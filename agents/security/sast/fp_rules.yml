@@ -1,0 +1,163 @@
+# =============================================================================
+# agents/security/sast/fp_rules.yml
+# Layer 1 FP Rules — YAML rule-based pre-filter
+#
+# Design (SSDLC_Design_v3.2.docx §6):
+#   - Always active from Day 1. No ML training required.
+#   - Target: resolve ~30% of findings as FP in <5ms.
+#   - Rules versioned here; full rules repo in Gitea from Phase 1+.
+#
+# Rule evaluation: ALL non-empty match criteria must be satisfied (AND logic).
+# Empty lists/fields are wildcards (match anything).
+#
+# Match criteria:
+#   frameworks:      list of framework values (spring-boot, angular, django, etc.)
+#   severity:        list of severity values (CRITICAL, HIGH, MEDIUM, LOW, INFO)
+#   rule_ids:        list of specific Semgrep rule IDs
+#   code_patterns:   list of regex patterns — ALL must match in code_snippet (AND)
+#   file_patterns:   list of regex patterns — ALL must match in file_path (AND)
+#
+# FP categories:
+#   test-code            — finding is in test/mock/stub code
+#   config-only          — finding is in config file, not executable path
+#   framework-safe       — framework handles this concern automatically
+#   dead-code            — code is unreachable / commented out
+#   out-of-scope         — explicitly excluded from security review scope
+#   annotation-suppressed — suppressed via @SuppressWarnings or equivalent
+# =============================================================================
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # TEST CODE — findings in test classes are never exploitable in production
+  # ---------------------------------------------------------------------------
+
+  - id: spring_test_class_fp
+    description: "Semgrep findings in Spring Boot @Test classes are FP — not production code"
+    match:
+      frameworks: [spring-boot]
+      code_patterns:
+        - "@Test|@SpringBootTest|@WebMvcTest|@DataJpaTest"
+    verdict: FP
+    fp_category: test-code
+    reasoning: "Finding is in a Spring Boot test class. Test code does not run in production and cannot be exploited."
+
+  - id: test_directory_fp
+    description: "Any finding under src/test/ or test/ directory is FP"
+    match:
+      file_patterns:
+        - "src/test/|/test/java/|/test/resources/|__tests__|spec\\.ts|spec\\.js|\\.test\\."
+    verdict: FP
+    fp_category: test-code
+    reasoning: "File is in a test directory. Test code does not execute in production."
+
+  - id: mock_class_fp
+    description: "Findings in Mock or Stub classes are FP"
+    match:
+      code_patterns:
+        - "class\\s+\\w*(Mock|Stub|Fake|Dummy)\\w*|@MockBean|@Mock\\b"
+    verdict: FP
+    fp_category: test-code
+    reasoning: "Finding is in a mock or stub class used only in testing."
+
+  # ---------------------------------------------------------------------------
+  # SPRING BOOT FRAMEWORK-SAFE — Spring handles these concerns automatically
+  # ---------------------------------------------------------------------------
+
+  - id: spring_data_jpa_sqli_fp
+    description: "Spring Data JPA @Query with named params is safe — JPA parameterises automatically"
+    match:
+      frameworks: [spring-boot]
+      rule_ids:
+        - java.lang.security.injection.tainted-sql-string.tainted-sql-string
+      code_patterns:
+        - "@Query|JpaRepository|CrudRepository|findBy\\w+"
+    verdict: FP
+    fp_category: framework-safe
+    reasoning: "Spring Data JPA parameterises queries automatically. Named parameters (:param) and method queries are not vulnerable to SQL injection."
+
+  - id: spring_security_csrf_fp
+    description: "CSRF is handled by Spring Security — not a finding in Spring Boot apps using Spring Security"
+    match:
+      frameworks: [spring-boot]
+      code_patterns:
+        - "@EnableWebSecurity|SecurityFilterChain|csrf\\(\\)"
+      rule_ids:
+        - java.spring.security.missing-csrf-protection.missing-csrf-protection
+    verdict: FP
+    fp_category: framework-safe
+    reasoning: "Spring Security manages CSRF protection. Finding is in security configuration code where CSRF behaviour is deliberately configured."
+
+  - id: spring_thymeleaf_xss_fp
+    description: "Thymeleaf auto-escapes output by default — XSS finding is FP for th:text"
+    match:
+      frameworks: [spring-boot]
+      code_patterns:
+        - "th:text|th:value|th:field"
+    verdict: FP
+    fp_category: framework-safe
+    reasoning: "Thymeleaf's th:text and th:value auto-escape HTML. Only th:utext is unescaped and potentially vulnerable."
+
+  # ---------------------------------------------------------------------------
+  # ANGULAR — TypeScript/Angular specific FP patterns
+  # ---------------------------------------------------------------------------
+
+  - id: angular_innerhtml_safe_fp
+    description: "Angular [innerHTML] with DomSanitizer.sanitize() is safe"
+    match:
+      frameworks: [angular]
+      code_patterns:
+        - "DomSanitizer|sanitize\\(SecurityContext"
+    verdict: FP
+    fp_category: framework-safe
+    reasoning: "Angular's DomSanitizer.sanitize() with SecurityContext.HTML sanitises content before DOM insertion."
+
+  - id: angular_template_xss_fp
+    description: "Angular template interpolation {{ }} auto-escapes — not XSS vulnerable"
+    match:
+      frameworks: [angular]
+      code_patterns:
+        - "\\{\\{.*\\}\\}"
+      rule_ids:
+        - javascript.angular.security.angular-src-binding.angular-src-binding
+    verdict: FP
+    fp_category: framework-safe
+    reasoning: "Angular template interpolation {{ }} is auto-escaped. XSS is only possible with bypassSecurityTrustHtml() or similar bypass methods."
+
+  # ---------------------------------------------------------------------------
+  # CONFIGURATION FILES — config files are not executable attack paths
+  # ---------------------------------------------------------------------------
+
+  - id: properties_file_fp
+    description: "Findings in .properties or .yml config files are typically FP — not executable"
+    match:
+      file_patterns:
+        - "\\.properties$|\\.yaml$|\\.yml$|application\\.\\w+\\.properties"
+      severity: [LOW, MEDIUM]
+    verdict: FP
+    fp_category: config-only
+    reasoning: "Finding is in a configuration file. Configuration values are environment-specific and managed by ops, not directly exploitable via code injection."
+
+  - id: dockerfile_low_fp
+    description: "Low/Info severity findings in Dockerfiles during dev are FP"
+    match:
+      file_patterns:
+        - "Dockerfile|docker-compose"
+      severity: [LOW, INFO]
+    verdict: FP
+    fp_category: config-only
+    reasoning: "Low/Info findings in Dockerfile are typically best-practice suggestions, not exploitable vulnerabilities in development phase."
+
+  # ---------------------------------------------------------------------------
+  # DEAD CODE / COMMENTED CODE
+  # ---------------------------------------------------------------------------
+
+  - id: commented_code_fp
+    description: "Findings in fully commented-out code blocks are FP"
+    match:
+      code_patterns:
+        - "^\\s*//.*$|^\\s*/\\*|^\\s*\\*"
+      severity: [LOW, MEDIUM, INFO]
+    verdict: FP
+    fp_category: dead-code
+    reasoning: "Finding is in commented-out code that is not compiled or executed."

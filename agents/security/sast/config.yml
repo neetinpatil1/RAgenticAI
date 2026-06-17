@@ -1,0 +1,75 @@
+# =============================================================================
+# agents/security/sast/config.yml
+# SAST Agent Configuration
+#
+# Design (SSDLC_Design_v3.2.docx §4, §5):
+#   Agents are specialised by config only — core logic lives in base_agent.py
+#   and the shared FP pipeline. Each agent's config.yml defines:
+#     - Which tools to run
+#     - Which LLM tier to use
+#     - FP pipeline configuration
+#     - Output contract reference
+#     - SLA thresholds
+# =============================================================================
+
+agent:
+  name: sast_agent
+  version: "1.0"
+  description: "Static Application Security Testing agent using Semgrep"
+  phase: 0
+
+# LLM routing (SSDLC_Design_v3.2.docx §5)
+llm:
+  default_tier: 1                  # Tier 1 = Qwen2.5-Coder:14b
+  allow_tier2_for:                 # Task types where Llama 3B is acceptable
+    - framework_detection          # simple classification, no analysis
+  escalation:
+    confidence_threshold: 0.6      # re-run on Tier 1 if below this
+    high_stakes_cwes:              # always use Tier 1 for these
+      - CWE-89   # SQL Injection
+      - CWE-79   # XSS
+      - CWE-22   # Path Traversal
+      - CWE-326  # Weak Crypto
+      - CWE-798  # Hard-coded Credentials
+      - CWE-306  # Missing Auth
+      - CWE-502  # Deserialization
+
+# Tools used by this agent
+tools:
+  - name: semgrep
+    sandboxed: true                # runs in Docker
+    rules_path: ./agents/security/sast/fp_rules.yml
+    timeout_seconds: 300
+    max_findings: 1000
+
+# FP pipeline configuration
+fp_pipeline:
+  layer1:
+    enabled: true
+    rules_file: ./agents/security/sast/fp_rules.yml
+  layer2:
+    enabled: false                 # disabled until Phase 1 (needs ≥150 labels per segment)
+  layer3:
+    enabled: true
+    prompt_agent: sast_agent
+    prompt_version: "v1.0"
+    prompt_file: fp_analysis
+    top_k_precedents: 5           # number of similar past decisions to inject
+
+# Output contract
+output:
+  contract: sast_report            # references core/output_contracts/sast_report.py
+  write_to_table: findings_reports
+
+# SLA thresholds (monitored by Watchdog)
+sla:
+  scan_timeout_minutes: 30         # max time for Semgrep scan
+  fp_pipeline_timeout_minutes: 60  # max time for full FP processing
+  critical_sla_hours: 24           # CRITICAL finding review SLA
+  high_sla_hours: 72               # HIGH finding review SLA
+
+# Human gate policy (SSDLC_Design_v3.2.docx §9.2)
+human_gate:
+  severities: [CRITICAL, HIGH]    # only these gate releases
+  baseline_excluded: true          # first-scan findings never gate
+  deadlock_route: human_queue     # DEADLOCK FP verdicts → human review
