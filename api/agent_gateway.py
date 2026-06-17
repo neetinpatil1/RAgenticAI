@@ -23,17 +23,19 @@ Design (SSDLC_Design_v3.2.docx §14):
 """
 
 import asyncio
+import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
@@ -126,7 +128,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8080"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8080",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -381,7 +387,19 @@ async def list_findings(
             *params,
         )
 
-    return {"findings": [dict(r) for r in rows], "count": len(rows)}
+    def _decode_row(r) -> dict:
+        d = dict(r)
+        # asyncpg returns JSONB columns as raw strings — decode them
+        if isinstance(d.get("ref_urls"), str):
+            try:
+                d["ref_urls"] = json.loads(d["ref_urls"])
+            except Exception:
+                d["ref_urls"] = []
+        if d.get("ref_urls") is None:
+            d["ref_urls"] = []
+        return d
+
+    return {"findings": [_decode_row(r) for r in rows], "count": len(rows)}
 
 
 @app.post("/api/v1/label", status_code=201)
@@ -478,6 +496,105 @@ async def list_runs(
     return {"runs": runs, "count": len(runs)}
 
 
+@app.get("/api/v1/scan/{run_id}/stream")
+async def stream_scan_progress(run_id: str, pool: asyncpg.Pool = Depends(get_pool)):
+    """
+    SSE endpoint — streams real-time scan progress to the React UI.
+
+    Events emitted (text/event-stream):
+      {"type": "status",   "state": "pending|running|completed|failed"}
+      {"type": "file",     "file": "relative/path.java", "index": N, "total": M}
+      {"type": "progress", "pct": 0-100, "eta_seconds": N}
+      {"type": "done",     "state": "completed|failed", "findings_count": N}
+      {"type": "error",    "message": "..."}
+    """
+    wf_state = get_workflow_state()
+    run = await wf_state.get_run(run_id)
+    if not run:
+        raise HTTPException(404, f"Run not found: {run_id}")
+
+    scan_path = Path(run["scan_path"])
+
+    async def _generate() -> AsyncIterator[str]:
+        def _sse(data: dict) -> str:
+            return f"data: {json.dumps(data)}\n\n"
+
+        # --- Enumerate files the same extensions Semgrep targets ---
+        _SCAN_EXTS = {
+            ".java", ".py", ".js", ".ts", ".jsx", ".tsx",
+            ".go", ".rb", ".php", ".cs", ".kt", ".scala",
+            ".yaml", ".yml", ".json", ".tf", ".sh",
+        }
+        files: list[str] = []
+        if scan_path.exists() and scan_path.is_dir():
+            for p in sorted(scan_path.rglob("*")):
+                if p.is_file() and p.suffix in _SCAN_EXTS:
+                    try:
+                        files.append(str(p.relative_to(scan_path)))
+                    except ValueError:
+                        files.append(p.name)
+
+        total = len(files)
+        yield _sse({"type": "status", "state": "running", "total_files": total})
+
+        start_ts = asyncio.get_event_loop().time()
+        # Stream file names progressively while the background scan runs
+        for idx, f in enumerate(files, start=1):
+            elapsed = asyncio.get_event_loop().time() - start_ts
+            pct = round((idx / total) * 100) if total else 100
+            rate = idx / elapsed if elapsed > 0 else 1
+            eta = round((total - idx) / rate) if rate > 0 else 0
+
+            yield _sse({
+                "type":  "file",
+                "file":  f,
+                "index": idx,
+                "total": total,
+                "pct":   pct,
+                "eta_seconds": eta,
+            })
+
+            # Check if scan already finished — no need to keep streaming
+            current = await wf_state.get_run(run_id)
+            state = current["state"] if current else "unknown"
+            if state in ("completed", "failed"):
+                break
+
+            # Pace the file events (~100 files/sec feels natural)
+            await asyncio.sleep(0.01)
+
+        # --- Final poll until DB reflects terminal state ---
+        for _ in range(120):  # max 120 × 0.5 s = 60 s wait
+            current = await wf_state.get_run(run_id)
+            state = current["state"] if current else "unknown"
+            if state in ("completed", "failed"):
+                break
+            yield _sse({"type": "status", "state": state, "pct": 99})
+            await asyncio.sleep(0.5)
+
+        # Fetch final finding count
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM findings_reports WHERE run_id = $1", run_id
+            )
+
+        yield _sse({
+            "type":           "done",
+            "state":          state,
+            "findings_count": count or 0,
+            "total_files":    total,
+        })
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":   "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/labeling", response_class=HTMLResponse)
 async def labeling_screen(request: Request):
     """
@@ -537,7 +654,15 @@ async def next_finding_for_review(pool: asyncpg.Pool = Depends(get_pool)):
     if not row:
         raise HTTPException(404, "No findings awaiting review")
 
-    return {"finding": dict(row)}
+    d = dict(row)
+    if isinstance(d.get("ref_urls"), str):
+        try:
+            d["ref_urls"] = json.loads(d["ref_urls"])
+        except Exception:
+            d["ref_urls"] = []
+    if d.get("ref_urls") is None:
+        d["ref_urls"] = []
+    return {"finding": d}
 
 
 @app.get("/api/v1/labels/count")
@@ -562,3 +687,26 @@ async def label_count(pool: asyncpg.Pool = Depends(get_pool)):
         "target":     200,
         "progress_pct": round((total / 200) * 100, 1) if total else 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# React SPA — serve built UI from ui/dist/
+# Must come LAST so API routes take priority.
+# ---------------------------------------------------------------------------
+_UI_DIST = Path(__file__).parent.parent / "ui" / "dist"
+
+if _UI_DIST.exists():
+    # Serve static assets (JS, CSS, images)
+    app.mount("/assets", StaticFiles(directory=str(_UI_DIST / "assets")), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    async def serve_root():
+        return FileResponse(str(_UI_DIST / "index.html"))
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str):
+        """Catch-all — return index.html so React Router handles client-side routes."""
+        file = _UI_DIST / full_path
+        if file.exists() and file.is_file():
+            return FileResponse(str(file))
+        return FileResponse(str(_UI_DIST / "index.html"))
