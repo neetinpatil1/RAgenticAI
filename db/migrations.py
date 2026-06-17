@@ -103,6 +103,11 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
     # -------------------------------------------------------------------------
     await _add_columns_if_missing(pool)
 
+    # -------------------------------------------------------------------------
+    # Code Review Agent table (Phase 1 — created here so it exists on startup)
+    # -------------------------------------------------------------------------
+    await _create_code_review_table(pool)
+
 
 async def _add_columns_if_missing(pool: asyncpg.Pool) -> None:
     """
@@ -138,3 +143,30 @@ async def _add_columns_if_missing(pool: asyncpg.Pool) -> None:
                     logger.info("Added column %s.%s", table, column)
                 except Exception as exc:
                     logger.warning("Could not add column %s.%s: %s", table, column, exc)
+
+
+async def _create_code_review_table(pool: asyncpg.Pool) -> None:
+    """Create code_review_findings table if it doesn't exist."""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS code_review_findings (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                run_id          TEXT NOT NULL,
+                file_path       TEXT NOT NULL,
+                language        TEXT,
+                category        TEXT NOT NULL,
+                severity        TEXT NOT NULL,
+                line_start      INT,
+                line_end        INT,
+                title           TEXT NOT NULL,
+                description     TEXT,
+                recommendation  TEXT,
+                confidence      REAL DEFAULT 0.5,
+                overall_file_score INT,
+                created_at      TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cr_findings_run ON code_review_findings(run_id)"
+        )
+    logger.info("code_review_findings table ready")

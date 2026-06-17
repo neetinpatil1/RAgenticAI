@@ -56,6 +56,57 @@ export interface ScanStatus {
   };
 }
 
+export type ReviewCategory = "SECURITY" | "PERFORMANCE" | "CODE_QUALITY" | "ERROR_HANDLING" | "BEST_PRACTICES";
+
+export interface CodeReviewFinding {
+  id: string;
+  run_id: string;
+  file_path: string;
+  language: string;
+  category: ReviewCategory;
+  severity: Severity;
+  line_start: number | null;
+  line_end: number | null;
+  title: string;
+  description: string;
+  recommendation: string;
+  confidence: number;
+  overall_file_score: number | null;
+  created_at: string;
+}
+
+export interface CodeReviewSummary {
+  files_reviewed: number;
+  total_findings: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  security: number;
+  performance: number;
+  code_quality: number;
+  error_handling: number;
+  best_practices: number;
+}
+
+export interface RunSummary {
+  run_id: string;
+  scan_path: string;
+  project_name: string;
+  state: string;
+  created_at: string | null;
+  completed_at: string | null;
+  duration_ms: number;
+  error: string | null;
+  severity: {
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+    total: number;
+  };
+}
+
 // SSE event shapes
 export type SseEvent =
   | { type: "status";   state: string; total_files?: number; pct?: number }

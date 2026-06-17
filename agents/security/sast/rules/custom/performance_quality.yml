@@ -1,0 +1,211 @@
+rules:
+
+  # ---------------------------------------------------------------------------
+  # JAVA: N+1 Query Pattern (DB call inside loop)
+  # ---------------------------------------------------------------------------
+
+  - id: java-db-call-inside-loop
+    patterns:
+      - pattern: |
+          for (...) {
+            ...
+            $REPO.findById(...)
+            ...
+          }
+    message: >
+      N+1 query detected: repository.findById() called inside a loop. Each
+      iteration triggers a separate DB round-trip. Replace with a batch fetch
+      (findAllById, JOIN FETCH, or EntityGraph) outside the loop.
+    languages: [java]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-400: Uncontrolled Resource Consumption"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      confidence: MEDIUM
+
+  - id: java-jdbc-in-loop
+    patterns:
+      - pattern: |
+          for (...) {
+            ...
+            $STMT.executeQuery(...)
+            ...
+          }
+    message: >
+      Database query inside a loop causes N+1 problem. Rewrite to use a
+      single query with IN clause or execute the query before the loop and
+      iterate over the in-memory results.
+    languages: [java]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-400: Uncontrolled Resource Consumption"]
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # JAVA: Resource Leaks (unclosed streams)
+  # ---------------------------------------------------------------------------
+
+  - id: java-inputstream-not-closed
+    patterns:
+      - pattern: |
+          FileInputStream $IS = new FileInputStream(...);
+          ...
+      - pattern-not: |
+          try (...; FileInputStream $IS = new FileInputStream(...); ...) {
+            ...
+          }
+    message: >
+      FileInputStream not opened in a try-with-resources block. If an exception
+      occurs before close() is called the file descriptor leaks. Use:
+      try (FileInputStream is = new FileInputStream(path)) { ... }
+    languages: [java]
+    severity: LOW
+    metadata:
+      cwe: ["CWE-772: Missing Release of Resource after Effective Lifetime"]
+      confidence: LOW
+
+  - id: java-connection-not-closed
+    patterns:
+      - pattern: |
+          Connection $CONN = $DS.getConnection();
+          ...
+      - pattern-not: |
+          try (...; Connection $CONN = $DS.getConnection(); ...) {
+            ...
+          }
+    message: >
+      JDBC Connection not opened in a try-with-resources block — connection pool
+      exhaustion under load. Use: try (Connection conn = ds.getConnection()) { ... }
+    languages: [java]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-772: Missing Release of Resource after Effective Lifetime"]
+      confidence: LOW
+
+  # ---------------------------------------------------------------------------
+  # JAVA: Error Handling Anti-patterns
+  # ---------------------------------------------------------------------------
+
+  - id: java-empty-catch-block
+    patterns:
+      - pattern: |
+          try {
+            ...
+          } catch ($E) {
+          }
+    message: >
+      Empty catch block silently swallows the exception. At minimum log it:
+      logger.error("Operation failed", $E). Silent catch blocks hide bugs
+      and make debugging impossible in production.
+    languages: [java]
+    severity: LOW
+    metadata:
+      cwe: ["CWE-390: Detection of Error Condition Without Action"]
+      confidence: MEDIUM
+
+  - id: java-catch-generic-exception
+    patterns:
+      - pattern: |
+          try {
+            ...
+          } catch (Exception $E) {
+            ...
+          }
+    message: >
+      Catching raw Exception is too broad — it catches RuntimeExceptions
+      including NullPointerException and programming errors that should propagate.
+      Catch specific exception types (IOException, SQLException, etc.) instead.
+    languages: [java]
+    severity: LOW
+    metadata:
+      cwe: ["CWE-755: Improper Handling of Exceptional Conditions"]
+      confidence: LOW
+
+  - id: java-print-stack-trace
+    patterns:
+      - pattern: $E.printStackTrace()
+    message: >
+      printStackTrace() prints to stdout/stderr and leaks internal stack traces
+      to logs or even end users. Log with the exception parameter instead:
+      logger.error("Message", $E)
+    languages: [java]
+    severity: LOW
+    metadata:
+      cwe: ["CWE-209: Information Exposure Through Error Message"]
+      confidence: HIGH
+
+  - id: java-system-out-println
+    patterns:
+      - pattern: System.out.println(...)
+    message: >
+      System.out.println() bypasses the logging framework — output is not
+      structured, not configurable, and not filterable. Replace with:
+      logger.info("...") using SLF4J or Logback.
+    languages: [java]
+    severity: INFO
+    metadata:
+      cwe: ["CWE-779: Logging of Excessive Data"]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # PYTHON: Error Handling Anti-patterns
+  # ---------------------------------------------------------------------------
+
+  - id: python-bare-except
+    patterns:
+      - pattern: |
+          try:
+            ...
+          except:
+            ...
+    message: >
+      Bare except: catches ALL exceptions including SystemExit and
+      KeyboardInterrupt. Use `except Exception:` at minimum, or catch
+      specific exception types.
+    languages: [python]
+    severity: LOW
+    metadata:
+      cwe: ["CWE-390: Detection of Error Condition Without Action"]
+      confidence: HIGH
+
+  - id: python-mutable-default-argument
+    patterns:
+      - pattern: def $FUNC(..., $PARAM=[], ...): ...
+    message: >
+      Mutable default argument: the list [] is shared across ALL calls to $FUNC.
+      Mutations persist between calls causing subtle state bugs. Use None as
+      default and initialise inside the function: if param is None: param = []
+    languages: [python]
+    severity: LOW
+    metadata:
+      cwe: ["CWE-1188: Insecure Default Initialization"]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # JAVASCRIPT: Production Debug Code
+  # ---------------------------------------------------------------------------
+
+  - id: js-console-log-production
+    patterns:
+      - pattern: console.log($X)
+    message: >
+      console.log() in production code leaks information and degrades performance.
+      Remove before deploying, or replace with a configurable logger that can be
+      silenced by log level.
+    languages: [javascript, typescript]
+    severity: INFO
+    metadata:
+      cwe: ["CWE-532: Insertion of Sensitive Information Into Log File"]
+      confidence: HIGH
+
+  - id: js-debugger-statement
+    patterns:
+      - pattern: debugger
+    message: >
+      debugger statement left in production code. Browsers pause execution here
+      when DevTools is open, causing unexpected stops for users. Remove before deploying.
+    languages: [javascript, typescript]
+    severity: LOW
+    metadata:
+      cwe: ["CWE-489: Active Debug Code"]
+      confidence: HIGH

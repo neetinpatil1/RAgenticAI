@@ -210,18 +210,26 @@ WATCHDOG (5-min scheduled job):
 **Scope Adaptation:** Local path scanning (no Git), native installs (no Docker for infra), Layer 3 FP only (no CodeBERT yet).
 
 #### Deliverables
-- [ ] PostgreSQL setup with pgvector extension
-- [ ] Ollama running `qwen2.5-coder:14b` natively
-- [ ] SAST Agent — accepts `--scan /local/path`, runs Semgrep (Docker sandbox), writes findings to PG
-- [ ] Layer 1 FP rules (YAML, Spring Boot + Angular rules)
-- [ ] Layer 3 FP via Qwen LLM + pgvector retrieval
-- [ ] Pydantic output contracts (`sast_report.py`, `fp_decision.py`)
-- [ ] Labeling-as-exhaust: human approve/dismiss in minimal UI writes label to PG
-- [ ] Audit trail in PostgreSQL (append-only ledger)
-- [ ] Watchdog job (5-min scheduled, SLA alerts)
-- [ ] Minimal FastAPI endpoint: `POST /api/v1/scan {"path": "..."}`
+- [x] PostgreSQL setup with pgvector extension
+- [x] Ollama running `qwen2.5-coder:14b` natively
+- [x] SAST Agent — accepts `--scan /local/path`, runs Semgrep (Docker sandbox), writes findings to PG
+- [x] Finding enrichment — class, method, fix suggestion, OWASP category, ref URLs, likelihood, impact
+- [x] Scan coverage stats — files scanned/skipped, packages by build file type
+- [x] Layer 1 FP rules (YAML, Spring Boot + Angular rules)
+- [x] Layer 3 FP via Qwen LLM + pgvector retrieval
+- [x] Pydantic output contracts (`sast_report.py`, `fp_decision.py`)
+- [x] Labeling-as-exhaust: human approve/dismiss in minimal HTML UI writes label to PG
+- [x] Audit trail in PostgreSQL (append-only ledger)
+- [x] Watchdog job (5-min scheduled, SLA alerts)
+- [x] FastAPI endpoints: `POST /api/v1/scan`, `GET /api/v1/scan/{run_id}`, `GET /api/v1/findings`, `GET /api/v1/scan/{run_id}/stream` (SSE)
+- [x] React scan UI (ScanInput + animated ScanProgress + ScanResults with expandable findings table) — served on port 8080
+- [x] Air-gap setup scripts (Semgrep rules local, Grype DB local)
 - [ ] Governance charter signed (before code ships to staging)
-- [ ] Air-gap setup scripts (Semgrep rules local, Grype DB local)
+
+#### Still Needed for Phase 0 Gate
+- [ ] Run against 200 real findings and label them via UI
+- [ ] Measure ≥75% LLM–human agreement
+- [ ] Sign governance charter
 
 #### Gate Criteria
 - [ ] ≥75% LLM–human agreement on 200 labeled findings
@@ -374,13 +382,14 @@ WATCHDOG (5-min scheduled job):
 | Label capture | Every UI action (approve, FP, ruling, sign-off) → `POST` endpoint writes label to PG in same transaction. |
 
 ### UI Delivery Plan
-| Sprint | Deliverable |
-|---|---|
-| Sprint 3 (Phase 0) | Minimal HTML labeling screen (no React). Sufficient for Phase 0 gate. |
-| Sprint 5–6 (Phase 1) | React 18 + Vite setup. `/console/agents` live feed. `/console/findings` review queue. |
-| Sprint 7–8 (Phase 1) | `/dashboard` + Recharts. `/console/challenges`. `/console/labeling` full React. |
-| Sprint 9–10 (Phase 1) | `/apps` portfolio. `/console/csra` sign-off. Assessment detail + PDF export. |
-| Sprint 15+ (Phase 2) | `/settings`, agent health, FP rules editor, model manifest management. |
+| Sprint | Deliverable | Status |
+|---|---|---|
+| Sprint 3 (Phase 0) | Minimal HTML labeling screen (no React). Sufficient for Phase 0 gate. | ✅ Done |
+| Phase 0 (early) | React scan UI shipped ahead of schedule: ScanInput + animated ScanProgress (SSE-driven) + ScanResults (severity chart, expandable findings table, code snippets, fix suggestions, OWASP tags). Served by FastAPI on port 8080. | ✅ Done |
+| Sprint 5–6 (Phase 1) | `/console/findings` review queue. `/console/agents` live feed. | ⬜ |
+| Sprint 7–8 (Phase 1) | `/dashboard` + Recharts KPI tiles. `/console/challenges`. `/console/labeling` full React. | ⬜ |
+| Sprint 9–10 (Phase 1) | `/apps` portfolio. `/console/csra` sign-off. Assessment detail + PDF export. | ⬜ |
+| Sprint 15+ (Phase 2) | `/settings`, agent health, FP rules editor, model manifest management. | ⬜ |
 
 ---
 
@@ -507,4 +516,4 @@ ssdlc-agent-platform/
 
 ---
 
-*Last updated: June 2025 | Source: SSDLC_Design_v3.2.docx*
+*Last updated: June 2026 | Source: SSDLC_Design_v3.2.docx*

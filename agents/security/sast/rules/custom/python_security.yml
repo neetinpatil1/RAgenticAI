@@ -1,0 +1,212 @@
+rules:
+
+  # ---------------------------------------------------------------------------
+  # PYTHON: Code Execution (eval / exec)
+  # ---------------------------------------------------------------------------
+
+  - id: python-eval-user-input
+    patterns:
+      - pattern: eval($X)
+      - pattern-not: eval("...")
+    message: >
+      eval() called with a non-literal expression. If $X contains user-controlled
+      data this is Remote Code Execution. Replace with ast.literal_eval() for safe
+      evaluation of literals, or redesign to avoid dynamic evaluation entirely.
+    languages: [python]
+    severity: CRITICAL
+    metadata:
+      cwe: ["CWE-78: OS Command Injection", "CWE-94: Code Injection"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: MEDIUM
+
+  - id: python-exec-user-input
+    patterns:
+      - pattern: exec($X)
+      - pattern-not: exec("...")
+    message: >
+      exec() with a dynamic argument can execute arbitrary code. This is a critical
+      RCE vector if $X is derived from user input. Remove exec() or restrict to
+      a whitelist of known-safe strings.
+    languages: [python]
+    severity: CRITICAL
+    metadata:
+      cwe: ["CWE-94: Code Injection"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # PYTHON: Deserialization
+  # ---------------------------------------------------------------------------
+
+  - id: python-pickle-loads
+    patterns:
+      - pattern: pickle.loads($DATA)
+    message: >
+      pickle.loads() deserialises arbitrary Python objects. Deserialising attacker-
+      controlled data leads to Remote Code Execution. Use a safe format (JSON, msgpack)
+      for data exchange; if pickle is required, verify HMAC integrity before loading.
+    languages: [python]
+    severity: CRITICAL
+    metadata:
+      cwe: ["CWE-502: Deserialization of Untrusted Data"]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+      confidence: MEDIUM
+
+  - id: python-yaml-load-unsafe
+    patterns:
+      - pattern: yaml.load($DATA, ...)
+      - pattern-not: yaml.load($DATA, Loader=yaml.SafeLoader)
+      - pattern-not: yaml.safe_load(...)
+    message: >
+      yaml.load() with the default Loader can deserialise Python objects and execute
+      arbitrary code. Use yaml.safe_load() or yaml.load($DATA, Loader=yaml.SafeLoader).
+    languages: [python]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-502: Deserialization of Untrusted Data"]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # PYTHON: OS Command Injection
+  # ---------------------------------------------------------------------------
+
+  - id: python-subprocess-shell-true
+    patterns:
+      - pattern: subprocess.run($CMD, ..., shell=True, ...)
+      - pattern-not: subprocess.run("...", ..., shell=True, ...)
+    message: >
+      subprocess.run() with shell=True and a dynamic command is a command injection
+      risk. Pass the command as a list without shell=True, or validate/sanitise $CMD
+      against a strict whitelist.
+    languages: [python]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-78: OS Command Injection"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: MEDIUM
+
+  - id: python-os-system
+    patterns:
+      - pattern: os.system($CMD)
+      - pattern-not: os.system("...")
+    message: >
+      os.system() with a dynamic argument is a command injection vector. Use
+      subprocess.run(cmd_list) without shell=True instead.
+    languages: [python]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-78: OS Command Injection"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # PYTHON: SQL Injection
+  # ---------------------------------------------------------------------------
+
+  - id: python-sqli-fstring
+    patterns:
+      - pattern: $CURSOR.execute(f"...{$VAR}...")
+    message: >
+      SQL injection: f-string interpolation inside execute(). Use parameterised
+      queries — cursor.execute("SELECT ... WHERE id = %s", (value,)) — never
+      embed variables directly into the SQL string.
+    languages: [python]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-89: SQL Injection"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: HIGH
+
+  - id: python-sqli-format
+    patterns:
+      - pattern: $CURSOR.execute($SQL % $VAR)
+    message: >
+      SQL injection: % formatting inside execute(). Use parameterised queries with
+      placeholders (%s) passed as a separate tuple instead of inline formatting.
+    languages: [python]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-89: SQL Injection"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # PYTHON: Weak Hashing
+  # ---------------------------------------------------------------------------
+
+  - id: python-md5-password
+    patterns:
+      - pattern: hashlib.md5($X).hexdigest()
+    message: >
+      MD5 is cryptographically broken — do not use for passwords or integrity checks.
+      Use bcrypt, argon2, or scrypt for passwords; SHA-256/SHA-3 for integrity.
+    languages: [python]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-327: Broken Crypto", "CWE-328: Reversible One-Way Hash"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      confidence: MEDIUM
+
+  - id: python-sha1-password
+    patterns:
+      - pattern: hashlib.sha1($X).hexdigest()
+    message: >
+      SHA-1 is deprecated for security purposes (collision attacks demonstrated).
+      Use SHA-256 or SHA-3 for integrity; bcrypt/argon2 for passwords.
+    languages: [python]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-327: Broken Crypto"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      confidence: LOW
+
+  # ---------------------------------------------------------------------------
+  # PYTHON: Insecure Temp Files
+  # ---------------------------------------------------------------------------
+
+  - id: python-insecure-tempfile
+    patterns:
+      - pattern: tempfile.mktemp(...)
+    message: >
+      tempfile.mktemp() has a TOCTOU race condition — the returned filename can
+      be hijacked before you open it. Use tempfile.mkstemp() or tempfile.NamedTemporaryFile()
+      which atomically create and open the file.
+    languages: [python]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-377: Insecure Temporary File"]
+      owasp: ["A01:2021 - Broken Access Control"]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # PYTHON: Debug Mode in Web Frameworks
+  # ---------------------------------------------------------------------------
+
+  - id: python-flask-debug-true
+    patterns:
+      - pattern: app.run(..., debug=True, ...)
+    message: >
+      Flask debug mode is enabled. This exposes an interactive debugger in the
+      browser (allowing arbitrary code execution) and detailed stack traces.
+      Set debug=False or remove the debug flag in non-development environments.
+    languages: [python]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-94: Code Injection"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      confidence: HIGH
+
+  - id: python-django-debug-true
+    patterns:
+      - pattern: DEBUG = True
+    message: >
+      Django DEBUG=True exposes full stack traces, SQL queries, and settings to
+      users when an error occurs. Set DEBUG=False in production; use environment
+      variables to configure this per-environment.
+    languages: [python]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-209: Information Exposure Through Error Message"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      confidence: MEDIUM

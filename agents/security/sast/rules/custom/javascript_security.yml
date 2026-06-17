@@ -1,0 +1,179 @@
+rules:
+
+  # ---------------------------------------------------------------------------
+  # JAVASCRIPT / TYPESCRIPT: Code Injection
+  # ---------------------------------------------------------------------------
+
+  - id: js-eval-user-input
+    patterns:
+      - pattern: eval($X)
+      - pattern-not: eval("...")
+    message: >
+      eval() with a dynamic argument is a code injection vulnerability. If $X
+      contains user-supplied data this is Remote Code Execution. Replace with
+      safe alternatives (JSON.parse for data, Function constructor avoided entirely).
+    languages: [javascript, typescript]
+    severity: CRITICAL
+    metadata:
+      cwe: ["CWE-94: Code Injection"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: MEDIUM
+
+  - id: js-new-function
+    patterns:
+      - pattern: new Function($X)
+    message: >
+      new Function() constructs and evaluates arbitrary code at runtime —
+      equivalent to eval(). This is a code injection risk if $X contains any
+      user-controlled data. Avoid dynamic code construction entirely.
+    languages: [javascript, typescript]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-94: Code Injection"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # JAVASCRIPT: DOM XSS
+  # ---------------------------------------------------------------------------
+
+  - id: js-innerhtml-assignment
+    patterns:
+      - pattern: $EL.innerHTML = $DATA
+      - pattern-not: $EL.innerHTML = "..."
+    message: >
+      Assigning user-controlled data to innerHTML causes DOM XSS. Use
+      textContent for plain text, or DOMPurify.sanitize($DATA) before assigning
+      to innerHTML if HTML is genuinely needed.
+    languages: [javascript, typescript]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-79: XSS"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: MEDIUM
+
+  - id: js-document-write
+    patterns:
+      - pattern: document.write($DATA)
+      - pattern-not: document.write("...")
+    message: >
+      document.write() with dynamic content causes XSS and overwrites the entire
+      page. Remove document.write(); use DOM manipulation (createElement, appendChild)
+      or a templating library instead.
+    languages: [javascript, typescript]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-79: XSS"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: MEDIUM
+
+  - id: react-dangerous-innerhtml
+    patterns:
+      - pattern: dangerouslySetInnerHTML={{__html: $DATA}}
+      - pattern-not: dangerouslySetInnerHTML={{__html: "..."}}
+    message: >
+      dangerouslySetInnerHTML with dynamic content causes React XSS. Sanitise
+      $DATA with DOMPurify.sanitize() before passing, or redesign to avoid raw HTML.
+    languages: [javascript, typescript]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-79: XSS"]
+      owasp: ["A03:2021 - Injection"]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # JAVASCRIPT: Prototype Pollution
+  # ---------------------------------------------------------------------------
+
+  - id: js-prototype-pollution-merge
+    patterns:
+      - pattern: Object.assign($OBJ, $USER_DATA)
+      - pattern-not: Object.assign({}, ...)
+    message: >
+      Object.assign() with user-controlled $USER_DATA may allow prototype pollution
+      if $USER_DATA contains a __proto__ key. Validate and sanitise input before
+      merging, or use a safe deep-merge library that prevents prototype pollution.
+    languages: [javascript, typescript]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-1321: Prototype Pollution"]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+      confidence: LOW
+
+  # ---------------------------------------------------------------------------
+  # JAVASCRIPT: Insecure Randomness
+  # ---------------------------------------------------------------------------
+
+  - id: js-math-random-security
+    patterns:
+      - pattern: Math.random()
+    message: >
+      Math.random() is not cryptographically secure — its output is predictable.
+      For security-sensitive values (tokens, nonces, session IDs) use
+      crypto.getRandomValues() (browser) or crypto.randomBytes() (Node.js).
+    languages: [javascript, typescript]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-338: Cryptographically Weak PRNG"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      confidence: LOW
+
+  # ---------------------------------------------------------------------------
+  # JAVASCRIPT: Sensitive Data in Storage
+  # ---------------------------------------------------------------------------
+
+  - id: js-localstorage-token
+    patterns:
+      - pattern: localStorage.setItem($KEY, $VAL)
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: (?i)(token|jwt|auth|session|secret|password|credential|api_?key)
+    message: >
+      Sensitive data (auth token / session / credential) stored in localStorage is
+      accessible to any JavaScript on the page (XSS). Use httpOnly cookies for
+      session tokens; if localStorage is required, encrypt the value first.
+    languages: [javascript, typescript]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-312: Cleartext Storage"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # JAVASCRIPT: postMessage without origin check
+  # ---------------------------------------------------------------------------
+
+  - id: js-postmessage-no-origin
+    patterns:
+      - pattern: window.addEventListener("message", $HANDLER, ...)
+      - pattern-not: |
+          window.addEventListener("message", function($E) {
+            if ($E.origin !== ...) { ... }
+            ...
+          }, ...)
+    message: >
+      postMessage event listener does not validate event.origin. Attackers from
+      any origin can send messages to this handler. Add: if (event.origin !== EXPECTED_ORIGIN) return;
+    languages: [javascript, typescript]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-346: Origin Validation Error"]
+      owasp: ["A01:2021 - Broken Access Control"]
+      confidence: LOW
+
+  # ---------------------------------------------------------------------------
+  # JAVASCRIPT: Disabled security headers / HTTPS
+  # ---------------------------------------------------------------------------
+
+  - id: js-node-http-not-https
+    patterns:
+      - pattern: require("http").createServer(...)
+    message: >
+      Plain HTTP server created. All traffic is unencrypted. Use https.createServer()
+      with a valid certificate in production, or terminate TLS at a reverse proxy.
+    languages: [javascript]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-319: Cleartext Transmission"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      confidence: LOW

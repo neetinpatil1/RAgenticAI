@@ -5,10 +5,11 @@ import {
 } from "recharts";
 import {
   ChevronDown, ChevronUp, RotateCcw, ShieldAlert, ExternalLink,
-  FileCode, Wrench, BookOpen, TrendingUp,
+  FileCode, Wrench, BookOpen, TrendingUp, Brain, Zap, Code2, AlertTriangle,
+  CheckCircle2, Loader2, PlayCircle,
 } from "lucide-react";
-import { getFindings, getScanStatus } from "../lib/api";
-import type { Finding, ScanStatus } from "../types";
+import { getFindings, getScanStatus, triggerCodeReview, getCodeReview } from "../lib/api";
+import type { Finding, ScanStatus, CodeReviewFinding, CodeReviewSummary, ReviewCategory } from "../types";
 import { SeverityBadge } from "./SeverityBadge";
 import { CodeBlock } from "./CodeBlock";
 
@@ -25,12 +26,37 @@ interface Props {
   onNewScan: () => void;
 }
 
+const CAT_ICONS: Record<ReviewCategory, React.ReactNode> = {
+  SECURITY:       <ShieldAlert className="w-3.5 h-3.5" />,
+  PERFORMANCE:    <Zap         className="w-3.5 h-3.5" />,
+  CODE_QUALITY:   <Code2       className="w-3.5 h-3.5" />,
+  ERROR_HANDLING: <AlertTriangle className="w-3.5 h-3.5" />,
+  BEST_PRACTICES: <CheckCircle2  className="w-3.5 h-3.5" />,
+};
+
+const CAT_COLORS: Record<ReviewCategory, string> = {
+  SECURITY:       "text-red-400 bg-red-500/10 border-red-500/30",
+  PERFORMANCE:    "text-yellow-400 bg-yellow-500/10 border-yellow-500/30",
+  CODE_QUALITY:   "text-purple-400 bg-purple-500/10 border-purple-500/30",
+  ERROR_HANDLING: "text-orange-400 bg-orange-500/10 border-orange-500/30",
+  BEST_PRACTICES: "text-green-400 bg-green-500/10 border-green-500/30",
+};
+
 export function ScanResults({ runId, onNewScan }: Props) {
   const [findings,  setFindings]  = useState<Finding[]>([]);
   const [status,    setStatus]    = useState<ScanStatus | null>(null);
   const [expanded,  setExpanded]  = useState<Set<string>>(new Set());
   const [loading,   setLoading]   = useState(true);
   const [sevFilter, setSevFilter] = useState<string>("ALL");
+  const [activeTab, setActiveTab] = useState<"sast" | "review">("sast");
+
+  // Code review state
+  const [crFindings,  setCrFindings]  = useState<CodeReviewFinding[]>([]);
+  const [crSummary,   setCrSummary]   = useState<CodeReviewSummary | null>(null);
+  const [crLoading,   setCrLoading]   = useState(false);
+  const [crTriggered, setCrTriggered] = useState(false);
+  const [crCatFilter, setCrCatFilter] = useState<string>("ALL");
+  const [crExpanded,  setCrExpanded]  = useState<Set<string>>(new Set());
 
   useEffect(() => {
     async function load() {
@@ -41,9 +67,44 @@ export function ScanResults({ runId, onNewScan }: Props) {
       setFindings(f);
       setStatus(s);
       setLoading(false);
+      // Auto-check if code review already done
+      try {
+        const cr = await getCodeReview(runId);
+        if (cr.count > 0) { setCrFindings(cr.findings); setCrSummary(cr.summary); setCrTriggered(true); }
+      } catch { /* not yet */ }
     }
     load();
   }, [runId]);
+
+  async function handleRunCodeReview() {
+    setCrLoading(true);
+    setCrTriggered(true);
+    try {
+      await triggerCodeReview(runId);
+      // Poll until results appear
+      const poll = async () => {
+        const cr = await getCodeReview(runId);
+        if (cr.count > 0) {
+          setCrFindings(cr.findings);
+          setCrSummary(cr.summary);
+          setCrLoading(false);
+        } else {
+          setTimeout(poll, 5000);
+        }
+      };
+      setTimeout(poll, 5000);
+    } catch (e) {
+      setCrLoading(false);
+    }
+  }
+
+  function toggleCrExpand(id: string) {
+    setCrExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
 
   function toggleExpand(id: string) {
     setExpanded((prev) => {
@@ -72,6 +133,9 @@ export function ScanResults({ runId, onNewScan }: Props) {
   }
 
   const cov = status?.scan_coverage;
+  const crFiltered = crCatFilter === "ALL"
+    ? crFindings
+    : crFindings.filter((f) => f.category === crCatFilter);
 
   return (
     <div className="min-h-screen p-6 max-w-7xl mx-auto space-y-6">
@@ -91,6 +155,32 @@ export function ScanResults({ runId, onNewScan }: Props) {
           <RotateCcw className="w-4 h-4" />
           New Scan
         </motion.button>
+      </div>
+
+      {/* Tab switcher */}
+      <div className="flex gap-1 bg-gray-900 border border-gray-700/60 rounded-lg p-1 w-fit">
+        {([
+          { id: "sast",   label: "SAST Findings",  icon: <ShieldAlert className="w-4 h-4" />,  count: findings.length },
+          { id: "review", label: "Code Review",     icon: <Brain       className="w-4 h-4" />,  count: crFindings.length },
+        ] as const).map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-all
+              ${activeTab === tab.id
+                ? "bg-gray-800 text-white shadow-sm"
+                : "text-gray-400 hover:text-gray-200"}`}
+          >
+            {tab.icon}
+            {tab.label}
+            {tab.count > 0 && (
+              <span className={`text-xs px-1.5 py-0.5 rounded-full
+                ${activeTab === tab.id ? "bg-brand-600 text-white" : "bg-gray-700 text-gray-400"}`}>
+                {tab.count}
+              </span>
+            )}
+          </button>
+        ))}
       </div>
 
       {/* Coverage + severity summary row */}
@@ -196,162 +286,345 @@ export function ScanResults({ runId, onNewScan }: Props) {
         </div>
       </div>
 
-      {/* Findings table */}
-      <div className="space-y-3">
-        <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wide">
-          Findings — {filtered.length}
-        </h2>
-        {filtered.length === 0 && (
-          <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-10 text-center text-gray-600">
-            No findings match the current filter.
-          </div>
-        )}
-        {filtered.map((f) => {
-          const open = expanded.has(f.id);
-          return (
-            <motion.div
-              key={f.id}
-              layout
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="rounded-xl bg-gray-900 border border-gray-700/60 overflow-hidden"
-            >
-              {/* Row header — always visible */}
-              <button
-                className="w-full text-left px-5 py-4 flex items-start gap-4 hover:bg-gray-800/40 transition-colors"
-                onClick={() => toggleExpand(f.id)}
+      {/* SAST Findings tab */}
+      {activeTab === "sast" && (
+        <div className="space-y-3">
+          <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wide">
+            Findings — {filtered.length}
+          </h2>
+          {filtered.length === 0 && (
+            <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-10 text-center text-gray-600">
+              No findings match the current filter.
+            </div>
+          )}
+          {filtered.map((f) => {
+            const open = expanded.has(f.id);
+            return (
+              <motion.div
+                key={f.id}
+                layout
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="rounded-xl bg-gray-900 border border-gray-700/60 overflow-hidden"
               >
-                <div className="mt-0.5 shrink-0">
-                  <SeverityBadge severity={f.severity} />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-sm font-medium text-white truncate">{f.rule_id}</span>
-                    {f.cwe_id && (
-                      <span className="text-xs text-gray-500 bg-gray-800 border border-gray-700 px-1.5 py-0.5 rounded">
-                        {f.cwe_id}
-                      </span>
-                    )}
-                    {f.owasp_category && (
-                      <span className="text-xs text-purple-400 bg-purple-900/20 border border-purple-700/40 px-1.5 py-0.5 rounded">
-                        {f.owasp_category}
-                      </span>
-                    )}
+                {/* Row header — always visible */}
+                <button
+                  className="w-full text-left px-5 py-4 flex items-start gap-4 hover:bg-gray-800/40 transition-colors"
+                  onClick={() => toggleExpand(f.id)}
+                >
+                  <div className="mt-0.5 shrink-0">
+                    <SeverityBadge severity={f.severity} />
                   </div>
-                  <p className="text-xs text-gray-400 mt-1 line-clamp-2">{f.message}</p>
-                  <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-600">
-                    <span className="flex items-center gap-1">
-                      <FileCode className="w-3 h-3" />
-                      {f.file_path.split("/").slice(-2).join("/")}:{f.line_start}
-                    </span>
-                    {f.class_name && <span>Class: <span className="text-gray-400">{f.class_name}</span></span>}
-                    {f.method_name && <span>Method: <span className="text-gray-400">{f.method_name}()</span></span>}
-                  </div>
-                </div>
-                <div className="shrink-0 text-gray-600 mt-1">
-                  {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                </div>
-              </button>
-
-              {/* Expandable detail section */}
-              <AnimatePresence initial={false}>
-                {open && (
-                  <motion.div
-                    key="detail"
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.2 }}
-                    className="overflow-hidden"
-                  >
-                    <div className="px-5 pb-5 border-t border-gray-700/60 pt-4 space-y-4">
-                      {/* Full file path + location */}
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-                        <div>
-                          <p className="text-gray-500 uppercase tracking-wide mb-1">File</p>
-                          <p className="text-gray-300 font-mono break-all">{f.file_path}</p>
-                          <p className="text-gray-500 mt-1">
-                            Lines {f.line_start}
-                            {f.line_end && f.line_end !== f.line_start ? `–${f.line_end}` : ""}
-                          </p>
-                        </div>
-                        <div className="grid grid-cols-2 gap-3">
-                          {f.likelihood && (
-                            <div>
-                              <p className="text-gray-500 flex items-center gap-1">
-                                <TrendingUp className="w-3 h-3" /> Likelihood
-                              </p>
-                              <p className="text-gray-300 mt-1">{f.likelihood}</p>
-                            </div>
-                          )}
-                          {f.impact && (
-                            <div>
-                              <p className="text-gray-500">Impact</p>
-                              <p className="text-gray-300 mt-1">{f.impact}</p>
-                            </div>
-                          )}
-                          {f.framework && f.framework !== "unknown" && (
-                            <div>
-                              <p className="text-gray-500">Framework</p>
-                              <p className="text-gray-300 mt-1">{f.framework}</p>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Code snippet */}
-                      {f.code_snippet && (
-                        <div>
-                          <p className="text-xs text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-1">
-                            <FileCode className="w-3 h-3" /> Vulnerable Code
-                          </p>
-                          <CodeBlock snippet={f.code_snippet} />
-                        </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-medium text-white truncate">{f.rule_id}</span>
+                      {f.cwe_id && (
+                        <span className="text-xs text-gray-500 bg-gray-800 border border-gray-700 px-1.5 py-0.5 rounded">
+                          {f.cwe_id}
+                        </span>
                       )}
-
-                      {/* Fix suggestion */}
-                      {f.fix_suggestion && (
-                        <div>
-                          <p className="text-xs text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-1">
-                            <Wrench className="w-3 h-3" /> How to Fix
-                          </p>
-                          <div className="rounded-lg bg-green-950/30 border border-green-800/40 px-4 py-3 text-sm text-green-300">
-                            {f.fix_suggestion}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* References */}
-                      {Array.isArray(f.ref_urls) && f.ref_urls.length > 0 && (
-                        <div>
-                          <p className="text-xs text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-1">
-                            <BookOpen className="w-3 h-3" /> References
-                          </p>
-                          <div className="flex flex-wrap gap-2">
-                            {f.ref_urls.map((url) => (
-                              <a
-                                key={url}
-                                href={url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="flex items-center gap-1 text-xs text-brand-500 hover:text-brand-400
-                                           bg-gray-800 border border-gray-700 px-2 py-1 rounded transition-colors"
-                              >
-                                <ExternalLink className="w-3 h-3" />
-                                {url.replace(/^https?:\/\/(www\.)?/, "").split("/")[0]}
-                              </a>
-                            ))}
-                          </div>
-                        </div>
+                      {f.owasp_category && (
+                        <span className="text-xs text-purple-400 bg-purple-900/20 border border-purple-700/40 px-1.5 py-0.5 rounded">
+                          {f.owasp_category}
+                        </span>
                       )}
                     </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </motion.div>
-          );
-        })}
-      </div>
+                    <p className="text-xs text-gray-400 mt-1 line-clamp-2">{f.message}</p>
+                    <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-600">
+                      <span className="flex items-center gap-1">
+                        <FileCode className="w-3 h-3" />
+                        {f.file_path.split("/").slice(-2).join("/")}:{f.line_start}
+                      </span>
+                      {f.class_name && <span>Class: <span className="text-gray-400">{f.class_name}</span></span>}
+                      {f.method_name && <span>Method: <span className="text-gray-400">{f.method_name}()</span></span>}
+                    </div>
+                  </div>
+                  <div className="shrink-0 text-gray-600 mt-1">
+                    {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                  </div>
+                </button>
+
+                {/* Expandable detail section */}
+                <AnimatePresence initial={false}>
+                  {open && (
+                    <motion.div
+                      key="detail"
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="overflow-hidden"
+                    >
+                      <div className="px-5 pb-5 border-t border-gray-700/60 pt-4 space-y-4">
+                        {/* Full file path + location */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                          <div>
+                            <p className="text-gray-500 uppercase tracking-wide mb-1">File</p>
+                            <p className="text-gray-300 font-mono break-all">{f.file_path}</p>
+                            <p className="text-gray-500 mt-1">
+                              Lines {f.line_start}
+                              {f.line_end && f.line_end !== f.line_start ? `–${f.line_end}` : ""}
+                            </p>
+                          </div>
+                          <div className="grid grid-cols-2 gap-3">
+                            {f.likelihood && (
+                              <div>
+                                <p className="text-gray-500 flex items-center gap-1">
+                                  <TrendingUp className="w-3 h-3" /> Likelihood
+                                </p>
+                                <p className="text-gray-300 mt-1">{f.likelihood}</p>
+                              </div>
+                            )}
+                            {f.impact && (
+                              <div>
+                                <p className="text-gray-500">Impact</p>
+                                <p className="text-gray-300 mt-1">{f.impact}</p>
+                              </div>
+                            )}
+                            {f.framework && f.framework !== "unknown" && (
+                              <div>
+                                <p className="text-gray-500">Framework</p>
+                                <p className="text-gray-300 mt-1">{f.framework}</p>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Code snippet */}
+                        {f.code_snippet && (
+                          <div>
+                            <p className="text-xs text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-1">
+                              <FileCode className="w-3 h-3" /> Vulnerable Code
+                            </p>
+                            <CodeBlock snippet={f.code_snippet} />
+                          </div>
+                        )}
+
+                        {/* Fix suggestion */}
+                        {f.fix_suggestion && (
+                          <div>
+                            <p className="text-xs text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-1">
+                              <Wrench className="w-3 h-3" /> How to Fix
+                            </p>
+                            <div className="rounded-lg bg-green-950/30 border border-green-800/40 px-4 py-3 text-sm text-green-300">
+                              {f.fix_suggestion}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* References */}
+                        {Array.isArray(f.ref_urls) && f.ref_urls.length > 0 && (
+                          <div>
+                            <p className="text-xs text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-1">
+                              <BookOpen className="w-3 h-3" /> References
+                            </p>
+                            <div className="flex flex-wrap gap-2">
+                              {f.ref_urls.map((url) => (
+                                <a
+                                  key={url}
+                                  href={url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="flex items-center gap-1 text-xs text-brand-500 hover:text-brand-400
+                                             bg-gray-800 border border-gray-700 px-2 py-1 rounded transition-colors"
+                                >
+                                  <ExternalLink className="w-3 h-3" />
+                                  {url.replace(/^https?:\/\/(www\.)?/, "").split("/")[0]}
+                                </a>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </motion.div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Code Review tab */}
+      {activeTab === "review" && (
+        <div className="space-y-4">
+          {/* Not yet triggered */}
+          {!crTriggered && (
+            <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-12 flex flex-col items-center gap-4">
+              <div className="w-14 h-14 rounded-full bg-purple-500/10 border border-purple-500/30 flex items-center justify-center">
+                <Brain className="w-7 h-7 text-purple-400" />
+              </div>
+              <div className="text-center">
+                <h3 className="text-base font-semibold text-white">LLM Code Review</h3>
+                <p className="text-sm text-gray-500 mt-1 max-w-md">
+                  Qwen2.5-Coder reviews every source file for security issues, performance problems,
+                  code quality, error handling, and best practices beyond what Semgrep detects.
+                </p>
+              </div>
+              <motion.button
+                onClick={handleRunCodeReview}
+                whileHover={{ scale: 1.03 }}
+                whileTap={{ scale: 0.97 }}
+                className="flex items-center gap-2 px-6 py-2.5 rounded-lg bg-purple-600 hover:bg-purple-500
+                           text-white text-sm font-medium transition-colors"
+              >
+                <PlayCircle className="w-4 h-4" />
+                Run Code Review
+              </motion.button>
+            </div>
+          )}
+
+          {/* Loading / in-progress */}
+          {crTriggered && crLoading && (
+            <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-12 flex flex-col items-center gap-3">
+              <Loader2 className="w-8 h-8 text-purple-400 animate-spin" />
+              <p className="text-sm text-gray-400">Reviewing files with Qwen2.5-Coder…</p>
+              <p className="text-xs text-gray-600">This may take several minutes depending on project size.</p>
+            </div>
+          )}
+
+          {/* Results available */}
+          {crTriggered && !crLoading && crFindings.length > 0 && (
+            <>
+              {/* Summary cards */}
+              {crSummary && (
+                <div className="grid grid-cols-3 lg:grid-cols-5 gap-3">
+                  {(["SECURITY", "PERFORMANCE", "CODE_QUALITY", "ERROR_HANDLING", "BEST_PRACTICES"] as ReviewCategory[]).map((cat) => {
+                    const key = cat.toLowerCase() as keyof CodeReviewSummary;
+                    const count = (crSummary[key] as number) ?? 0;
+                    return (
+                      <div key={cat} className={`rounded-lg border px-4 py-3 ${CAT_COLORS[cat]}`}>
+                        <div className="flex items-center gap-1.5 mb-1">{CAT_ICONS[cat]}
+                          <span className="text-xs font-semibold uppercase tracking-wide">
+                            {cat.replace("_", " ")}
+                          </span>
+                        </div>
+                        <p className="text-2xl font-bold tabular-nums">{count}</p>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Category filter */}
+              <div className="flex flex-wrap gap-2">
+                {(["ALL", "SECURITY", "PERFORMANCE", "CODE_QUALITY", "ERROR_HANDLING", "BEST_PRACTICES"] as const).map((cat) => {
+                  const count = cat === "ALL"
+                    ? crFindings.length
+                    : crFindings.filter((f) => f.category === cat).length;
+                  const active = crCatFilter === cat;
+                  return (
+                    <button
+                      key={cat}
+                      onClick={() => setCrCatFilter(cat)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+                        active
+                          ? "bg-purple-600 border-purple-500 text-white"
+                          : "bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500"
+                      }`}
+                    >
+                      {cat.replace("_", " ")} ({count})
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Finding rows */}
+              <div className="space-y-2">
+                <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wide">
+                  Findings — {crFiltered.length}
+                </h2>
+                {crFiltered.map((f) => {
+                  const open = crExpanded.has(f.id);
+                  return (
+                    <motion.div
+                      key={f.id}
+                      layout
+                      initial={{ opacity: 0, y: 6 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="rounded-xl bg-gray-900 border border-gray-700/60 overflow-hidden"
+                    >
+                      <button
+                        className="w-full text-left px-5 py-4 flex items-start gap-4 hover:bg-gray-800/40 transition-colors"
+                        onClick={() => toggleCrExpand(f.id)}
+                      >
+                        {/* Category badge */}
+                        <span className={`shrink-0 mt-0.5 flex items-center gap-1 text-xs font-semibold border px-2 py-1 rounded ${CAT_COLORS[f.category as ReviewCategory]}`}>
+                          {CAT_ICONS[f.category as ReviewCategory]}
+                          {f.category.replace("_", " ")}
+                        </span>
+
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-sm font-medium text-white">{f.title}</span>
+                            <SeverityBadge severity={f.severity} />
+                          </div>
+                          <p className="text-xs text-gray-400 mt-1 line-clamp-2">{f.description}</p>
+                          <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-600">
+                            <span className="flex items-center gap-1">
+                              <FileCode className="w-3 h-3" />
+                              {f.file_path.split("/").slice(-2).join("/")}
+                              {f.line_start ? `:${f.line_start}` : ""}
+                            </span>
+                            <span className="text-gray-700">
+                              Confidence: {Math.round((f.confidence ?? 0) * 100)}%
+                            </span>
+                          </div>
+                        </div>
+                        <div className="shrink-0 text-gray-600 mt-1">
+                          {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                        </div>
+                      </button>
+
+                      <AnimatePresence initial={false}>
+                        {open && (
+                          <motion.div
+                            key="cr-detail"
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: "auto", opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            transition={{ duration: 0.2 }}
+                            className="overflow-hidden"
+                          >
+                            <div className="px-5 pb-5 border-t border-gray-700/60 pt-4 space-y-4 text-sm">
+                              {/* File + lines */}
+                              <div>
+                                <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">File</p>
+                                <p className="text-gray-300 font-mono break-all text-xs">{f.file_path}</p>
+                                {f.line_start && (
+                                  <p className="text-gray-600 text-xs mt-1">
+                                    Lines {f.line_start}{f.line_end && f.line_end !== f.line_start ? `–${f.line_end}` : ""}
+                                  </p>
+                                )}
+                              </div>
+
+                              {/* Description */}
+                              <div>
+                                <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Description</p>
+                                <p className="text-gray-300 text-sm leading-relaxed">{f.description}</p>
+                              </div>
+
+                              {/* Recommendation */}
+                              <div>
+                                <p className="text-xs text-gray-500 uppercase tracking-wide mb-1 flex items-center gap-1">
+                                  <Wrench className="w-3 h-3" /> Recommendation
+                                </p>
+                                <div className="rounded-lg bg-green-950/30 border border-green-800/40 px-4 py-3 text-sm text-green-300">
+                                  {f.recommendation}
+                                </div>
+                              </div>
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </motion.div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

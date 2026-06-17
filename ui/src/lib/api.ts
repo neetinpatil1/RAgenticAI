@@ -1,4 +1,4 @@
-import type { ScanStatus, Finding } from "../types";
+import type { ScanStatus, Finding, RunSummary, CodeReviewFinding, CodeReviewSummary } from "../types";
 
 const BASE = "/api/v1";
 
@@ -26,6 +26,25 @@ export async function getFindings(runId: string): Promise<Finding[]> {
   if (!res.ok) throw new Error(`Findings fetch failed: ${res.status}`);
   const data = await res.json();
   return data.findings ?? [];
+}
+
+export async function getRuns(limit = 50): Promise<RunSummary[]> {
+  const res = await fetch(`${BASE}/runs?limit=${limit}`);
+  if (!res.ok) throw new Error(`Runs fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.runs ?? [];
+}
+
+export async function triggerCodeReview(runId: string): Promise<{ message: string }> {
+  const res = await fetch(`${BASE}/review/${runId}`, { method: "POST" });
+  if (!res.ok) throw new Error(`Code review trigger failed: ${res.status}`);
+  return res.json();
+}
+
+export async function getCodeReview(runId: string): Promise<{ findings: CodeReviewFinding[]; summary: CodeReviewSummary; count: number }> {
+  const res = await fetch(`${BASE}/review/${runId}?limit=500`);
+  if (!res.ok) throw new Error(`Code review fetch failed: ${res.status}`);
+  return res.json();
 }
 
 /** Open an SSE connection for real-time scan progress. */

@@ -1,0 +1,50 @@
+name: code_review_agent
+version: "1.0"
+phase: 1
+description: >
+  LLM-based code review agent. Reviews every source file for security issues,
+  performance anti-patterns, code quality, and best practices that Semgrep rules
+  cannot detect. Uses Qwen2.5-Coder:14b via Ollama.
+
+llm:
+  tier: 1                          # Always use Tier 1 (Qwen 14B) for deep analysis
+  model: qwen2.5-coder:14b
+  temperature: 0.1                 # Low temperature for consistent structured output
+  max_tokens: 2048
+
+review:
+  # File size limit — files larger than this are chunked or skipped
+  max_file_bytes: 51200            # 50 KB
+  # Maximum lines sent to LLM (truncated with notice if longer)
+  max_lines_per_review: 400
+  # Concurrent LLM calls (Ollama handles one at a time; pipeline queues extras)
+  concurrency: 1
+  # Minimum confidence threshold — findings below this are dropped
+  min_confidence: 0.5
+  # File extensions to review
+  extensions:
+    - .java
+    - .py
+    - .js
+    - .ts
+    - .jsx
+    - .tsx
+    - .go
+    - .rb
+    - .php
+    - .kt
+    - .scala
+    - .cs
+
+  # Smart prioritisation order for file selection
+  priority_paths:
+    - "**/security/**"
+    - "**/auth*/**"
+    - "**/payment*/**"
+    - "**/controller*/**"
+    - "**/service*/**"
+    - "**/repository*/**"
+    - "**/util*/**"
+
+prompts:
+  system: prompts/code_review_agent/v1.0/system.md

@@ -55,9 +55,13 @@ class OllamaConfig:
 class SemgrepConfig:
     """Semgrep SAST scanner settings. Runs in Docker sandbox for isolation."""
     # Detection rules path — Semgrep-format YAML rules for vulnerability detection.
-    # Passed as --config to Semgrep. Air-gap: bundled locally, no network calls.
+    # Points to the rules/ DIRECTORY so Semgrep loads ALL rule files recursively.
+    # Air-gap: bundled locally, no network calls.
+    # Sub-directories:
+    #   rules/owasp/    — 42 OWASP-mapped Java security rules
+    #   rules/custom/   — custom rules: Java, Python, JS, secrets, performance
     detection_rules_path: str = field(default_factory=lambda: os.getenv(
-        "SEMGREP_DETECTION_RULES_PATH", "./agents/security/sast/semgrep_detection_rules.yml"
+        "SEMGREP_DETECTION_RULES_PATH", "./agents/security/sast/rules"
     ))
     # FP filter rules path — Python Layer 1 format, NOT passed to Semgrep.
     # Loaded by core/fp_pipeline/layer1_rules.py for post-scan FP filtering.

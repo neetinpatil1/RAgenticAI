@@ -43,6 +43,9 @@
 | # | Task | File(s) | Status |
 |---|---|---|---|
 | 0.4.1 | Semgrep Docker sandbox wrapper | `tools/semgrep_tool.py` | ✅ |
+| 0.4.2 | Finding enrichment — `class_name`, `method_name`, `fix_suggestion`, `owasp_category`, `ref_urls`, `likelihood`, `impact` extracted at scan time | `tools/semgrep_tool.py` | ✅ |
+| 0.4.3 | Code snippet reader — reads file directly (Semgrep OSS `extra.lines` paywalled); marks vulnerable lines with `>>>` | `tools/semgrep_tool.py` | ✅ |
+| 0.4.4 | Scan coverage stats — `files_scanned`, `files_skipped`, `packages_total`, `packages_by_file` from `pom.xml` / `build.gradle` / `requirements.txt` / `package.json` | `tools/semgrep_tool.py` | ✅ |
 
 ### 0.5 SAST Agent
 | # | Task | File(s) | Status |
@@ -50,12 +53,18 @@
 | 0.5.1 | SAST agent config | `agents/security/sast/config.yml` | ✅ |
 | 0.5.2 | SAST LangGraph workflow | `workflows/sast_workflow.py` | ✅ |
 | 0.5.3 | Prompt: system + FP analysis | `prompts/sast_agent/v1.0/` | ✅ |
+| 0.5.4 | Workflow stores scan coverage stats in `workflow_runs.metadata` JSONB | `workflows/sast_workflow.py` | ✅ |
+| 0.5.5 | INSERT for all enrichment columns (`class_name`, `method_name`, `fix_suggestion`, `owasp_category`, `ref_urls`, `likelihood`, `impact`) | `workflows/sast_workflow.py` | ✅ |
 
 ### 0.6 API & Entry Point
 | # | Task | File(s) | Status |
 |---|---|---|---|
-| 0.6.1 | FastAPI gateway (`POST /api/v1/scan`) | `api/agent_gateway.py` | ✅ |
-| 0.6.2 | CLI entry point (`--scan /path`) | `main.py` | ✅ |
+| 0.6.1 | FastAPI gateway (`POST /api/v1/scan`, `GET /api/v1/scan/{run_id}`, findings + label endpoints) | `api/agent_gateway.py` | ✅ |
+| 0.6.2 | CLI entry point (`python main.py serve`) | `main.py` | ✅ |
+| 0.6.3 | `GET /api/v1/scan/{run_id}` returns `scan_coverage` object (files_scanned, files_clean, packages, duration) from `workflow_runs.metadata` | `api/agent_gateway.py` | ✅ |
+| 0.6.4 | `GET /api/v1/scan/{run_id}/stream` — SSE endpoint streams per-file progress events, ETA, and final `done` event | `api/agent_gateway.py` | ✅ |
+| 0.6.5 | `GET /api/v1/findings` returns all enrichment columns; JSONB `ref_urls` decoded from string to array | `api/agent_gateway.py` | ✅ |
+| 0.6.6 | FastAPI serves built React UI from `ui/dist/` on same port 8080 (single port) | `api/agent_gateway.py` | ✅ |
 
 ### 0.7 Minimal Labeling UI
 | # | Task | File(s) | Status |
@@ -63,13 +72,33 @@
 | 0.7.1 | Plain HTML labeling screen (no React) | `api/templates/labeling.html` | ✅ |
 | 0.7.2 | Label capture endpoint + labeling routes | `api/agent_gateway.py` | ✅ |
 
-### 0.8 Gate Verification
+### 0.8 React Scan UI (Built Ahead of Phase 1 Schedule)
+| # | Task | File(s) | Status |
+|---|---|---|---|
+| 0.8.1 | React 18 + Vite + Tailwind + Framer Motion + Recharts scaffold | `ui/package.json`, `vite.config.ts`, `tailwind.config.js` | ✅ |
+| 0.8.2 | `ScanInput` — folder path input, submit to `POST /api/v1/scan` | `ui/src/components/ScanInput.tsx` | ✅ |
+| 0.8.3 | `ScanProgress` — animated ring (blue→purple→green), spring file counter, filename fade, ETA, SSE-driven | `ui/src/components/ScanProgress.tsx` | ✅ |
+| 0.8.4 | `ScanResults` — coverage cards, severity pie chart, filter buttons, expandable findings table | `ui/src/components/ScanResults.tsx` | ✅ |
+| 0.8.5 | `CodeBlock` — line-numbered viewer, vulnerable lines highlighted red | `ui/src/components/CodeBlock.tsx` | ✅ |
+| 0.8.6 | `SeverityBadge` — color-coded CRITICAL/HIGH/MEDIUM/LOW/INFO pill | `ui/src/components/SeverityBadge.tsx` | ✅ |
+| 0.8.7 | API client (`submitScan`, `getScanStatus`, `getFindings`, `openSseStream`) | `ui/src/lib/api.ts` | ✅ |
+| 0.8.8 | TypeScript types for `Finding`, `ScanStatus`, `SseEvent`, `ScanCoverage` | `ui/src/types.ts` | ✅ |
+| 0.8.9 | React build served by FastAPI on port 8080 — single port, no Vite dev server needed | `api/agent_gateway.py`, `ui/dist/` | ✅ |
+
+### 0.9 DB Schema & Migrations
+| # | Task | File(s) | Status |
+|---|---|---|---|
+| 0.9.1 | `findings_reports` enrichment columns added to schema | `db/schema.sql` | ✅ |
+| 0.9.2 | `_add_columns_if_missing()` — idempotent ALTER TABLE on every startup | `db/migrations.py` | ✅ |
+| 0.9.3 | `SASTFinding` Pydantic contract updated with all enrichment fields | `core/output_contracts/sast_report.py` | ✅ |
+
+### 0.10 Gate Verification
 | # | Task | Status |
 |---|---|---|
-| 0.8.1 | Run against 200 real findings | ⬜ |
-| 0.8.2 | ≥75% LLM–human agreement measured | ⬜ |
-| 0.8.3 | Governance charter signed | ⬜ |
-| 0.8.4 | Air-gap setup scripts (`setup_semgrep_rules.sh`, `setup_grype_db.sh`, `setup_ollama_models.sh`) | ✅ |
+| 0.10.1 | Run against 200 real findings | ⬜ |
+| 0.10.2 | ≥75% LLM–human agreement measured | ⬜ |
+| 0.10.3 | Governance charter signed | ⬜ |
+| 0.10.4 | Air-gap setup scripts (`setup_semgrep_rules.sh`, `setup_grype_db.sh`, `setup_ollama_models.sh`) | ✅ |
 
 ---
 
@@ -86,7 +115,7 @@
 | 1.6 | Living golden dataset | `prompts/golden_datasets/` | ⬜ |
 | 1.7 | Gitea integration for prompts/rules | `core/prompt_manager.py` update | ⬜ |
 | 1.8 | HashiCorp Vault secrets | config update | ⬜ |
-| 1.9 | React UI foundation | `ui/` | ⬜ |
+| 1.9 | React UI foundation (Phase 0 scan UI shipped early — see 0.8.x) | `ui/` | 🔄 |
 | 1.10 | Git repo input support | `main.py` update | ⬜ |
 
 ---
@@ -128,7 +157,13 @@
 
 | Date | Decision | Reason |
 |---|---|---|
-| Jun 2025 | Phase 0 code-complete — 0.8.1–0.8.3 are operational (run real scans, measure agreement, sign charter) | — |
+| Jun 2026 | React scan UI (ScanInput + ScanProgress + ScanResults) shipped in Phase 0 ahead of Phase 1 schedule | User needed a working UI to view enriched findings — justified early delivery |
+| Jun 2026 | FastAPI serves React `ui/dist/` on port 8080 — single port, no separate Vite server | Simplify dev and prod; no cross-origin issues; one URL for users |
+| Jun 2026 | SSE (Server-Sent Events) chosen for real-time scan progress over WebSocket | Simpler one-way stream; WebSocket reserved for Phase 1 bidirectional agent activity feed |
+| Jun 2026 | `references` column renamed to `ref_urls` — PostgreSQL reserved keyword conflict | PG rejects `references` as a column name in some contexts |
+| Jun 2026 | asyncpg JSONB columns decoded manually before API response | asyncpg returns JSONB as raw string; `.map()` on a string crashes React silently |
+| Jun 2026 | Code snippet read directly from file (not Semgrep `extra.lines`) | Semgrep OSS paywalls `extra.lines`; file read + 3-line context gives same result |
+| Jun 2026 | Phase 0 code-complete — 0.10.1–0.10.3 are operational gates (run real scans, measure agreement, sign charter) | — |
 | Jun 2025 | Local path scanning for Phase 0 (no Git) | Remove Git dependency for initial dev |
 | Jun 2025 | Single Mac setup | Simplify start; split when RAM demands |
 | Jun 2025 | Native installs (no Docker for infra) | Ollama + PG run better natively on Apple Silicon |

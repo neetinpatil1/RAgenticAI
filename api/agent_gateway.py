@@ -51,6 +51,7 @@ from core.fp_pipeline.layer3_llm import Layer3LLM
 from core.watchdog import Watchdog
 from tools.semgrep_tool import SemgrepTool
 from workflows.sast_workflow import run_sast_workflow
+from workflows.code_review_workflow import run_code_review_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -487,13 +488,73 @@ async def capture_label(
 
 @app.get("/api/v1/runs")
 async def list_runs(
-    limit: int = Query(20, le=100),
+    limit: int = Query(50, le=200),
     pool: asyncpg.Pool = Depends(get_pool),
 ):
-    """List recent workflow runs for the Command Centre dashboard."""
-    wf_state = get_workflow_state()
-    runs = await wf_state.list_runs(limit=limit)
-    return {"runs": runs, "count": len(runs)}
+    """
+    List recent workflow runs with per-run severity counts.
+    Used by the Scan History screen.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                wr.run_id,
+                wr.scan_path,
+                wr.state,
+                wr.created_at,
+                wr.completed_at,
+                wr.error_msg,
+                wr.metadata,
+                COUNT(fr.id) FILTER (WHERE fr.severity = 'CRITICAL') AS critical,
+                COUNT(fr.id) FILTER (WHERE fr.severity = 'HIGH')     AS high,
+                COUNT(fr.id) FILTER (WHERE fr.severity = 'MEDIUM')   AS medium,
+                COUNT(fr.id) FILTER (WHERE fr.severity = 'LOW')      AS low,
+                COUNT(fr.id)                                         AS total
+            FROM workflow_runs wr
+            LEFT JOIN findings_reports fr ON fr.run_id = wr.run_id
+            GROUP BY wr.run_id, wr.scan_path, wr.state,
+                     wr.created_at, wr.completed_at, wr.error_msg, wr.metadata
+            ORDER BY wr.created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        # Parse metadata JSONB
+        meta = d.get("metadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        # Compute duration from metadata or timestamps
+        duration_ms = meta.get("scan_duration_ms", 0)
+        if not duration_ms and d.get("completed_at") and d.get("created_at"):
+            delta = d["completed_at"] - d["created_at"]
+            duration_ms = int(delta.total_seconds() * 1000)
+        result.append({
+            "run_id":       d["run_id"],
+            "scan_path":    d["scan_path"],
+            "project_name": d["scan_path"].rstrip("/").split("/")[-1] if d["scan_path"] else "—",
+            "state":        d["state"],
+            "created_at":   d["created_at"].isoformat() if d["created_at"] else None,
+            "completed_at": d["completed_at"].isoformat() if d["completed_at"] else None,
+            "duration_ms":  duration_ms,
+            "error":        d["error_msg"],
+            "severity": {
+                "critical": d["critical"] or 0,
+                "high":     d["high"]     or 0,
+                "medium":   d["medium"]   or 0,
+                "low":      d["low"]      or 0,
+                "total":    d["total"]    or 0,
+            },
+        })
+
+    return {"runs": result, "count": len(result)}
 
 
 @app.get("/api/v1/scan/{run_id}/stream")
@@ -686,6 +747,129 @@ async def label_count(pool: asyncpg.Pool = Depends(get_pool)):
         "fp_count":   fp_count,
         "target":     200,
         "progress_pct": round((total / 200) * 100, 1) if total else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Code Review Agent endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/review/{run_id}", status_code=202)
+async def trigger_code_review(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    pool: asyncpg.Pool = Depends(get_pool),
+):
+    """
+    Trigger Code Review Agent for a completed SAST scan.
+    Runs Qwen2.5-Coder on every source file — reviews security, performance,
+    code quality, and best practices beyond what Semgrep rules detect.
+    Results available via GET /api/v1/review/{run_id}.
+    """
+    wf_state = get_workflow_state()
+    run = await wf_state.get_run(run_id)
+    if not run:
+        raise HTTPException(404, f"Run not found: {run_id}")
+
+    # Check if code review already running / done
+    async with pool.acquire() as conn:
+        existing = await conn.fetchval(
+            "SELECT COUNT(*) FROM code_review_findings WHERE run_id = $1", run_id
+        )
+    if existing:
+        return {"message": "Code review already completed for this run", "run_id": run_id}
+
+    scan_path = run["scan_path"]
+    deps = _build_workflow_deps()
+
+    background_tasks.add_task(
+        run_code_review_workflow,
+        run_id=run_id,
+        scan_path=scan_path,
+        deps=deps,
+    )
+
+    logger.info("Code review triggered | run=%s path=%s", run_id, scan_path)
+    return {
+        "run_id":  run_id,
+        "status":  "accepted",
+        "message": f"Code review started. Poll GET /api/v1/review/{run_id} for results.",
+    }
+
+
+@app.get("/api/v1/review/{run_id}")
+async def get_code_review_findings(
+    run_id:   str,
+    category: Optional[str] = Query(None, description="SECURITY|PERFORMANCE|CODE_QUALITY|ERROR_HANDLING|BEST_PRACTICES"),
+    severity: Optional[str] = Query(None, description="CRITICAL|HIGH|MEDIUM|LOW|INFO"),
+    limit:    int            = Query(200, le=500),
+    pool:     asyncpg.Pool   = Depends(get_pool),
+):
+    """
+    Return code review findings for a run, with optional filters.
+    Also returns a summary: files reviewed, total findings, score distribution.
+    """
+    conditions = ["run_id = $1"]
+    params: list = [run_id]
+
+    if category:
+        params.append(category.upper())
+        conditions.append(f"category = ${len(params)}")
+    if severity:
+        params.append(severity.upper())
+        conditions.append(f"severity = ${len(params)}")
+
+    where = "WHERE " + " AND ".join(conditions)
+    params.append(limit)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT id, run_id, file_path, language, category, severity,
+                   line_start, line_end, title, description, recommendation,
+                   confidence, overall_file_score, created_at
+            FROM code_review_findings
+            {where}
+            ORDER BY
+                CASE severity
+                    WHEN 'CRITICAL' THEN 1
+                    WHEN 'HIGH'     THEN 2
+                    WHEN 'MEDIUM'   THEN 3
+                    WHEN 'LOW'      THEN 4
+                    ELSE                 5
+                END,
+                file_path, line_start NULLS LAST
+            LIMIT ${len(params)}
+            """,
+            *params,
+        )
+
+        # Summary counts
+        summary = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(DISTINCT file_path)                            AS files_reviewed,
+                COUNT(*)                                             AS total_findings,
+                COUNT(*) FILTER (WHERE severity = 'CRITICAL')       AS critical,
+                COUNT(*) FILTER (WHERE severity = 'HIGH')           AS high,
+                COUNT(*) FILTER (WHERE severity = 'MEDIUM')         AS medium,
+                COUNT(*) FILTER (WHERE severity = 'LOW')            AS low,
+                COUNT(*) FILTER (WHERE category = 'SECURITY')       AS security,
+                COUNT(*) FILTER (WHERE category = 'PERFORMANCE')    AS performance,
+                COUNT(*) FILTER (WHERE category = 'CODE_QUALITY')   AS code_quality,
+                COUNT(*) FILTER (WHERE category = 'ERROR_HANDLING') AS error_handling,
+                COUNT(*) FILTER (WHERE category = 'BEST_PRACTICES') AS best_practices
+            FROM code_review_findings
+            WHERE run_id = $1
+            """,
+            run_id,
+        )
+
+    return {
+        "run_id":   run_id,
+        "summary":  dict(summary) if summary else {},
+        "findings": [dict(r) for r in rows],
+        "count":    len(rows),
     }
 
 
