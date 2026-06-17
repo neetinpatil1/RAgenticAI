@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Output
+out/
+
+# Models & embeddings (large binary files)
+*.bin
+*.gguf
+*.safetensors
+*.pt
+*.pth
+models/
+ollama-models/
+
+# Security tool DBs (offline, not source-controlled)
+grype-db/
+trivy-db/
+*.db
+
+# Semgrep / Checkov / Kubescape offline rule caches
+opt/
+
+# Word temp/lock files
+~$*.docx
+~$*.xlsx
+~$*.pptx
+
+# Secrets & certs
+*.pem
+*.key
+*.crt
+secrets/
+vault-data/
+
+# Node (for React UI later)
+node_modules/
+ui/dist/
+ui/build/

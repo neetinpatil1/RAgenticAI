@@ -1,0 +1,9 @@
+[project]
+name = "ragenticai"
+version = "0.1.0"
+description = "Retrieval-Augmented Agentic AI project"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
