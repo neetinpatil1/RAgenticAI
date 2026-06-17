@@ -4,12 +4,15 @@ api/agent_gateway.py
 FastAPI gateway — the single HTTP interface for the SSDLC platform.
 
 Phase 0 endpoints:
-  POST /api/v1/scan          — submit a local path for SAST scanning
-  GET  /api/v1/scan/{run_id} — get scan status and results
-  GET  /api/v1/findings      — list findings (with filters)
-  POST /api/v1/label         — capture human label (approve / FP dismiss)
-  GET  /api/v1/runs          — list recent workflow runs
-  GET  /health               — liveness check
+  GET  /labeling                        — minimal HTML labeling screen
+  POST /api/v1/scan                     — submit a local path for SAST scanning
+  GET  /api/v1/scan/{run_id}            — get scan status and results
+  GET  /api/v1/findings                 — list findings (with filters)
+  GET  /api/v1/findings/next-for-review — next finding awaiting human review
+  POST /api/v1/label                    — capture human label (approve / FP dismiss)
+  GET  /api/v1/labels/count             — total human labels (Phase 0 gate progress)
+  GET  /api/v1/runs                     — list recent workflow runs
+  GET  /health                          — liveness check
 
 Design (SSDLC_Design_v3.2.docx §14):
   - All data read from PostgreSQL — no separate data store.
@@ -28,8 +31,10 @@ from pathlib import Path
 from typing import Optional
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from core.config import settings
@@ -45,6 +50,12 @@ from tools.semgrep_tool import SemgrepTool
 from workflows.sast_workflow import run_sast_workflow
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Jinja2 templates — serves labeling.html (Phase 0 labeling screen)
+# ---------------------------------------------------------------------------
+_TEMPLATES_DIR = Path(__file__).parent / "templates"
+templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 # ---------------------------------------------------------------------------
 # Module-level singletons — initialised in lifespan
@@ -427,3 +438,85 @@ async def list_runs(
     wf_state = get_workflow_state()
     runs = await wf_state.list_runs(limit=limit)
     return {"runs": runs, "count": len(runs)}
+
+
+@app.get("/labeling", response_class=HTMLResponse)
+async def labeling_screen(request: Request):
+    """
+    Serve the Phase 0 minimal HTML labeling screen.
+
+    Accessible at: http://localhost:8080/labeling
+    No auth in Phase 0 — reviewer name is stored in sessionStorage.
+    Phase 1+: replaced by React /console/labeling with full auth + kappa stats.
+    """
+    return templates.TemplateResponse("labeling.html", {"request": request})
+
+
+@app.get("/api/v1/findings/next-for-review")
+async def next_finding_for_review(pool: asyncpg.Pool = Depends(get_pool)):
+    """
+    Return the next finding awaiting human review.
+
+    Priority order:
+      1. DEADLOCK findings (FP Challenger could not resolve — mandatory human)
+      2. ESCALATED findings (LLM confidence too low)
+      3. REAL findings from last 24h (spot-check for agreement measurement)
+
+    Used by the labeling screen to load one finding at a time.
+    Returns 404 when queue is empty.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                fr.id, fr.run_id, fr.rule_id, fr.cwe_id, fr.severity,
+                fr.file_path, fr.line_start, fr.message, fr.framework,
+                fr.code_snippet, fr.is_baseline,
+                fp.verdict, fp.confidence, fp.fp_category, fp.reasoning,
+                fp.label_status
+            FROM findings_reports fr
+            JOIN fp_decisions fp ON fp.finding_id = fr.id
+            WHERE
+                fp.label_status = 'agent-only'
+                AND fp.verdict IN ('DEADLOCK', 'ESCALATED', 'REAL')
+                AND fr.is_baseline = FALSE
+            ORDER BY
+                CASE fp.verdict
+                    WHEN 'DEADLOCK'  THEN 1   -- highest priority
+                    WHEN 'ESCALATED' THEN 2
+                    ELSE                  3
+                END,
+                fr.severity DESC,
+                fr.created_at ASC
+            LIMIT 1
+            """
+        )
+
+    if not row:
+        raise HTTPException(404, "No findings awaiting review")
+
+    return {"finding": dict(row)}
+
+
+@app.get("/api/v1/labels/count")
+async def label_count(pool: asyncpg.Pool = Depends(get_pool)):
+    """
+    Return total human label count — used for Phase 0 gate progress bar.
+    Gate: ≥200 labels with ≥75% LLM–human agreement.
+    """
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM human_labels")
+        real_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM human_labels WHERE verdict = 'REAL'"
+        )
+        fp_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM human_labels WHERE verdict = 'FP'"
+        )
+
+    return {
+        "total":      total,
+        "real_count": real_count,
+        "fp_count":   fp_count,
+        "target":     200,
+        "progress_pct": round((total / 200) * 100, 1) if total else 0,
+    }

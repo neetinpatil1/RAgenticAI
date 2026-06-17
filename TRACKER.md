@@ -60,8 +60,8 @@
 ### 0.7 Minimal Labeling UI
 | # | Task | File(s) | Status |
 |---|---|---|---|
-| 0.7.1 | Plain HTML labeling screen (no React) | `api/templates/labeling.html` | ⬜ |
-| 0.7.2 | Label capture endpoint (`POST /api/v1/label`) | `api/agent_gateway.py` | ⬜ |
+| 0.7.1 | Plain HTML labeling screen (no React) | `api/templates/labeling.html` | ✅ |
+| 0.7.2 | Label capture endpoint + labeling routes | `api/agent_gateway.py` | ✅ |
 
 ### 0.8 Gate Verification
 | # | Task | Status |
@@ -69,7 +69,7 @@
 | 0.8.1 | Run against 200 real findings | ⬜ |
 | 0.8.2 | ≥75% LLM–human agreement measured | ⬜ |
 | 0.8.3 | Governance charter signed | ⬜ |
-| 0.8.4 | Air-gap setup scripts tested | ⬜ |
+| 0.8.4 | Air-gap setup scripts (`setup_semgrep_rules.sh`, `setup_grype_db.sh`, `setup_ollama_models.sh`) | ✅ |
 
 ---
 
@@ -128,6 +128,7 @@
 
 | Date | Decision | Reason |
 |---|---|---|
+| Jun 2025 | Phase 0 code-complete — 0.8.1–0.8.3 are operational (run real scans, measure agreement, sign charter) | — |
 | Jun 2025 | Local path scanning for Phase 0 (no Git) | Remove Git dependency for initial dev |
 | Jun 2025 | Single Mac setup | Simplify start; split when RAM demands |
 | Jun 2025 | Native installs (no Docker for infra) | Ollama + PG run better natively on Apple Silicon |

@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<!--
+  api/templates/labeling.html
+  ============================
+  Phase 0 minimal labeling screen — plain HTML, no React, no build step.
+
+  Design (SSDLC_Design_v3.2.docx §6.1 — Labels as Workflow Exhaust):
+    "A human never performs labeling as a standalone task.
+     Every human action in the platform UI automatically emits a label."
+
+  What this screen does:
+    1. Fetches the next finding awaiting human review from GET /api/v1/findings/next-for-review
+    2. Displays: rule, severity, CWE, file, code snippet, agent verdict + reasoning
+    3. Reviewer clicks REAL or FP (with mandatory category + justification for FP)
+    4. POST /api/v1/label writes label to PG atomically with fp_decisions update
+    5. Moves to next finding automatically
+
+  Phase 1+: replaced by React /console/labeling screen with kappa + velocity stats.
+  This screen is sufficient for Phase 0 gate (200 labeled findings).
+
+  Prompt injection note:
+    Code snippets are rendered as plain text inside <pre> tags (no innerHTML).
+    User-controlled content never touches the DOM as HTML.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SSDLC — Security Finding Review</title>
+  <style>
+    /* ---------- Reset & Base ---------- */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ---------- Header ---------- */
+    header {
+      background: #1a1d2e;
+      border-bottom: 1px solid #2d3748;
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .brand { font-size: 14px; font-weight: 600; color: #63b3ed; letter-spacing: 0.05em; }
+    .session-info { display: flex; gap: 24px; font-size: 13px; color: #718096; }
+    .session-info span strong { color: #e2e8f0; }
+    #timer { color: #f6ad55; font-weight: 600; }
+
+    /* ---------- Main Layout ---------- */
+    main { flex: 1; max-width: 960px; width: 100%; margin: 0 auto; padding: 24px 16px; }
+
+    /* ---------- Progress Bar ---------- */
+    .progress-wrap { margin-bottom: 20px; }
+    .progress-label { font-size: 12px; color: #718096; margin-bottom: 6px; display: flex; justify-content: space-between; }
+    .progress-bar { background: #2d3748; border-radius: 4px; height: 6px; overflow: hidden; }
+    .progress-fill { background: #4299e1; height: 100%; transition: width 0.4s ease; }
+
+    /* ---------- Finding Card ---------- */
+    .card {
+      background: #1a1d2e;
+      border: 1px solid #2d3748;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-bottom: 20px;
+    }
+    .card-header {
+      padding: 14px 20px;
+      border-bottom: 1px solid #2d3748;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      padding: 3px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+    .badge-CRITICAL { background: #742a2a; color: #fc8181; }
+    .badge-HIGH     { background: #7b341e; color: #f6ad55; }
+    .badge-MEDIUM   { background: #744210; color: #f6e05e; }
+    .badge-LOW      { background: #1a365d; color: #63b3ed; }
+    .badge-INFO     { background: #1a202c; color: #a0aec0; }
+    .rule-id { font-family: monospace; font-size: 13px; color: #9f7aea; }
+    .cwe-tag { font-size: 12px; color: #68d391; background: #1c4532; padding: 3px 8px; border-radius: 4px; }
+    .framework-tag { font-size: 12px; color: #76e4f7; background: #1a365d; padding: 3px 8px; border-radius: 4px; }
+
+    .card-body { padding: 16px 20px; }
+
+    .meta-row { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; font-size: 13px; }
+    .meta-label { color: #718096; min-width: 80px; flex-shrink: 0; }
+    .meta-value { color: #e2e8f0; word-break: break-all; }
+    .meta-value.filepath { font-family: monospace; color: #76e4f7; }
+
+    /* Code snippet — plain text, no innerHTML (prompt injection safe) */
+    .code-block {
+      background: #0d1117;
+      border: 1px solid #2d3748;
+      border-radius: 6px;
+      padding: 14px;
+      margin: 12px 0;
+      overflow-x: auto;
+      max-height: 280px;
+    }
+    .code-block pre {
+      font-family: "SF Mono", "Fira Code", monospace;
+      font-size: 12px;
+      color: #d4d4d4;
+      white-space: pre;
+      line-height: 1.6;
+    }
+
+    /* Agent verdict section */
+    .agent-verdict {
+      background: #171923;
+      border: 1px solid #2d3748;
+      border-left: 3px solid #9f7aea;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin-top: 14px;
+    }
+    .agent-verdict-label { font-size: 11px; color: #718096; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
+    .agent-verdict-row { display: flex; gap: 12px; align-items: center; margin-bottom: 4px; }
+    .verdict-REAL      { color: #fc8181; font-weight: 700; }
+    .verdict-FP        { color: #68d391; font-weight: 700; }
+    .verdict-ESCALATED { color: #f6ad55; font-weight: 700; }
+    .verdict-DEADLOCK  { color: #fc8181; font-weight: 700; }
+    .confidence-pill {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #2d3748;
+      color: #a0aec0;
+    }
+    .agent-reasoning { font-size: 13px; color: #a0aec0; margin-top: 6px; line-height: 1.5; }
+
+    /* ---------- Label Form ---------- */
+    .label-form {
+      background: #1a1d2e;
+      border: 1px solid #2d3748;
+      border-radius: 8px;
+      padding: 20px;
+    }
+    .form-title { font-size: 14px; font-weight: 600; margin-bottom: 16px; color: #e2e8f0; }
+
+    .verdict-buttons { display: flex; gap: 12px; margin-bottom: 18px; }
+    .btn-verdict {
+      flex: 1;
+      padding: 14px;
+      border: 2px solid transparent;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.15s;
+      letter-spacing: 0.04em;
+    }
+    .btn-real {
+      background: #742a2a;
+      color: #fc8181;
+      border-color: #742a2a;
+    }
+    .btn-real:hover, .btn-real.selected {
+      background: #9b2c2c;
+      border-color: #fc8181;
+    }
+    .btn-fp {
+      background: #1c4532;
+      color: #68d391;
+      border-color: #1c4532;
+    }
+    .btn-fp:hover, .btn-fp.selected {
+      background: #276749;
+      border-color: #68d391;
+    }
+
+    /* FP detail fields — hidden until FP selected */
+    #fp-details { display: none; }
+    #fp-details.visible { display: block; }
+
+    .form-group { margin-bottom: 14px; }
+    label { display: block; font-size: 13px; color: #a0aec0; margin-bottom: 6px; }
+    label .required { color: #fc8181; margin-left: 2px; }
+    select, textarea {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid #4a5568;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 14px;
+      padding: 10px 12px;
+      transition: border-color 0.15s;
+    }
+    select:focus, textarea:focus {
+      outline: none;
+      border-color: #63b3ed;
+    }
+    textarea { resize: vertical; min-height: 80px; font-family: inherit; }
+
+    .char-count { font-size: 11px; color: #718096; text-align: right; margin-top: 4px; }
+    .char-count.warn { color: #f6ad55; }
+
+    .btn-submit {
+      width: 100%;
+      padding: 14px;
+      background: #3182ce;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+      margin-top: 8px;
+    }
+    .btn-submit:hover { background: #2b6cb0; }
+    .btn-submit:disabled { background: #2d3748; color: #718096; cursor: not-allowed; }
+
+    /* ---------- States ---------- */
+    .state-panel {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 60px 20px;
+      text-align: center;
+      color: #718096;
+    }
+    .state-panel .icon { font-size: 48px; margin-bottom: 16px; }
+    .state-panel h2 { font-size: 20px; color: #e2e8f0; margin-bottom: 8px; }
+    .state-panel p { font-size: 14px; line-height: 1.6; max-width: 440px; }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      padding: 12px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+      z-index: 100;
+    }
+    .toast.show { opacity: 1; }
+    .toast.success { background: #276749; color: #68d391; }
+    .toast.error   { background: #742a2a; color: #fc8181; }
+
+    .spinner {
+      border: 3px solid #2d3748;
+      border-top-color: #63b3ed;
+      border-radius: 50%;
+      width: 32px;
+      height: 32px;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 16px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <div class="brand">SSDLC Platform — Security Finding Review</div>
+  <div class="session-info">
+    <span>Reviewer: <strong id="reviewer-name">—</strong></span>
+    <span>Labelled: <strong id="labelled-count">0</strong></span>
+    <span>Session: <strong id="timer">00:00</strong></span>
+  </div>
+</header>
+
+<main>
+
+  <!-- Progress bar -->
+  <div class="progress-wrap" id="progress-wrap" style="display:none">
+    <div class="progress-label">
+      <span>Phase 0 Gate Progress</span>
+      <span id="progress-text">0 / 200 labels (target for ≥75% agreement)</span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+    </div>
+  </div>
+
+  <!-- Loading state -->
+  <div class="state-panel" id="state-loading">
+    <div class="spinner"></div>
+    <p>Loading next finding…</p>
+  </div>
+
+  <!-- Empty queue state -->
+  <div class="state-panel" id="state-empty" style="display:none">
+    <div class="icon">✅</div>
+    <h2>Review queue is empty</h2>
+    <p>All ESCALATED and DEADLOCK findings have been reviewed.<br>
+       New findings will appear here after the next scan.</p>
+    <button class="btn-submit" style="max-width:200px;margin-top:24px" onclick="loadNext()">
+      Refresh
+    </button>
+  </div>
+
+  <!-- Error state -->
+  <div class="state-panel" id="state-error" style="display:none">
+    <div class="icon">⚠️</div>
+    <h2>Unable to load finding</h2>
+    <p id="error-message">An error occurred.</p>
+    <button class="btn-submit" style="max-width:200px;margin-top:24px" onclick="loadNext()">
+      Retry
+    </button>
+  </div>
+
+  <!-- Finding card -->
+  <div id="finding-panel" style="display:none">
+
+    <div class="card">
+      <div class="card-header">
+        <span class="badge" id="severity-badge">—</span>
+        <span class="rule-id" id="rule-id">—</span>
+        <span class="cwe-tag" id="cwe-tag" style="display:none">—</span>
+        <span class="framework-tag" id="framework-tag" style="display:none">—</span>
+      </div>
+      <div class="card-body">
+        <div class="meta-row">
+          <span class="meta-label">Message</span>
+          <span class="meta-value" id="message">—</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">File</span>
+          <span class="meta-value filepath" id="filepath">—</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Run ID</span>
+          <span class="meta-value" id="run-id-display" style="font-size:11px;color:#718096">—</span>
+        </div>
+
+        <!-- Code snippet: textContent only — never innerHTML -->
+        <div class="code-block" id="code-block" style="display:none">
+          <pre id="code-snippet"></pre>
+        </div>
+
+        <!-- Agent verdict -->
+        <div class="agent-verdict" id="agent-verdict" style="display:none">
+          <div class="agent-verdict-label">Agent verdict (Layer 3 — Qwen2.5-Coder:14b)</div>
+          <div class="agent-verdict-row">
+            <span id="agent-verdict-text">—</span>
+            <span class="confidence-pill" id="agent-confidence">confidence: —</span>
+            <span id="agent-fp-category" style="font-size:12px;color:#a0aec0"></span>
+          </div>
+          <div class="agent-reasoning" id="agent-reasoning"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Label form -->
+    <div class="label-form">
+      <div class="form-title">Your Verdict</div>
+
+      <div class="verdict-buttons">
+        <button class="btn-verdict btn-real"  onclick="selectVerdict('REAL')">✗ REAL</button>
+        <button class="btn-verdict btn-fp"    onclick="selectVerdict('FP')">✓ FALSE POSITIVE</button>
+      </div>
+
+      <!-- Shown only when FP is selected -->
+      <div id="fp-details">
+        <div class="form-group">
+          <label for="fp-category">FP Category <span class="required">*</span></label>
+          <select id="fp-category">
+            <option value="">— select reason —</option>
+            <option value="test-code">test-code — Finding is in test / mock / stub code</option>
+            <option value="config-only">config-only — Configuration file, not executable</option>
+            <option value="framework-safe">framework-safe — Framework handles this automatically</option>
+            <option value="dead-code">dead-code — Unreachable or commented-out code</option>
+            <option value="out-of-scope">out-of-scope — Explicitly excluded from review scope</option>
+            <option value="annotation-suppressed">annotation-suppressed — @SuppressWarnings or equivalent</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="justification">
+          Justification <span class="required">*</span>
+          <span style="font-size:11px;color:#718096;font-weight:400"> — be specific, min 10 chars</span>
+        </label>
+        <textarea
+          id="justification"
+          placeholder="Explain your decision. E.g. 'This is a Spring Data JPA method query — JPA parameterises automatically, not vulnerable to SQL injection.'"
+          oninput="updateCharCount()"
+        ></textarea>
+        <div class="char-count" id="char-count">0 chars</div>
+      </div>
+
+      <button class="btn-submit" id="submit-btn" disabled onclick="submitLabel()">
+        Submit &amp; Next →
+      </button>
+    </div>
+
+  </div><!-- /finding-panel -->
+
+</main>
+
+<!-- Toast notification -->
+<div class="toast" id="toast"></div>
+
+<script>
+// =============================================================================
+// SSDLC Labeling Screen — Phase 0
+// Plain JavaScript, no framework, no CDN calls (air-gap safe).
+// =============================================================================
+
+// --- State ---
+let currentFinding = null;   // full finding object from API
+let selectedVerdict = null;  // 'REAL' | 'FP'
+let labelledCount = 0;
+let sessionStart = Date.now();
+let timerInterval = null;
+
+// Reviewer ID — in Phase 1+ set by auth middleware; Phase 0 prompts on load
+let reviewerId = sessionStorage.getItem('reviewerId') || '';
+
+// --- Init ---
+document.addEventListener('DOMContentLoaded', () => {
+  if (!reviewerId) {
+    reviewerId = prompt('Enter your reviewer name (used for labeling audit):') || 'anonymous';
+    sessionStorage.setItem('reviewerId', reviewerId);
+  }
+  document.getElementById('reviewer-name').textContent = reviewerId;
+  startTimer();
+  loadNext();
+  loadProgress();
+});
+
+// --- Timer ---
+function startTimer() {
+  timerInterval = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
+    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const s = String(elapsed % 60).padStart(2, '0');
+    document.getElementById('timer').textContent = `${m}:${s}`;
+
+    // Warn at 30-min mark (Phase 0 duty rotation guideline)
+    if (elapsed === 1800) showToast('30-minute mark — consider handing off to next reviewer', 'error');
+  }, 1000);
+}
+
+// --- Load next finding for review ---
+async function loadNext() {
+  showState('loading');
+  selectedVerdict = null;
+  document.getElementById('justification').value = '';
+  document.getElementById('fp-category').value = '';
+  document.getElementById('fp-details').classList.remove('visible');
+  document.querySelectorAll('.btn-verdict').forEach(b => b.classList.remove('selected'));
+  updateSubmitState();
+
+  try {
+    const res = await fetch('/api/v1/findings/next-for-review');
+    if (res.status === 404) { showState('empty'); return; }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const data = await res.json();
+    if (!data.finding) { showState('empty'); return; }
+
+    currentFinding = data.finding;
+    renderFinding(currentFinding);
+    showState('finding');
+  } catch (err) {
+    document.getElementById('error-message').textContent = err.message;
+    showState('error');
+  }
+}
+
+// --- Render finding into DOM (no innerHTML for user content — XSS safe) ---
+function renderFinding(f) {
+  // Severity badge
+  const badge = document.getElementById('severity-badge');
+  badge.textContent = f.severity;
+  badge.className = `badge badge-${f.severity}`;
+
+  // Rule, CWE, framework
+  document.getElementById('rule-id').textContent = f.rule_id;
+
+  const cweTag = document.getElementById('cwe-tag');
+  if (f.cwe_id) { cweTag.textContent = f.cwe_id; cweTag.style.display = ''; }
+  else           { cweTag.style.display = 'none'; }
+
+  const fwTag = document.getElementById('framework-tag');
+  if (f.framework && f.framework !== 'unknown') {
+    fwTag.textContent = f.framework;
+    fwTag.style.display = '';
+  } else { fwTag.style.display = 'none'; }
+
+  // Meta
+  document.getElementById('message').textContent = f.message || '—';
+  document.getElementById('filepath').textContent = `${f.file_path}:${f.line_start}`;
+  document.getElementById('run-id-display').textContent = `Run: ${f.run_id}`;
+
+  // Code snippet — textContent ONLY (prompt injection safe, no innerHTML)
+  const codeBlock = document.getElementById('code-block');
+  if (f.code_snippet) {
+    document.getElementById('code-snippet').textContent = f.code_snippet;
+    codeBlock.style.display = '';
+  } else {
+    codeBlock.style.display = 'none';
+  }
+
+  // Agent verdict
+  const agentSection = document.getElementById('agent-verdict');
+  if (f.verdict) {
+    const vt = document.getElementById('agent-verdict-text');
+    vt.textContent = f.verdict;
+    vt.className = `verdict-${f.verdict}`;
+    document.getElementById('agent-confidence').textContent =
+      `confidence: ${f.confidence != null ? (f.confidence * 100).toFixed(0) + '%' : '—'}`;
+    document.getElementById('agent-fp-category').textContent =
+      f.fp_category ? `[${f.fp_category}]` : '';
+    document.getElementById('agent-reasoning').textContent = f.reasoning || '';
+    agentSection.style.display = '';
+  } else {
+    agentSection.style.display = 'none';
+  }
+}
+
+// --- Verdict selection ---
+function selectVerdict(v) {
+  selectedVerdict = v;
+  document.querySelectorAll('.btn-verdict').forEach(b => b.classList.remove('selected'));
+  document.querySelector(v === 'REAL' ? '.btn-real' : '.btn-fp').classList.add('selected');
+
+  const fpDetails = document.getElementById('fp-details');
+  if (v === 'FP') fpDetails.classList.add('visible');
+  else            fpDetails.classList.remove('visible');
+
+  updateSubmitState();
+}
+
+// --- Char count & submit state ---
+function updateCharCount() {
+  const len = document.getElementById('justification').value.length;
+  const el = document.getElementById('char-count');
+  el.textContent = `${len} chars`;
+  el.className = len > 0 && len < 10 ? 'char-count warn' : 'char-count';
+  updateSubmitState();
+}
+
+function updateSubmitState() {
+  const justLen = document.getElementById('justification').value.trim().length;
+  const fpCat   = document.getElementById('fp-category').value;
+  const ok = selectedVerdict !== null
+    && justLen >= 10
+    && (selectedVerdict !== 'FP' || fpCat !== '');
+  document.getElementById('submit-btn').disabled = !ok;
+}
+
+// --- Submit label ---
+async function submitLabel() {
+  if (!currentFinding || !selectedVerdict) return;
+
+  const justification = document.getElementById('justification').value.trim();
+  const fpCategory    = document.getElementById('fp-category').value || null;
+
+  const payload = {
+    finding_id:    currentFinding.id,
+    run_id:        currentFinding.run_id,
+    verdict:       selectedVerdict,
+    fp_category:   selectedVerdict === 'FP' ? fpCategory : null,
+    justification: justification,
+    labeler_id:    reviewerId,
+  };
+
+  document.getElementById('submit-btn').disabled = true;
+  document.getElementById('submit-btn').textContent = 'Saving…';
+
+  try {
+    const res = await fetch('/api/v1/label', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+
+    labelledCount++;
+    document.getElementById('labelled-count').textContent = labelledCount;
+    showToast(`Labelled as ${selectedVerdict} ✓`, 'success');
+    loadProgress();
+    await loadNext();
+
+  } catch (err) {
+    showToast(`Error: ${err.message}`, 'error');
+    document.getElementById('submit-btn').disabled = false;
+    document.getElementById('submit-btn').textContent = 'Submit & Next →';
+  }
+}
+
+// --- Progress bar (Phase 0 gate: 200 labels) ---
+async function loadProgress() {
+  try {
+    const res = await fetch('/api/v1/labels/count');
+    if (!res.ok) return;
+    const data = await res.json();
+    const total = data.total || 0;
+    const target = 200;
+    const pct = Math.min(100, (total / target) * 100).toFixed(1);
+    document.getElementById('progress-text').textContent =
+      `${total} / ${target} labels (Phase 0 gate: ≥75% agreement)`;
+    document.getElementById('progress-fill').style.width = pct + '%';
+    document.getElementById('progress-wrap').style.display = '';
+  } catch (_) { /* progress bar is non-critical */ }
+}
+
+// --- UI helpers ---
+function showState(state) {
+  document.getElementById('state-loading').style.display = state === 'loading' ? '' : 'none';
+  document.getElementById('state-empty').style.display   = state === 'empty'   ? '' : 'none';
+  document.getElementById('state-error').style.display   = state === 'error'   ? '' : 'none';
+  document.getElementById('finding-panel').style.display = state === 'finding' ? '' : 'none';
+}
+
+function showToast(msg, type = 'success') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = `toast ${type} show`;
+  setTimeout(() => { t.className = `toast ${type}`; }, 3000);
+}
+</script>
+</body>
+</html>
