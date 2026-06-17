@@ -63,6 +63,11 @@ class SastWorkflowState(TypedDict):
     raw_findings: list[dict]          # serialised SASTFinding dicts
     scan_duration_ms: int
     files_scanned: int
+    files_skipped: int
+    files_with_findings: int
+    skip_reasons: dict
+    packages_total: int
+    packages_by_file: list
 
     # Set by write_findings node
     finding_db_ids: dict[str, str]    # fingerprint → DB UUID mapping
@@ -112,7 +117,7 @@ async def node_run_semgrep(state: SastWorkflowState, deps: dict) -> SastWorkflow
 
     start = datetime.now(timezone.utc)
     try:
-        findings: list[SASTFinding] = await tool.scan(state["scan_path"])
+        findings, scan_stats = await tool.scan(state["scan_path"])
     except Exception as exc:
         logger.error("Semgrep scan failed | run=%s error=%s", run_id, exc)
         await audit.log(
@@ -125,18 +130,26 @@ async def node_run_semgrep(state: SastWorkflowState, deps: dict) -> SastWorkflow
 
     elapsed_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
 
+    # Count packages from build files (pom.xml, build.gradle, requirements.txt, package.json)
+    pkg_stats = tool.count_packages(state["scan_path"])
+
     # Serialise findings to dicts for state (LangGraph state must be serialisable)
     findings_dicts = [f.model_dump() for f in findings]
 
     logger.info(
-        "Semgrep complete | run=%s findings=%d duration=%dms",
-        run_id, len(findings), elapsed_ms
+        "Semgrep complete | run=%s findings=%d files_scanned=%d packages=%d duration=%dms",
+        run_id, len(findings), scan_stats["files_scanned"], pkg_stats["total"], elapsed_ms,
     )
     return {
         **state,
-        "raw_findings": findings_dicts,
-        "scan_duration_ms": elapsed_ms,
-        "files_scanned": 0,        # populated from Semgrep output in full impl
+        "raw_findings":        findings_dicts,
+        "scan_duration_ms":    elapsed_ms,
+        "files_scanned":       scan_stats["files_scanned"],
+        "files_skipped":       scan_stats["files_skipped"],
+        "files_with_findings": scan_stats["files_with_findings"],
+        "skip_reasons":        scan_stats["skip_reasons"],
+        "packages_total":      pkg_stats["total"],
+        "packages_by_file":    pkg_stats["by_file"],
     }
 
 
@@ -179,14 +192,17 @@ async def node_write_findings(state: SastWorkflowState, deps: dict) -> SastWorkf
             embed_text = f"{finding.message}\n\n{finding.code_snippet or ''}"
 
             async with conn.transaction():
-                # Insert finding
+                # Insert finding with all enrichment fields
                 await conn.execute(
                     """
                     INSERT INTO findings_reports
                         (id, run_id, fingerprint, tool, rule_id, cwe_id, severity,
                          file_path, line_start, line_end, code_snippet, message,
-                         framework, is_baseline)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                         framework, is_baseline,
+                         class_name, method_name, fix_suggestion,
+                         owasp_category, ref_urls, likelihood, impact)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+                            $15,$16,$17,$18,$19::jsonb,$20,$21)
                     ON CONFLICT DO NOTHING
                     """,
                     finding_id, run_id, finding.fingerprint, "semgrep",
@@ -194,6 +210,10 @@ async def node_write_findings(state: SastWorkflowState, deps: dict) -> SastWorkf
                     finding.file_path, finding.line_start, finding.line_end,
                     finding.code_snippet, finding.message,
                     finding.framework.value, is_first_scan,
+                    finding.class_name, finding.method_name, finding.fix_suggestion,
+                    finding.owasp_category,
+                    json.dumps(finding.references),
+                    finding.likelihood, finding.impact,
                 )
 
             finding_db_ids[finding.fingerprint] = finding_id
@@ -375,12 +395,32 @@ async def node_enqueue_next(state: SastWorkflowState, deps: dict) -> SastWorkflo
         priority=5,
     )
 
+    # Persist scan stats into workflow_runs.metadata so the status endpoint can return them
+    scan_stats = {
+        "files_scanned":       state.get("files_scanned", 0),
+        "files_skipped":       state.get("files_skipped", 0),
+        "files_with_findings": state.get("files_with_findings", 0),
+        "files_clean":         max(0, state.get("files_scanned", 0) - state.get("files_with_findings", 0)),
+        "skip_reasons":        state.get("skip_reasons", {}),
+        "packages_total":      state.get("packages_total", 0),
+        "packages_by_file":    state.get("packages_by_file", []),
+        "scan_duration_ms":    state.get("scan_duration_ms", 0),
+        "fp_summary":          fp_summary,
+    }
+    pool: asyncpg.Pool = deps["pool"]
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE workflow_runs SET metadata = $1::jsonb WHERE run_id = $2",
+            json.dumps(scan_stats),
+            run_id,
+        )
+
     await wf_state.set_completed(run_id)
     await audit.log(
         event_type=AuditEvent.SCAN_COMPLETED,
         actor="sast_agent",
         run_id=run_id,
-        payload=fp_summary,
+        payload=scan_stats,
     )
 
     logger.info(
@@ -460,16 +500,36 @@ async def run_sast_workflow(
     app = build_sast_graph(deps)
 
     initial_state: SastWorkflowState = {
-        "run_id":         run_id,
-        "scan_path":      scan_path,
-        "raw_findings":   [],
-        "scan_duration_ms": 0,
-        "files_scanned":  0,
-        "finding_db_ids": {},
-        "fp_results":     [],
+        "run_id":              run_id,
+        "scan_path":           scan_path,
+        "raw_findings":        [],
+        "scan_duration_ms":    0,
+        "files_scanned":       0,
+        "files_skipped":       0,
+        "files_with_findings": 0,
+        "skip_reasons":        {},
+        "packages_total":      0,
+        "packages_by_file":    [],
+        "finding_db_ids":      {},
+        "fp_results":          [],
         "fp_summary":     {},
         "error":          None,
     }
 
-    final_state = await app.ainvoke(initial_state)
+    try:
+        final_state = await app.ainvoke(initial_state)
+    except Exception as exc:
+        # Top-level catch: ensure the run is never left stuck in 'running'
+        logger.error("SAST workflow crashed | run=%s error=%s", run_id, exc, exc_info=True)
+        wf_state: WorkflowState = deps.get("workflow_state")
+        if wf_state:
+            await wf_state.set_failed(run_id, str(exc))
+        raise
+
+    # If semgrep error propagated through state, mark run as failed
+    if final_state.get("error"):
+        wf_state = deps.get("workflow_state")
+        if wf_state:
+            await wf_state.set_failed(run_id, final_state["error"])
+
     return final_state

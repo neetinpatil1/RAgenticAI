@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 core/state/workflow_state.py
 =============================

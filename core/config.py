@@ -54,8 +54,16 @@ class OllamaConfig:
 @dataclass
 class SemgrepConfig:
     """Semgrep SAST scanner settings. Runs in Docker sandbox for isolation."""
-    # Local rules path — air-gap: rules downloaded once and stored here
-    rules_path: str = field(default_factory=lambda: os.getenv("SEMGREP_RULES_PATH", "./agents/security/sast/fp_rules.yml"))
+    # Detection rules path — Semgrep-format YAML rules for vulnerability detection.
+    # Passed as --config to Semgrep. Air-gap: bundled locally, no network calls.
+    detection_rules_path: str = field(default_factory=lambda: os.getenv(
+        "SEMGREP_DETECTION_RULES_PATH", "./agents/security/sast/semgrep_detection_rules.yml"
+    ))
+    # FP filter rules path — Python Layer 1 format, NOT passed to Semgrep.
+    # Loaded by core/fp_pipeline/layer1_rules.py for post-scan FP filtering.
+    rules_path: str = field(default_factory=lambda: os.getenv(
+        "SEMGREP_RULES_PATH", "./agents/security/sast/fp_rules.yml"
+    ))
     # Docker image used for sandboxed execution
     docker_image: str = field(default_factory=lambda: os.getenv("SEMGREP_DOCKER_IMAGE", "semgrep/semgrep:latest"))
     # Timeout per scan in seconds

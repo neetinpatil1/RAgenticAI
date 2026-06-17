@@ -1,0 +1,375 @@
+# =============================================================================
+# agents/security/sast/semgrep_detection_rules.yml
+# Semgrep Vulnerability DETECTION Rules — Java / Spring Boot (Phase 0)
+#
+# These are SEMGREP-FORMAT rules used by tools/semgrep_tool.py via --config.
+# DO NOT confuse with fp_rules.yml — that is the Layer 1 Python FP filter.
+#
+# Air-gap: rules are bundled locally; Semgrep is invoked with --config <this file>
+# so no network calls are made during scanning.
+#
+# Coverage (Phase 0):
+#   - SQL Injection (JDBC, JPA native queries)
+#   - Hardcoded credentials / secrets
+#   - Path traversal
+#   - OS command injection
+#   - XML External Entity (XXE)
+#   - Insecure random (crypto context)
+#   - Open redirect
+#   - Log injection
+#   - Spring Boot misconfigurations (actuator, H2 console, debug mode)
+#   - Insecure deserialization
+# =============================================================================
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # SQL INJECTION
+  # ---------------------------------------------------------------------------
+
+  - id: java-sqli-jdbc-string-concat
+    patterns:
+      - pattern: |
+          $STMT.execute($SQL + $VAR)
+      - pattern-not: |
+          $STMT.execute($SQL)
+    message: >
+      Possible SQL injection: user-controlled data concatenated directly into a
+      SQL string passed to JDBC execute(). Use PreparedStatement with '?' placeholders.
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-89: SQL Injection"]
+      technology: [java, spring-boot]
+      confidence: HIGH
+
+  - id: java-sqli-jdbc-query-concat
+    patterns:
+      - pattern: |
+          $STMT.query($SQL + $VAR, ...)
+    message: >
+      Possible SQL injection: user-controlled data concatenated into a SQL query
+      string. Use PreparedStatement or JdbcTemplate with parameterised queries.
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-89: SQL Injection"]
+      technology: [java, spring-boot]
+      confidence: MEDIUM
+
+  - id: java-sqli-native-query
+    patterns:
+      - pattern: |
+          @Query(value = $SQL + $VAR, nativeQuery = true)
+    message: >
+      SQL injection in JPA native @Query via string concatenation. Use named
+      parameters (:param) or positional parameters (?1) instead.
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-89: SQL Injection"]
+      technology: [java, spring-boot]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # HARDCODED CREDENTIALS
+  # ---------------------------------------------------------------------------
+
+  - id: java-hardcoded-password-field
+    patterns:
+      - pattern: |
+          String $VAR = "...";
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i)(password|passwd|pwd|secret|apikey|api_key|token|credential|auth_token)
+      - pattern-not: |
+          String $VAR = "";
+    message: >
+      Hardcoded credential detected in field/variable '$VAR'. Store secrets in
+      environment variables or a secrets manager (e.g., HashiCorp Vault).
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-798: Use of Hard-coded Credentials"]
+      technology: [java]
+      confidence: MEDIUM
+
+  - id: java-hardcoded-password-assignment
+    patterns:
+      - pattern: |
+          $OBJ.setPassword("...");
+      - pattern-not: |
+          $OBJ.setPassword("");
+    message: >
+      Hardcoded password passed to setPassword(). Use environment variables or
+      a secrets manager instead of embedding credentials in source code.
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-798: Use of Hard-coded Credentials"]
+      technology: [java, spring-boot]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # PATH TRAVERSAL
+  # ---------------------------------------------------------------------------
+
+  - id: java-path-traversal-new-file
+    patterns:
+      - pattern: new File($BASE, $USER_INPUT)
+      - pattern-not: new File($BASE, $CONST)
+    message: >
+      Path traversal: user-controlled input used to construct a File path.
+      Validate and canonicalise the path before use (e.g., Paths.get().normalize()).
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-22: Path Traversal"]
+      technology: [java]
+      confidence: MEDIUM
+
+  - id: java-path-traversal-paths-get
+    patterns:
+      - pattern: Paths.get($BASE, $USER_INPUT)
+    message: >
+      Path traversal: user-controlled input in Paths.get(). Call .normalize()
+      and verify the resulting path starts with the expected base directory.
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-22: Path Traversal"]
+      technology: [java]
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # OS COMMAND INJECTION
+  # ---------------------------------------------------------------------------
+
+  - id: java-command-injection-runtime-exec
+    patterns:
+      - pattern: Runtime.getRuntime().exec($CMD)
+      - pattern-not: Runtime.getRuntime().exec(new String[]{...})
+    message: >
+      OS command injection: Runtime.exec() called with a string that may contain
+      user input. Use ProcessBuilder with a fixed command array instead.
+    languages: [java]
+    severity: CRITICAL
+    metadata:
+      cwe: ["CWE-78: OS Command Injection"]
+      technology: [java]
+      confidence: MEDIUM
+
+  - id: java-command-injection-processbuilder
+    patterns:
+      - pattern: |
+          new ProcessBuilder($CMD_LIST)
+      - pattern-not: |
+          new ProcessBuilder(new ArrayList<>(Arrays.asList(...)))
+    message: >
+      OS command injection: ProcessBuilder constructed with a dynamic list.
+      Ensure no user-controlled data reaches the command arguments.
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-78: OS Command Injection"]
+      technology: [java]
+      confidence: LOW
+
+  # ---------------------------------------------------------------------------
+  # XML EXTERNAL ENTITY (XXE)
+  # ---------------------------------------------------------------------------
+
+  - id: java-xxe-documentbuilderfactory
+    patterns:
+      - pattern: |
+          DocumentBuilderFactory $F = DocumentBuilderFactory.newInstance();
+          ...
+          $F.newDocumentBuilder().parse($INPUT);
+      - pattern-not: |
+          $F.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+    message: >
+      XXE vulnerability: DocumentBuilderFactory not configured to disable DOCTYPE
+      declarations. Set FEATURE_SECURE_PROCESSING or disallow-doctype-decl=true.
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-611: XML External Entity"]
+      technology: [java]
+      confidence: MEDIUM
+
+  - id: java-xxe-saxparserfactory
+    patterns:
+      - pattern: |
+          SAXParserFactory $F = SAXParserFactory.newInstance();
+          ...
+          $F.newSAXParser().parse($INPUT, ...);
+      - pattern-not: |
+          $F.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+    message: >
+      XXE vulnerability: SAXParserFactory not hardened against XXE attacks.
+      Disable DOCTYPE declarations before parsing untrusted XML.
+    languages: [java]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-611: XML External Entity"]
+      technology: [java]
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # INSECURE RANDOM (cryptographic context)
+  # ---------------------------------------------------------------------------
+
+  - id: java-insecure-random-crypto
+    patterns:
+      - pattern: new Random()
+    message: >
+      java.util.Random is not cryptographically secure. For tokens, session IDs,
+      or passwords use java.security.SecureRandom instead.
+    languages: [java]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-330: Use of Insufficiently Random Values"]
+      technology: [java]
+      confidence: LOW
+
+  - id: java-math-random-crypto
+    patterns:
+      - pattern: Math.random()
+    message: >
+      Math.random() is not cryptographically secure. Use SecureRandom for any
+      security-sensitive value (tokens, nonces, salts, session IDs).
+    languages: [java]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-330: Use of Insufficiently Random Values"]
+      technology: [java]
+      confidence: LOW
+
+  # ---------------------------------------------------------------------------
+  # OPEN REDIRECT
+  # ---------------------------------------------------------------------------
+
+  - id: java-open-redirect-sendredirect
+    patterns:
+      - pattern: $RESP.sendRedirect($URL)
+      - pattern-not: $RESP.sendRedirect($CONST_URL)
+    message: >
+      Open redirect: response.sendRedirect() called with a potentially
+      user-controlled URL. Validate the redirect target against an allowlist.
+    languages: [java]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-601: Open Redirect"]
+      technology: [java, spring-boot]
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # LOG INJECTION
+  # ---------------------------------------------------------------------------
+
+  - id: java-log-injection-slf4j
+    patterns:
+      - pattern: $LOG.info($MSG + $VAR)
+      - pattern-not: $LOG.info($TEMPLATE, $VAR)
+    message: >
+      Log injection: user-controlled data concatenated directly into a log message.
+      Use parameterised logging (logger.info("{}", value)) and strip newlines
+      from user input before logging.
+    languages: [java]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-117: Log Injection"]
+      technology: [java]
+      confidence: MEDIUM
+
+  - id: java-log-injection-error
+    patterns:
+      - pattern: $LOG.error($MSG + $VAR)
+      - pattern-not: $LOG.error($TEMPLATE, $VAR)
+    message: >
+      Log injection: user-controlled data concatenated into error log message.
+      Use parameterised logging to prevent log forging.
+    languages: [java]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-117: Log Injection"]
+      technology: [java]
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # SPRING BOOT MISCONFIGURATIONS (Properties files)
+  # ---------------------------------------------------------------------------
+
+  - id: spring-actuator-all-endpoints-exposed
+    patterns:
+      - pattern: management.endpoints.web.exposure.include=*
+    message: >
+      All Spring Boot Actuator endpoints are exposed. This includes /env, /heapdump,
+      /loggers etc. which can leak secrets and allow remote configuration changes.
+      Restrict to specific endpoints needed: e.g. include=health,info
+    languages: [generic]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-16: Configuration"]
+      technology: [spring-boot]
+      confidence: HIGH
+
+  - id: spring-h2-console-enabled
+    patterns:
+      - pattern: spring.h2.console.enabled=true
+    message: >
+      H2 web console is enabled. This exposes a full SQL console to anyone who
+      can reach the application. Disable in non-development environments.
+    languages: [generic]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-16: Configuration"]
+      technology: [spring-boot]
+      confidence: HIGH
+
+  - id: spring-debug-mode-enabled
+    patterns:
+      - pattern: debug=true
+    message: >
+      Spring Boot debug mode is enabled. This exposes detailed stack traces and
+      auto-configuration reports. Disable in staging and production.
+    languages: [generic]
+    severity: MEDIUM
+    metadata:
+      cwe: ["CWE-16: Configuration"]
+      technology: [spring-boot]
+      confidence: MEDIUM
+
+  - id: spring-security-disabled
+    patterns:
+      - pattern: spring.security.enabled=false
+    message: >
+      Spring Security has been explicitly disabled. All endpoints are unprotected.
+      Remove this property or set to true in non-development environments.
+    languages: [generic]
+    severity: HIGH
+    metadata:
+      cwe: ["CWE-306: Missing Authentication"]
+      technology: [spring-boot]
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # INSECURE DESERIALIZATION
+  # ---------------------------------------------------------------------------
+
+  - id: java-insecure-deserialization-objectinputstream
+    patterns:
+      - pattern: |
+          ObjectInputStream $OIS = new ObjectInputStream($INPUT);
+          ...
+          $OIS.readObject();
+    message: >
+      Insecure deserialization: ObjectInputStream.readObject() on untrusted data
+      can lead to remote code execution. Use a safe deserialisation library or
+      validate/filter the input stream with a ValidatingObjectInputStream.
+    languages: [java]
+    severity: CRITICAL
+    metadata:
+      cwe: ["CWE-502: Deserialization of Untrusted Data"]
+      technology: [java]
+      confidence: MEDIUM

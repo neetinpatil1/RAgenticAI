@@ -1,126 +1,131 @@
 #!/usr/bin/env bash
 # =============================================================================
 # scripts/airgap/setup_semgrep_rules.sh
-# Download and stage Semgrep rules for air-gapped deployment.
+# Download official Semgrep Java/Spring OWASP rules for air-gap bundling.
 #
 # Design (SSDLC_Design_v3.2.docx §3, Gap #2):
-#   Rules pulled from registry.semgrep.dev ONCE on a jump workstation.
-#   Committed to agents/security/sast/ in Gitea (Phase 1+).
-#   Semgrep invoked with --config=file:///opt/semgrep-rules/ (no network call).
-#
-# Run this on a jump workstation WITH internet access.
-# Transfer the output directory to the air-gapped machine via approved media.
+#   Rules sourced from semgrep/semgrep-rules (Apache 2.0, open source).
+#   Downloaded ONCE on a machine with internet, committed to git.
+#   All future scans use local copies — no network calls during scanning.
 #
 # Usage:
-#   ./scripts/airgap/setup_semgrep_rules.sh [--output-dir /path/to/rules]
+#   cd /path/to/RAgenticAI
+#   bash scripts/airgap/setup_semgrep_rules.sh
 #
-# Output: rules directory ready to mount into Semgrep Docker container
-# Cadence: Quarterly (as per design doc)
+# Output: agents/security/sast/rules/owasp/*.yml
+# Cadence: Re-run quarterly to pick up new rules
 # =============================================================================
 
 set -euo pipefail
 
-OUTPUT_DIR="${1:-./semgrep-rules-bundle}"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="./semgrep-rules-setup-${TIMESTAMP}.log"
+RULES_DIR="agents/security/sast/rules/owasp"
+RAW="https://raw.githubusercontent.com/semgrep/semgrep-rules/develop"
 
-echo "=============================================="
-echo " Semgrep Rules — Air-Gap Bundle Setup"
-echo " Output: ${OUTPUT_DIR}"
-echo " Log:    ${LOG_FILE}"
-echo "=============================================="
+mkdir -p "$RULES_DIR"
 
-# --- Check prerequisites ---
-if ! command -v semgrep &>/dev/null; then
-  echo "ERROR: semgrep not installed. Run: pip install semgrep"
-  exit 1
-fi
-if ! command -v sha256sum &>/dev/null && ! command -v shasum &>/dev/null; then
-  echo "ERROR: sha256sum / shasum not found"
-  exit 1
-fi
-
-mkdir -p "${OUTPUT_DIR}/java"
-mkdir -p "${OUTPUT_DIR}/javascript"
-mkdir -p "${OUTPUT_DIR}/generic"
-
-echo "[$(date)] Starting rule download..." | tee -a "${LOG_FILE}"
-
-# ---------------------------------------------------------------------------
-# Java / Spring Boot rules
-# ---------------------------------------------------------------------------
-echo "Downloading Java security rules..."
-semgrep --config "p/java"         --dry-run --json /dev/null 2>/dev/null || true
-semgrep --config "p/spring"       --dry-run --json /dev/null 2>/dev/null || true
-semgrep --config "p/owasp-top-ten" --dry-run --json /dev/null 2>/dev/null || true
-
-# Download rule YAML files directly
-JAVA_RULESETS=(
-  "https://semgrep.dev/c/p/java"
-  "https://semgrep.dev/c/p/spring"
-  "https://semgrep.dev/c/p/owasp-top-ten"
-  "https://semgrep.dev/c/p/sql-injection"
-  "https://semgrep.dev/c/p/secrets"
-)
-for url in "${JAVA_RULESETS[@]}"; do
-  rulename=$(basename "${url}")
-  echo "  Fetching ${rulename}..."
-  curl -fsSL "${url}" -o "${OUTPUT_DIR}/java/${rulename}.yml" 2>>"${LOG_FILE}" || {
-    echo "  WARNING: Failed to fetch ${url}" | tee -a "${LOG_FILE}"
-  }
-done
-
-# ---------------------------------------------------------------------------
-# JavaScript / Angular / TypeScript rules
-# ---------------------------------------------------------------------------
-echo "Downloading JavaScript/Angular rules..."
-JS_RULESETS=(
-  "https://semgrep.dev/c/p/javascript"
-  "https://semgrep.dev/c/p/typescript"
-  "https://semgrep.dev/c/p/angular"
-  "https://semgrep.dev/c/p/react"
-)
-for url in "${JS_RULESETS[@]}"; do
-  rulename=$(basename "${url}")
-  echo "  Fetching ${rulename}..."
-  curl -fsSL "${url}" -o "${OUTPUT_DIR}/javascript/${rulename}.yml" 2>>"${LOG_FILE}" || {
-    echo "  WARNING: Failed to fetch ${url}" | tee -a "${LOG_FILE}"
-  }
-done
-
-# ---------------------------------------------------------------------------
-# Copy project-specific FP rules
-# ---------------------------------------------------------------------------
-echo "Copying project FP rules..."
-cp ./agents/security/sast/fp_rules.yml "${OUTPUT_DIR}/generic/project-fp-rules.yml"
-
-# ---------------------------------------------------------------------------
-# Generate SHA-256 manifest for integrity verification on air-gapped machine
-# ---------------------------------------------------------------------------
-echo "Generating SHA-256 manifest..."
-MANIFEST="${OUTPUT_DIR}/manifest.txt"
-echo "# Semgrep Rules Bundle — SHA-256 Manifest" > "${MANIFEST}"
-echo "# Generated: ${TIMESTAMP}" >> "${MANIFEST}"
-echo "#" >> "${MANIFEST}"
-
-find "${OUTPUT_DIR}" -name "*.yml" -type f | sort | while read -r f; do
-  if command -v sha256sum &>/dev/null; then
-    sha256sum "${f}" >> "${MANIFEST}"
+# Helper: download one rule file, skip silently if URL 404s
+fetch() {
+  local url="$1"
+  local out="$2"
+  if curl -fsSL --max-time 15 "$url" -o "$out" 2>/dev/null; then
+    # Reject empty files and HTML error pages
+    if [ -s "$out" ] && head -1 "$out" | grep -q "^rules:\|^-\|- id:"; then
+      echo "  OK  $(basename "$out")"
+    else
+      rm -f "$out"
+      echo "  --  $(basename "$out") (not a valid rule file, skipped)"
+    fi
   else
-    shasum -a 256 "${f}" >> "${MANIFEST}"
+    echo "  --  $(basename "$out") (not found upstream, skipped)"
   fi
-done
+}
 
+echo "=============================================="
+echo " Semgrep OWASP Rules — Air-Gap Download"
+echo " Output: $RULES_DIR"
+echo "=============================================="
+echo ""
+
+# ---------------------------------------------------------------------------
+# A01 + A03: Broken Access Control / Injection — SQL
+# ---------------------------------------------------------------------------
+echo "[A01/A03] SQL Injection..."
+fetch "$RAW/java/lang/security/audit/formatted-sql-string.yaml"                    "$RULES_DIR/java-sqli-formatted.yml"
+fetch "$RAW/java/lang/security/audit/tainted-sql-string.yaml"                      "$RULES_DIR/java-sqli-tainted.yml"
+fetch "$RAW/java/spring/security/injection/tainted-sql-from-http-request.yaml"    "$RULES_DIR/spring-sqli-http.yml"
+
+# ---------------------------------------------------------------------------
+# A01: Broken Access Control — Path Traversal, Open Redirect, IDOR
+# ---------------------------------------------------------------------------
+echo "[A01] Broken Access Control..."
+fetch "$RAW/java/lang/security/audit/path-traversal.yaml"                          "$RULES_DIR/java-path-traversal.yml"
+fetch "$RAW/java/spring/security/spring-unvalidated-redirect.yaml"                 "$RULES_DIR/spring-open-redirect.yml"
+
+# ---------------------------------------------------------------------------
+# A02: Cryptographic Failures
+# ---------------------------------------------------------------------------
+echo "[A02] Cryptographic Failures..."
+fetch "$RAW/java/lang/security/audit/crypto/weak-hash.yaml"                        "$RULES_DIR/java-weak-hash.yml"
+fetch "$RAW/java/lang/security/audit/crypto/use-of-sha1.yaml"                      "$RULES_DIR/java-sha1.yml"
+fetch "$RAW/java/lang/security/audit/crypto/weak-rsa.yaml"                         "$RULES_DIR/java-weak-rsa.yml"
+fetch "$RAW/java/lang/security/audit/crypto/no-static-iv.yaml"                     "$RULES_DIR/java-static-iv.yml"
+fetch "$RAW/java/lang/security/audit/crypto/weak-ssl.yaml"                         "$RULES_DIR/java-weak-ssl.yml"
+fetch "$RAW/java/lang/security/audit/crypto/use-of-des.yaml"                       "$RULES_DIR/java-des.yml"
+
+# ---------------------------------------------------------------------------
+# A03: Injection — OS Command, LDAP, XSS, Log
+# ---------------------------------------------------------------------------
+echo "[A03] Injection (Command, LDAP, XSS, Log)..."
+fetch "$RAW/java/lang/security/audit/command-injection-formatted-runtime-call.yaml" "$RULES_DIR/java-command-injection.yml"
+fetch "$RAW/java/lang/security/audit/ldap-injection.yaml"                           "$RULES_DIR/java-ldap-injection.yml"
+fetch "$RAW/java/lang/security/audit/xss/xss-javaee.yaml"                           "$RULES_DIR/java-xss-javaee.yml"
+fetch "$RAW/java/lang/security/audit/xss/xss-potential.yaml"                        "$RULES_DIR/java-xss-potential.yml"
+
+# ---------------------------------------------------------------------------
+# A05: Security Misconfiguration
+# ---------------------------------------------------------------------------
+echo "[A05] Security Misconfiguration..."
+fetch "$RAW/java/spring/security/spring-cookie-without-secure.yaml"                "$RULES_DIR/spring-cookie-secure.yml"
+fetch "$RAW/java/spring/security/spring-cookie-without-httponly.yaml"              "$RULES_DIR/spring-cookie-httponly.yml"
+fetch "$RAW/java/lang/security/audit/xml/xxe.yaml"                                 "$RULES_DIR/java-xxe.yml"
+
+# ---------------------------------------------------------------------------
+# A07: Identification and Authentication Failures
+# ---------------------------------------------------------------------------
+echo "[A07] Auth Failures..."
+fetch "$RAW/java/lang/security/audit/hardcoded-credentials.yaml"                   "$RULES_DIR/java-hardcoded-creds.yml"
+fetch "$RAW/java/lang/security/audit/hardcoded-secret-key.yaml"                    "$RULES_DIR/java-hardcoded-key.yml"
+fetch "$RAW/java/spring/security/missing-jwt-signature-check.yaml"                 "$RULES_DIR/spring-jwt.yml"
+
+# ---------------------------------------------------------------------------
+# A08: Software and Data Integrity Failures
+# ---------------------------------------------------------------------------
+echo "[A08] Insecure Deserialization..."
+fetch "$RAW/java/lang/security/audit/object-deserialization.yaml"                  "$RULES_DIR/java-deserialization.yml"
+
+# ---------------------------------------------------------------------------
+# A10: Server-Side Request Forgery (SSRF)
+# ---------------------------------------------------------------------------
+echo "[A10] SSRF..."
+fetch "$RAW/java/spring/security/injection/tainted-ssrf-spring.yaml"               "$RULES_DIR/spring-ssrf.yml"
+fetch "$RAW/java/lang/security/audit/url-rewriting.yaml"                            "$RULES_DIR/java-url-rewriting.yml"
+
+# ---------------------------------------------------------------------------
+# Remove any empty files left over
+# ---------------------------------------------------------------------------
+find "$RULES_DIR" -name "*.yml" -empty -delete 2>/dev/null || true
+
+DOWNLOADED=$(ls "$RULES_DIR"/*.yml 2>/dev/null | wc -l | tr -d ' ')
 echo ""
 echo "=============================================="
-echo " Bundle ready: ${OUTPUT_DIR}"
-echo " Manifest:     ${MANIFEST}"
-echo " Rule files:   $(find "${OUTPUT_DIR}" -name "*.yml" | wc -l | tr -d ' ')"
+echo " Done. $DOWNLOADED rule files in $RULES_DIR/"
 echo ""
-echo " NEXT STEPS (air-gapped machine):"
-echo "  1. Transfer ${OUTPUT_DIR} via approved media"
-echo "  2. Verify: sha256sum -c ${MANIFEST}"
-echo "  3. Set SEMGREP_RULES_PATH to the transferred directory"
-echo "  4. Test: docker run --rm -v /path/to/code:/src -v ${OUTPUT_DIR}:/rules \\"
-echo "           semgrep/semgrep semgrep --config file:///rules /src"
+echo " Next steps:"
+echo "  1. Commit to git:"
+echo "       git add $RULES_DIR && git commit -m 'feat: bundle official OWASP Semgrep rules'"
+echo ""
+echo "  2. Update .env:"
+echo "       SEMGREP_DETECTION_RULES_PATH=./agents/security/sast/rules"
+echo ""
+echo "  3. Restart server and re-scan your project"
 echo "=============================================="

@@ -41,7 +41,8 @@ class SASTFinding(BaseModel):
 
     Fields populated by Semgrep (raw tool output):
         rule_id, cwe_id, severity, file_path, line_start, line_end,
-        code_snippet, message
+        code_snippet, message, fix_suggestion, owasp_category,
+        references, class_name, method_name, likelihood, impact
 
     Fields populated by LLM (Qwen2.5-Coder:14b analysis):
         framework, llm_summary, llm_severity_rationale, confidence
@@ -54,8 +55,21 @@ class SASTFinding(BaseModel):
     file_path:    str   = Field(..., description="Relative path to affected file")
     line_start:   int   = Field(..., ge=1, description="Start line number")
     line_end:     Optional[int] = Field(None, description="End line number")
-    code_snippet: Optional[str] = Field(None, description="Affected code context (max 20 lines)")
-    message:      str   = Field(..., description="Semgrep rule message")
+    code_snippet: Optional[str] = Field(None, description="Vulnerable line(s) + surrounding context")
+    message:      str   = Field(..., description="Semgrep rule message explaining the issue")
+
+    # --- Location enrichment (derived at scan time) ---
+    class_name:   Optional[str] = Field(None, description="Java class name (from filename)")
+    method_name:  Optional[str] = Field(None, description="Enclosing method name (scanned from file)")
+
+    # --- Fix & remediation ---
+    fix_suggestion: Optional[str] = Field(None, description="Inline fix from rule or LLM suggestion")
+    owasp_category: Optional[str] = Field(None, description="OWASP Top 10 category, e.g. A02:2021 - Cryptographic Failures")
+    references:     list[str]    = Field(default_factory=list, description="Links to CWE/OWASP/CVE docs")
+
+    # --- Risk metadata ---
+    likelihood:   Optional[str] = Field(None, description="Exploitation likelihood: LOW/MEDIUM/HIGH")
+    impact:       Optional[str] = Field(None, description="Business impact: LOW/MEDIUM/HIGH")
 
     # --- LLM enrichment ---
     framework:              Framework = Field(Framework.UNKNOWN, description="Detected framework")

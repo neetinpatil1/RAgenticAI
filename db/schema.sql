@@ -82,6 +82,14 @@ CREATE TABLE IF NOT EXISTS findings_reports (
     message         TEXT NOT NULL,                  -- tool's finding description
     framework       TEXT,                           -- spring-boot|angular|django|etc.
     is_baseline     BOOLEAN NOT NULL DEFAULT FALSE, -- TRUE = first scan, doesn't gate release
+    -- Enrichment fields (populated at scan time)
+    class_name      TEXT,                           -- Java class name (from filename)
+    method_name     TEXT,                           -- enclosing method/function name
+    fix_suggestion  TEXT,                           -- inline fix from rule or LLM
+    owasp_category  TEXT,                           -- e.g. A02:2021 - Cryptographic Failures
+    ref_urls        JSONB DEFAULT '[]',             -- array of docs/CVE/OWASP URLs
+    likelihood      TEXT,                           -- LOW|MEDIUM|HIGH (exploitation likelihood)
+    impact          TEXT,                           -- LOW|MEDIUM|HIGH (business impact)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

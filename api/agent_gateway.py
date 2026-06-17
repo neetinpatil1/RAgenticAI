@@ -38,6 +38,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from core.config import settings
+from db.migrations import run_migrations
 from core.audit_logger import AuditLogger, AuditEvent, init_audit_logger, get_audit_logger
 from core.pg_job_queue import PGJobQueue, JobType, init_job_queue, get_job_queue
 from core.prompt_manager import PromptManager, init_prompt_manager, get_prompt_manager
@@ -83,6 +84,9 @@ async def lifespan(app: FastAPI):
         min_size=settings.db.pool_min,
         max_size=settings.db.pool_max,
     )
+
+    # --- Run schema migrations (idempotent — safe on every startup) ---
+    await run_migrations(_pool)
 
     # --- Initialise all singletons with the pool ---
     init_audit_logger(_pool)
@@ -272,7 +276,9 @@ async def get_scan_status(run_id: str, pool: asyncpg.Pool = Depends(get_pool)):
     if not run:
         raise HTTPException(404, f"Run not found: {run_id}")
 
-    # Fetch finding counts
+    import json as _json
+
+    # Fetch finding counts grouped by severity + files affected
     async with pool.acquire() as conn:
         counts = await conn.fetchrow(
             """
@@ -282,21 +288,41 @@ async def get_scan_status(run_id: str, pool: asyncpg.Pool = Depends(get_pool)):
                 COUNT(*) FILTER (WHERE severity = 'MEDIUM')   AS medium,
                 COUNT(*) FILTER (WHERE severity = 'LOW')      AS low,
                 COUNT(*) FILTER (WHERE is_baseline = TRUE)    AS baseline,
-                COUNT(*)                                       AS total
+                COUNT(*)                                       AS total,
+                COUNT(DISTINCT file_path)                      AS files_with_findings
             FROM findings_reports
             WHERE run_id = $1
             """,
             run_id,
         )
 
+    # Scan stats stored in metadata by node_enqueue_next
+    meta = run["metadata"] or {}
+    if isinstance(meta, str):
+        try:
+            meta = _json.loads(meta)
+        except Exception:
+            meta = {}
+
+    findings_dict = dict(counts) if counts else {}
+
     return {
-        "run_id":      run["run_id"],
-        "status":      run["state"],
-        "scan_path":   run["scan_path"],
-        "created_at":  run["created_at"].isoformat() if run["created_at"] else None,
+        "run_id":       run["run_id"],
+        "status":       run["state"],
+        "scan_path":    run["scan_path"],
+        "created_at":   run["created_at"].isoformat() if run["created_at"] else None,
         "completed_at": run["completed_at"].isoformat() if run["completed_at"] else None,
-        "error":       run["error_msg"],
-        "findings": dict(counts) if counts else {},
+        "error":        run["error_msg"],
+        "scan_coverage": {
+            "files_scanned":       meta.get("files_scanned", 0),
+            "files_with_findings": findings_dict.get("files_with_findings", 0),
+            "files_clean":         meta.get("files_clean", 0),
+            "files_skipped":       meta.get("files_skipped", 0),
+            "packages_total":      meta.get("packages_total", 0),
+            "packages_by_file":    meta.get("packages_by_file", []),
+            "scan_duration_ms":    meta.get("scan_duration_ms", 0),
+        },
+        "findings": {k: v for k, v in findings_dict.items() if k != "files_with_findings"},
     }
 
 
@@ -330,14 +356,26 @@ async def list_findings(
             f"""
             SELECT
                 fr.id, fr.run_id, fr.rule_id, fr.cwe_id, fr.severity,
-                fr.file_path, fr.line_start, fr.message, fr.framework,
+                fr.file_path, fr.line_start, fr.line_end,
+                fr.code_snippet, fr.message, fr.framework,
+                fr.class_name, fr.method_name,
+                fr.fix_suggestion, fr.owasp_category, fr.ref_urls,
+                fr.likelihood, fr.impact,
                 fr.is_baseline, fr.created_at,
                 fp.verdict, fp.confidence, fp.fp_category, fp.reasoning,
                 fp.label_status
             FROM findings_reports fr
             LEFT JOIN fp_decisions fp ON fp.finding_id = fr.id
             {where}
-            ORDER BY fr.created_at DESC
+            ORDER BY
+                CASE fr.severity
+                    WHEN 'CRITICAL' THEN 1
+                    WHEN 'HIGH'     THEN 2
+                    WHEN 'MEDIUM'   THEN 3
+                    WHEN 'LOW'      THEN 4
+                    ELSE                 5
+                END,
+                fr.created_at DESC
             LIMIT ${len(params)}
             """,
             *params,
@@ -470,8 +508,12 @@ async def next_finding_for_review(pool: asyncpg.Pool = Depends(get_pool)):
             """
             SELECT
                 fr.id, fr.run_id, fr.rule_id, fr.cwe_id, fr.severity,
-                fr.file_path, fr.line_start, fr.message, fr.framework,
-                fr.code_snippet, fr.is_baseline,
+                fr.file_path, fr.line_start, fr.line_end,
+                fr.code_snippet, fr.message, fr.framework,
+                fr.class_name, fr.method_name,
+                fr.fix_suggestion, fr.owasp_category, fr.ref_urls,
+                fr.likelihood, fr.impact,
+                fr.is_baseline,
                 fp.verdict, fp.confidence, fp.fp_category, fp.reasoning,
                 fp.label_status
             FROM findings_reports fr
