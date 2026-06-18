@@ -142,9 +142,9 @@ export function CodeGraph({ scanPath }: Props) {
     }
   }
 
-  function openGraph() {
+  function openGraph(mode: "file" | "full" | "community" = "file") {
     window.open(
-      `/api/v1/graph/visualization?scan_path=${encodeURIComponent(scanPath)}`,
+      `/api/v1/graph/visualization?scan_path=${encodeURIComponent(scanPath)}&mode=${mode}`,
       "_blank",
       "noopener,noreferrer"
     );
@@ -179,13 +179,26 @@ export function CodeGraph({ scanPath }: Props) {
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
           </button>
           {status?.available && !isBuilding && (
-            <button
-              onClick={openGraph}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium
-                         bg-brand-600 hover:bg-brand-500 text-white transition-colors"
-            >
-              <ExternalLink className="w-3.5 h-3.5" /> Open Graph
-            </button>
+            <div className="flex items-center gap-1">
+              <span className="text-xs text-gray-600 mr-1">View:</span>
+              {(["file", "full", "community"] as const).map(m => (
+                <button
+                  key={m}
+                  onClick={() => openGraph(m)}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium
+                             bg-gray-800 border border-gray-700 text-gray-300
+                             hover:bg-brand-600 hover:border-brand-500 hover:text-white transition-colors"
+                  title={
+                    m === "file"      ? "File-level nodes — shows each source file as a node" :
+                    m === "full"      ? "Full detail — every class & method as a node" :
+                                        "Community view — grouped clusters of related files"
+                  }
+                >
+                  <ExternalLink className="w-3 h-3" />
+                  {m === "file" ? "Files" : m === "full" ? "Full" : "Groups"}
+                </button>
+              ))}
+            </div>
           )}
         </div>
       </div>
@@ -348,8 +361,8 @@ export function CodeGraph({ scanPath }: Props) {
           <div className="flex items-center justify-between">
             <p className="text-xs text-gray-600 flex items-center gap-1.5">
               <ExternalLink className="w-3 h-3" />
-              Click <span className="text-brand-400 font-medium">Open Graph</span> to explore
-              call relationships, hub files, and community clusters interactively.
+              Use <span className="text-brand-400 font-medium">Files</span> view for file names,
+              <span className="text-brand-400 font-medium ml-1">Full</span> for classes &amp; methods.
             </p>
             <button
               onClick={triggerBuild}

@@ -1270,12 +1270,18 @@ async def get_build_status(scan_path: Optional[str] = None):
 
 
 @app.get("/api/v1/graph/visualization", response_class=HTMLResponse)
-async def get_graph_visualization(scan_path: Optional[str] = None):
+async def get_graph_visualization(
+    scan_path: Optional[str] = None,
+    mode: str = "file",
+):
     """
     Regenerate and serve the interactive graph HTML for a given scan_path.
+    mode: file (default) | full | community | auto
     Opens full-screen — not meant for iframe embedding (graph uses CDN JS).
     """
     import asyncio, subprocess as _sp
+    if mode not in ("file", "full", "community", "auto"):
+        mode = "file"
     root = Path(scan_path) if scan_path else _GRAPH_DB.parent.parent
     db   = root / ".code-review-graph" / "graph.db"
     html = root / ".code-review-graph" / "graph.html"
@@ -1293,11 +1299,11 @@ async def get_graph_visualization(scan_path: Optional[str] = None):
     try:
         proc = await asyncio.create_subprocess_exec(
             "python3.11", "-m", "code_review_graph", "visualize",
-            "--format", "html", "--mode", "community",
+            "--format", "html", "--mode", mode,
             "--repo", str(root),
             stdout=_sp.PIPE, stderr=_sp.PIPE,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=30)
+        await asyncio.wait_for(proc.communicate(), timeout=60)
     except Exception as exc:
         logger.warning("graph/visualize error: %s", exc)
 

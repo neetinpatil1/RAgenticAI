@@ -1,5 +1,5 @@
 # SSDLC Multi-Agent Platform — Project Scope & Tracking
-> Based on: `SSDLC_Design_v3.2.docx` | Status: In Progress | Started: June 2025
+> Based on: `SSDLC_Design_v3.2.docx` | Status: Phase 1 In Progress | Started: June 2025 | Updated: 18 June 2026
 
 ---
 
@@ -212,7 +212,7 @@ WATCHDOG (5-min scheduled job):
 #### Deliverables
 - [x] PostgreSQL setup with pgvector extension
 - [x] Ollama running `qwen2.5-coder:14b` natively
-- [x] SAST Agent — accepts `--scan /local/path`, runs Semgrep (Docker sandbox), writes findings to PG
+- [x] SAST Agent — accepts local path, runs Semgrep (Docker sandbox), writes findings to PG
 - [x] Finding enrichment — class, method, fix suggestion, OWASP category, ref URLs, likelihood, impact
 - [x] Scan coverage stats — files scanned/skipped, packages by build file type
 - [x] Layer 1 FP rules (YAML, Spring Boot + Angular rules)
@@ -222,7 +222,7 @@ WATCHDOG (5-min scheduled job):
 - [x] Audit trail in PostgreSQL (append-only ledger)
 - [x] Watchdog job (5-min scheduled, SLA alerts)
 - [x] FastAPI endpoints: `POST /api/v1/scan`, `GET /api/v1/scan/{run_id}`, `GET /api/v1/findings`, `GET /api/v1/scan/{run_id}/stream` (SSE)
-- [x] React scan UI (ScanInput + animated ScanProgress + ScanResults with expandable findings table) — served on port 8080
+- [x] React scan UI (ScanInput + animated ScanProgress + ScanResults with expandable findings table) — served on port 8000
 - [x] Air-gap setup scripts (Semgrep rules local, Grype DB local)
 - [ ] Governance charter signed (before code ships to staging)
 
@@ -241,20 +241,52 @@ WATCHDOG (5-min scheduled job):
 
 ### Phase 1 — Two Agents
 > **Duration:** Months 3–5 | **Gate:** ≥85% L2 accuracy on ≥2 segments. FP challenge <5 min p50.
+> **Current status:** In progress — core agents done, supporting infrastructure pending.
 
-#### Deliverables
-- [ ] SCA Agent (Grype + Trivy)
-- [ ] Code Review Agent (correlates SAST + SCA)
+#### Deliverables — Agents & Backend
+- [x] SCA Agent (Grype) — runs in parallel with SAST, findings written to PG, ~20 CVE findings on a real Java project
+- [x] Code Review Agent — LangGraph workflow, Qwen2.5-Coder:14b via Ollama, adaptive file/line limits by project size, JSON truncation rescue parser
+- [x] Parallel agent execution — SAST + SCA + Code Review + Secrets + Code Graph all run in parallel on scan submit
+- [x] Code Review status tracking — `code_review_status` PG table, SSE-driven progress bar in UI, race-condition fix (immediate `status=running` write on trigger)
+- [x] Code Knowledge Graph (via `code_review_graph` CLI) — SQLite DB per project with nodes, edges, communities, hub scores, risk index
+- [x] Graph build at scan startup — triggered from `POST /api/v1/scan`, uses `_run_graph_build` background task so UI polling sees `building → done`
+- [x] Graph context enriched into LLM prompts — `GraphContext` dataclass per file; callers, community name/purpose, hub score, risk score, test coverage injected into code review prompt
+- [x] `_ensure_graph_built()` in code review workflow — builds graph if missing before loading context
+- [x] Graph API endpoints: `POST /api/v1/graph/build`, `GET /api/v1/graph/build/status`, `GET /api/v1/graph/status`, `GET /api/v1/graph/visualization`
+- [x] Graph visualization — 3 modes: **file** (default, shows file names), **full** (classes & methods), **community** (aggregated clusters); mode selectable from UI buttons
+- [x] LLM tuning — `num_ctx=3072`, `num_predict=1024`, timeout 120s, confidence threshold 0.3
 - [ ] FP Challenger Agent (full 3-layer pipeline)
-- [ ] PG job queue (no Kafka yet)
+- [ ] PG job queue SKIP LOCKED (Kafka deferred)
 - [ ] Layer 2 CodeBERT classifier (segment-gated)
-- [ ] Online agreement monitoring (Grafana)
-- [ ] Living golden dataset (quarterly refresh)
-- [ ] First kappa calibration cycle (Cohen's kappa, monthly)
+- [ ] Secrets Agent (Trufflehog/Gitleaks — status card exists in UI, backend TBD)
 - [ ] Gitea for prompts/rules versioning
 - [ ] HashiCorp Vault for secrets
-- [ ] React UI: `/console/findings`, `/console/labeling`, `/console/challenges`
-- [ ] Git repo input support (`--repo git@...` alongside local path)
+- [ ] Git repo input support
+
+#### Deliverables — React UI
+- [x] ScanResults redesigned for parallel agents — 5-column status grid (SAST · SCA · Secrets · Code Review · Code Graph)
+- [x] GraphBuildCard — animated progress bar, stage labels, elapsed timer, success/fail states
+- [x] Code Review tab — findings table, retry button, "no issues found" state, error display
+- [x] SCA findings tab — CVE table, dependency summary, severity breakdown
+- [x] Code Graph card — 3 "View" mode buttons (Files / Full / Groups), build progress, stats (nodes/edges/files/languages)
+- [x] AgentStatusCard — shows `AlertTriangle` icon + red border on failure
+- [x] `loadDeps` race condition fixed — SCA polling no longer stops when SAST completes
+- [ ] `/console/findings` review queue
+- [ ] `/console/labeling` duty queue with kappa display
+- [ ] `/console/challenges` FP deadlock resolution
+- [ ] `/dashboard` CISO KPI tiles
+
+#### Bugs Fixed in This Phase
+| Bug | Root Cause | Fix |
+|---|---|---|
+| Code review progress bar disappears | Stale `status=completed` in PG from previous 0-findings run | Immediately upsert `status=running` in `trigger_code_review` before starting background task |
+| SCA shows 0 findings | `loadDeps` stopped polling when SAST set `state=completed` (~15s) but SCA takes 25–60s | Removed `getScanStatus` check from `loadDeps`; SCA completion signalled by findings appearing in DB |
+| Build Now does nothing | Was calling `GET /api/v1/graph/visualization` (wrong endpoint, returns HTML) | Added proper `POST /api/v1/graph/build` → async background task |
+| Graph card shows "not started" | `subprocess.Popen` in `node_start_scan` never updates `_graph_build_status` dict | Moved build trigger to `POST /api/v1/scan` using `_run_graph_build` background task |
+| Graph shows no labels | `--mode community` shows aggregated clusters, not individual nodes | Changed default to `--mode file`; added 3-mode UI buttons |
+| LLM JSON truncated | `num_predict=512` + `num_ctx=2048` left ~750 tokens for output | `num_ctx=3072`, `num_predict=1024`; JSON rescue parser for partial arrays |
+| Method Not Allowed on Build Now | Vite proxy pointed to port 8080 (macOS system process) | Changed proxy target to 8000 |
+| `code_review_graph build` fails | Used positional path arg; CLI requires `--repo <path>` | Fixed flag in `_ensure_graph_built()` and `node_start_scan` |
 
 #### Gate Criteria
 - [ ] ≥85% L2 accuracy on ≥2 active segments
@@ -349,7 +381,7 @@ WATCHDOG (5-min scheduled job):
 
 ## 12. Web Command Centre
 
-**Served by FastAPI on Mac 1, port 8080. React 18 + Vite. All data from PostgreSQL.**
+**Served by FastAPI on Mac 1, port 8000. React 18 + Vite. All data from PostgreSQL.**
 
 ### User Personas & Screens
 | Persona | Primary Screens |
@@ -385,7 +417,8 @@ WATCHDOG (5-min scheduled job):
 | Sprint | Deliverable | Status |
 |---|---|---|
 | Sprint 3 (Phase 0) | Minimal HTML labeling screen (no React). Sufficient for Phase 0 gate. | ✅ Done |
-| Phase 0 (early) | React scan UI shipped ahead of schedule: ScanInput + animated ScanProgress (SSE-driven) + ScanResults (severity chart, expandable findings table, code snippets, fix suggestions, OWASP tags). Served by FastAPI on port 8080. | ✅ Done |
+| Phase 0 (early) | React scan UI shipped ahead of schedule: ScanInput + animated ScanProgress (SSE-driven) + ScanResults (severity chart, expandable findings table, code snippets, fix suggestions, OWASP tags). Served by FastAPI on port 8000. | ✅ Done |
+| Phase 1 (current) | Parallel agent status grid (SAST · SCA · Secrets · Code Review · Code Graph). GraphBuildCard with live progress. Code Review tab with retry. SCA CVE tab. Code Graph with 3-mode visualization buttons. | ✅ Done |
 | Sprint 5–6 (Phase 1) | `/console/findings` review queue. `/console/agents` live feed. | ⬜ |
 | Sprint 7–8 (Phase 1) | `/dashboard` + Recharts KPI tiles. `/console/challenges`. `/console/labeling` full React. | ⬜ |
 | Sprint 9–10 (Phase 1) | `/apps` portfolio. `/console/csra` sign-off. Assessment detail + PDF export. | ⬜ |
@@ -429,77 +462,52 @@ WATCHDOG (5-min scheduled job):
 ## 15. Project Structure
 
 ```
-ssdlc-agent-platform/
-├── core/
-│   ├── base_agent.py              # BaseAgent class + config loader
-│   ├── model_router.py            # Two-tier routing + escalation logic
-│   ├── pg_job_queue.py            # PG SKIP LOCKED job bus
-│   ├── watchdog.py                # SLA monitor + auto-replay
-│   ├── drift_monitor.py           # PSI per segment (weekly)
-│   ├── audit_logger.py            # Append-only PG ledger
-│   ├── prompt_manager.py          # Local YAML loader (Phase 0) → Gitea-backed (Phase 1+)
-│   ├── tool_sandbox.py            # Docker isolation wrapper (security tools only)
-│   ├── state/
-│   │   ├── workflow_state.py      # PG workflow truth (authoritative)
-│   │   ├── session_state.py       # PG session tables with TTL
-│   │   └── vector_memory.py       # pgvector hybrid retrieval
-│   ├── fp_pipeline/
-│   │   ├── layer1_rules.py        # YAML rule-based pre-filter (<5ms)
-│   │   ├── layer2_classifier.py   # Segment-gated CodeBERT wrapper
-│   │   └── layer3_llm.py          # LLM + hybrid retrieval context
-│   └── output_contracts/          # Pydantic v2 models — every LLM output
-│       ├── sast_report.py
-│       ├── fp_decision.py
-│       ├── arch_review.py
-│       └── csra_finding.py
-├── tools/                         # Air-gapped security tool wrappers (Docker sandboxed)
-│   ├── semgrep_tool.py            # --config=file:///opt/semgrep-rules/
-│   ├── grype_tool.py              # GRYPE_DB_UPDATE_URL=internal-nexus
-│   ├── trivy_tool.py              # TRIVY_DB_REPOSITORY=internal-registry
-│   ├── zap_tool.py                # API mode, OpenAPI-driven (Phase 2)
-│   ├── checkov_tool.py            # --external-checks-dir /opt/checkov/
-│   └── kubescape_tool.py          # --use-from /opt/kubescape/nsa.json
-├── agents/                        # Config-only specialisation
-│   ├── security/sast/config.yml + fp_rules.yml
-│   ├── security/dast/config.yml
-│   ├── security/sca/config.yml
-│   ├── security/csra/config.yml
-│   ├── security/vapt/config.yml
-│   ├── security/k8s_security/config.yml
-│   ├── development/code_review/config.yml
-│   ├── development/arch_review/config.yml
-│   ├── development/fp_challenger/config.yml
-│   ├── development/dev_fix/config.yml
-│   ├── quality/test_design/config.yml
-│   ├── quality/test_automation/config.yml
-│   ├── devops/config.yml
-│   └── uiux/config.yml
-├── prompts/                       # Local YAML prompt store (Phase 0)
-│   ├── sast_agent/v1.0/
-│   ├── code_review_agent/v1.0/
-│   └── golden_datasets/           # Living — quarterly refresh
-├── classifier/                    # CodeBERT training + drift pipeline (Phase 1+)
-│   ├── train.py
-│   ├── evaluate.py
-│   ├── drift_check.py
-│   └── models/
-├── workflows/                     # LangGraph per-agent graphs
-│   ├── sast_workflow.py
-│   ├── dast_workflow.py
-│   └── csra_workflow.py
+RAgenticAI/                        # Actual repo root (as of Phase 1, June 2026)
 ├── api/
-│   └── agent_gateway.py           # FastAPI (port 8080)
-├── ui/                            # React 18 + Vite (Phase 1+)
+│   └── agent_gateway.py           # FastAPI (port 8000) — all endpoints, background tasks,
+│                                  # graph build status dict, SSE streaming
+├── workflows/
+│   ├── sast_workflow.py           # LangGraph: Semgrep → FP pipeline → PG
+│   ├── sca_workflow.py            # LangGraph: Grype → CVE findings → PG
+│   ├── code_review_workflow.py    # LangGraph: graph context → Qwen LLM review → PG
+│   │                              # GraphContext dataclass, adaptive file/line limits,
+│   │                              # JSON truncation rescue, _ensure_graph_built()
+│   └── secrets_workflow.py        # (placeholder — status card in UI)
+├── core/
+│   ├── audit_logger.py            # Append-only PG audit ledger
+│   ├── pg_job_queue.py            # PG job queue (SKIP LOCKED)
+│   ├── workflow_state.py          # PG workflow truth
+│   └── fp_pipeline/
+│       ├── layer1_rules.py        # YAML rule-based pre-filter
+│       └── layer3_llm.py          # Qwen LLM + pgvector retrieval
+├── ui/
+│   ├── src/components/
+│   │   ├── ScanInput.tsx          # Path input + scan trigger
+│   │   ├── ScanProgress.tsx       # SSE-driven animated progress
+│   │   ├── ScanResults.tsx        # Full results: parallel agent status grid,
+│   │   │                          # SAST/SCA/CodeReview/Secrets/CodeGraph tabs,
+│   │   │                          # GraphBuildCard, AgentStatusCard
+│   │   ├── CodeGraph.tsx          # Graph status card, build button, 3-mode view buttons
+│   │   └── ...
+│   ├── vite.config.ts             # Proxy: /api → localhost:8000
+│   └── dist/                      # Built bundle served by FastAPI
 ├── db/
 │   └── migrations/                # PostgreSQL schema migrations
 ├── scripts/
-│   └── airgap/                    # Air-gap setup scripts
+│   └── airgap/                    # Air-gap setup scripts (Semgrep rules, Grype DB)
+├── security-rules/
+│   └── fp-rules/                  # Layer 1 YAML FP rules (Spring Boot, Angular)
+├── .code-review-graph/            # Per-project graph DB (gitignored)
+│   ├── graph.db                   # SQLite: nodes, edges, communities, risk_index, flows
+│   └── graph.html                 # Generated visualization (regenerated on Open Graph)
 ├── SSDLC_SCOPE.md                 # This file
 ├── SSDLC_Design_v3.2.docx         # Source design document
-├── main.py                        # Entry point: python main.py --scan /path
+├── CLAUDE.md                      # Claude Code instructions (use graph MCP tools first)
 ├── requirements.txt
 └── pyproject.toml
 ```
+
+> **Note:** The idealized directory layout from `SSDLC_Design_v3.2.docx` (Section 13) is the target structure for Phase 2+. Current implementation is a working monolith — `agent_gateway.py` owns the API + orchestration, `workflows/` owns the LangGraph agents.
 
 ---
 
@@ -516,4 +524,15 @@ ssdlc-agent-platform/
 
 ---
 
-*Last updated: June 2026 | Source: SSDLC_Design_v3.2.docx*
+---
+
+## Current Focus (as of 18 June 2026)
+
+Working on branch `phase1`. Core parallel-agent scan pipeline is complete and stable. Next up:
+
+1. **Secrets Agent** — wire backend (Trufflehog/Gitleaks) to existing UI status card
+2. **FP Challenger Agent** — 3-layer FP pipeline (Layer 1 YAML → Layer 3 LLM arbitration)
+3. **`/console/findings`** review queue UI page
+4. **Labeling flywheel** — accumulate 200 labeled findings to hit Phase 0 gate (≥75% agreement)
+
+*Last updated: 18 June 2026 | Branch: phase1 | Source: SSDLC_Design_v3.2.docx*
