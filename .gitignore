@@ -82,3 +82,5 @@ vault-data/
 node_modules/
 ui/dist/
 ui/build/
+# Added by code-review-graph
+.code-review-graph/

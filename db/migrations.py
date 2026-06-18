@@ -104,9 +104,11 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
     await _add_columns_if_missing(pool)
 
     # -------------------------------------------------------------------------
-    # Code Review Agent table (Phase 1 — created here so it exists on startup)
+    # Phase 1 agent tables — created here so they exist on startup
     # -------------------------------------------------------------------------
     await _create_code_review_table(pool)
+    await _create_secret_findings_table(pool)
+    await _create_dependency_findings_table(pool)
 
 
 async def _add_columns_if_missing(pool: asyncpg.Pool) -> None:
@@ -123,6 +125,9 @@ async def _add_columns_if_missing(pool: asyncpg.Pool) -> None:
         ("findings_reports", "ref_urls",        "JSONB DEFAULT '[]'"),
         ("findings_reports", "likelihood",     "TEXT"),
         ("findings_reports", "impact",         "TEXT"),
+        # Feature 2: blast radius from code-review-graph
+        # How many files call into this finding's file (HIGH/CRITICAL only)
+        ("findings_reports", "blast_radius",   "INT DEFAULT 0"),
     ]
 
     async with pool.acquire() as conn:
@@ -170,3 +175,51 @@ async def _create_code_review_table(pool: asyncpg.Pool) -> None:
             "CREATE INDEX IF NOT EXISTS idx_cr_findings_run ON code_review_findings(run_id)"
         )
     logger.info("code_review_findings table ready")
+
+
+async def _create_secret_findings_table(pool: asyncpg.Pool) -> None:
+    """Create secret_findings table if it doesn't exist."""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS secret_findings (
+                id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                run_id        TEXT NOT NULL,
+                file_path     TEXT NOT NULL,
+                line_start    INT,
+                secret_type   TEXT NOT NULL,
+                severity      TEXT NOT NULL,
+                description   TEXT,
+                match_preview TEXT,
+                entropy       REAL,
+                context_line  TEXT,
+                created_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_secrets_run ON secret_findings(run_id)"
+        )
+    logger.info("secret_findings table ready")
+
+
+async def _create_dependency_findings_table(pool: asyncpg.Pool) -> None:
+    """Create dependency_findings table if it doesn't exist."""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dependency_findings (
+                id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                run_id            TEXT NOT NULL,
+                package_name      TEXT NOT NULL,
+                installed_version TEXT,
+                fixed_version     TEXT,
+                vulnerability_id  TEXT NOT NULL,
+                severity          TEXT NOT NULL,
+                description       TEXT,
+                ecosystem         TEXT NOT NULL,
+                file_path         TEXT,
+                created_at        TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dep_findings_run ON dependency_findings(run_id)"
+        )
+    logger.info("dependency_findings table ready")

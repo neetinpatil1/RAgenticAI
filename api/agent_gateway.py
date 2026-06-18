@@ -52,6 +52,8 @@ from core.watchdog import Watchdog
 from tools.semgrep_tool import SemgrepTool
 from workflows.sast_workflow import run_sast_workflow
 from workflows.code_review_workflow import run_code_review_workflow
+from workflows.secret_scan_workflow import run_secret_scan_workflow
+from workflows.sca_workflow import run_sca_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +203,33 @@ def _build_workflow_deps() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Phase 1: parallel agent launcher
+# ---------------------------------------------------------------------------
+
+async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
+    """
+    Run all Phase 1 agents in parallel:
+      - SAST Agent       (Semgrep + FP pipeline)
+      - Secret Scanner   (regex + entropy)
+      - SCA Agent        (pip-audit + npm audit + OSV API)
+
+    return_exceptions=True ensures one agent crashing does not cancel the others.
+    """
+    logger.info("Phase 1 agents starting in parallel | run=%s", run_id)
+    results = await asyncio.gather(
+        run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_secret_scan_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_sca_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        return_exceptions=True,
+    )
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            agent = ["sast", "secret_scanner", "sca"][i]
+            logger.error("Agent failed | agent=%s run=%s error=%s", agent, run_id, r)
+    logger.info("Phase 1 agents complete | run=%s", run_id)
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -257,11 +286,10 @@ async def submit_scan(
         payload={"scan_path": str(scan_path.resolve()), "metadata": request.metadata},
     )
 
-    # Run the SAST workflow as a FastAPI background task
-    # Phase 1+: this will be a separate worker process polling pg_jobs
+    # Phase 1: run all agents in parallel as a single background task
     deps = _build_workflow_deps()
     background_tasks.add_task(
-        run_sast_workflow,
+        _run_all_agents,
         run_id=run_id,
         scan_path=str(scan_path.resolve()),
         deps=deps,
@@ -369,6 +397,7 @@ async def list_findings(
                 fr.fix_suggestion, fr.owasp_category, fr.ref_urls,
                 fr.likelihood, fr.impact,
                 fr.is_baseline, fr.created_at,
+                COALESCE(fr.blast_radius, 0) AS blast_radius,
                 fp.verdict, fp.confidence, fp.fp_category, fp.reasoning,
                 fp.label_status
             FROM findings_reports fr
@@ -751,8 +780,159 @@ async def label_count(pool: asyncpg.Pool = Depends(get_pool)):
 
 
 # ---------------------------------------------------------------------------
+# Secret Scanner endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/secrets/{run_id}")
+async def get_secret_findings(
+    run_id:   str,
+    severity: Optional[str] = Query(None),
+    limit:    int            = Query(200, le=500),
+    pool:     asyncpg.Pool   = Depends(get_pool),
+):
+    """Return secret findings for a run with summary counts."""
+    conditions = ["run_id = $1"]
+    params: list = [run_id]
+    if severity:
+        params.append(severity.upper())
+        conditions.append(f"severity = ${len(params)}")
+    where = "WHERE " + " AND ".join(conditions)
+    params.append(limit)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT id, run_id, file_path, line_start, secret_type, severity,
+                   description, match_preview, entropy, context_line, created_at
+            FROM secret_findings
+            {where}
+            ORDER BY
+                CASE severity
+                    WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2
+                    WHEN 'MEDIUM'   THEN 3 ELSE 4
+                END, file_path, line_start
+            LIMIT ${len(params)}
+            """,
+            *params,
+        )
+        summary = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*)                                        AS total,
+                COUNT(*) FILTER (WHERE severity = 'CRITICAL')  AS critical,
+                COUNT(*) FILTER (WHERE severity = 'HIGH')      AS high,
+                COUNT(*) FILTER (WHERE severity = 'MEDIUM')    AS medium,
+                COUNT(*) FILTER (WHERE severity = 'LOW')       AS low,
+                COUNT(DISTINCT file_path)                       AS files_with_secrets
+            FROM secret_findings WHERE run_id = $1
+            """,
+            run_id,
+        )
+
+    return {
+        "run_id":   run_id,
+        "summary":  dict(summary) if summary else {},
+        "findings": [dict(r) for r in rows],
+        "count":    len(rows),
+    }
+
+
+# ---------------------------------------------------------------------------
+# SCA (Dependency) endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/dependencies/{run_id}")
+async def get_dependency_findings(
+    run_id:    str,
+    ecosystem: Optional[str] = Query(None, description="python|npm|maven"),
+    severity:  Optional[str] = Query(None),
+    limit:     int            = Query(200, le=500),
+    pool:      asyncpg.Pool   = Depends(get_pool),
+):
+    """Return dependency vulnerability findings for a run with summary counts."""
+    conditions = ["run_id = $1"]
+    params: list = [run_id]
+    if ecosystem:
+        params.append(ecosystem.lower())
+        conditions.append(f"ecosystem = ${len(params)}")
+    if severity:
+        params.append(severity.upper())
+        conditions.append(f"severity = ${len(params)}")
+    where = "WHERE " + " AND ".join(conditions)
+    params.append(limit)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT id, run_id, package_name, installed_version, fixed_version,
+                   vulnerability_id, severity, description, ecosystem, file_path, created_at
+            FROM dependency_findings
+            {where}
+            ORDER BY
+                CASE severity
+                    WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2
+                    WHEN 'MEDIUM'   THEN 3 ELSE 4
+                END, package_name
+            LIMIT ${len(params)}
+            """,
+            *params,
+        )
+        summary = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*)                                        AS total,
+                COUNT(*) FILTER (WHERE severity = 'CRITICAL')  AS critical,
+                COUNT(*) FILTER (WHERE severity = 'HIGH')      AS high,
+                COUNT(*) FILTER (WHERE severity = 'MEDIUM')    AS medium,
+                COUNT(*) FILTER (WHERE severity = 'LOW')       AS low,
+                COUNT(*) FILTER (WHERE ecosystem = 'python')   AS python,
+                COUNT(*) FILTER (WHERE ecosystem = 'npm')      AS npm,
+                COUNT(*) FILTER (WHERE ecosystem = 'maven')    AS maven
+            FROM dependency_findings WHERE run_id = $1
+            """,
+            run_id,
+        )
+
+    return {
+        "run_id":   run_id,
+        "summary":  dict(summary) if summary else {},
+        "findings": [dict(r) for r in rows],
+        "count":    len(rows),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Code Review Agent endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/api/v1/review/{run_id}/progress")
+async def get_code_review_progress(run_id: str, pool: asyncpg.Pool = Depends(get_pool)):
+    """
+    Return live progress for an in-flight code review.
+    Polls code_review_status table — updated after every file reviewed.
+    """
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM code_review_status WHERE run_id = $1", run_id
+            )
+    except Exception:
+        return {"run_id": run_id, "status": "not_started", "pct": 0, "files_done": 0, "total_files": 0}
+
+    if not row:
+        return {"run_id": run_id, "status": "not_started", "pct": 0, "files_done": 0, "total_files": 0}
+
+    return {
+        "run_id":         run_id,
+        "status":         row["status"],
+        "files_done":     row["files_done"],
+        "total_files":    row["total_files"],
+        "pct":            row["pct"],
+        "current_file":   row["current_file"],
+        "findings_count": row["findings_count"],
+        "updated_at":     row["updated_at"].isoformat() if row["updated_at"] else None,
+    }
+
 
 @app.post("/api/v1/review/{run_id}", status_code=202)
 async def trigger_code_review(
@@ -871,6 +1051,85 @@ async def get_code_review_findings(
         "findings": [dict(r) for r in rows],
         "count":    len(rows),
     }
+
+
+# ---------------------------------------------------------------------------
+# Code Graph API — serves code-review-graph visualization + stats
+# ---------------------------------------------------------------------------
+
+_GRAPH_DB   = Path(__file__).parent.parent / ".code-review-graph" / "graph.db"
+_GRAPH_HTML = Path(__file__).parent.parent / ".code-review-graph" / "graph.html"
+
+
+@app.get("/api/v1/graph/status")
+async def get_graph_status(scan_path: str | None = None):
+    """Return code-review-graph stats for a given scan_path (defaults to project root)."""
+    root = Path(scan_path) if scan_path else _GRAPH_DB.parent.parent
+    db   = root / ".code-review-graph" / "graph.db"
+    if not db.exists():
+        return {"available": False}
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db), timeout=5)
+        meta = dict(conn.execute("SELECT key, value FROM metadata").fetchall())
+        nodes = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        files = conn.execute("SELECT COUNT(DISTINCT file_path) FROM nodes WHERE file_path IS NOT NULL").fetchone()[0]
+        langs_rows = conn.execute(
+            "SELECT language, COUNT(*) FROM nodes WHERE language IS NOT NULL GROUP BY language ORDER BY COUNT(*) DESC"
+        ).fetchall()
+        conn.close()
+        languages = ", ".join(r[0] for r in langs_rows if r[0])
+        sha = meta.get("git_head_sha", "")
+        return {
+            "available":    True,
+            "nodes":        nodes,
+            "edges":        edges,
+            "files":        files,
+            "languages":    languages,
+            "last_updated": meta.get("last_updated", ""),
+            "branch":       meta.get("git_branch", ""),
+            "commit":       sha[:8] if sha else "",
+        }
+    except Exception as exc:
+        logger.warning("graph/status error: %s", exc)
+        return {"available": False, "error": str(exc)}
+
+
+@app.get("/api/v1/graph/visualization", response_class=HTMLResponse)
+async def get_graph_visualization(scan_path: str | None = None):
+    """
+    Regenerate and serve the interactive graph HTML for a given scan_path.
+    Opens full-screen — not meant for iframe embedding (graph uses CDN JS).
+    """
+    import asyncio, subprocess as _sp
+    root = Path(scan_path) if scan_path else _GRAPH_DB.parent.parent
+    db   = root / ".code-review-graph" / "graph.db"
+    html = root / ".code-review-graph" / "graph.html"
+
+    if not db.exists():
+        return HTMLResponse(
+            "<html><body style='background:#0f172a;color:#64748b;font-family:monospace;"
+            "display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:12px'>"
+            "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40' viewBox='0 0 24 24' fill='none' "
+            "stroke='currentColor' stroke-width='1.5'><circle cx='12' cy='12' r='10'/>"
+            "<line x1='12' y1='8' x2='12' y2='12'/><line x1='12' y1='16' x2='12.01' y2='16'/></svg>"
+            "<p>Graph not built for this project yet.</p>"
+            "<p style='font-size:12px'>Run a scan to build it automatically.</p></body></html>"
+        )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3.11", "-m", "code_review_graph", "visualize", "--format", "html",
+            "--repo", str(root),
+            stdout=_sp.PIPE, stderr=_sp.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=30)
+    except Exception as exc:
+        logger.warning("graph/visualize error: %s", exc)
+
+    if html.exists():
+        return HTMLResponse(html.read_text())
+    return HTMLResponse("<html><body style='background:#0f172a;color:#ef4444'>Visualization failed</body></html>")
 
 
 # ---------------------------------------------------------------------------

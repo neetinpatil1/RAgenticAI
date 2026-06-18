@@ -1,4 +1,4 @@
-import type { ScanStatus, Finding, RunSummary, CodeReviewFinding, CodeReviewSummary } from "../types";
+import type { ScanStatus, Finding, RunSummary, CodeReviewFinding, CodeReviewSummary, SecretFinding, SecretSummary, DependencyFinding, DependencySummary } from "../types";
 
 const BASE = "/api/v1";
 
@@ -50,4 +50,25 @@ export async function getCodeReview(runId: string): Promise<{ findings: CodeRevi
 /** Open an SSE connection for real-time scan progress. */
 export function openSseStream(runId: string): EventSource {
   return new EventSource(`${BASE}/scan/${runId}/stream`);
+}
+
+export async function getCodeReviewProgress(runId: string): Promise<{
+  status: string; pct: number; files_done: number; total_files: number;
+  current_file: string | null; findings_count: number;
+}> {
+  const res = await fetch(`${BASE}/review/${runId}/progress`);
+  if (!res.ok) throw new Error(`Progress fetch failed: ${res.status}`);
+  return res.json();
+}
+
+export async function getSecretFindings(runId: string): Promise<{ findings: SecretFinding[]; summary: SecretSummary; count: number }> {
+  const res = await fetch(`${BASE}/secrets/${runId}?limit=500`);
+  if (!res.ok) throw new Error(`Secret findings fetch failed: ${res.status}`);
+  return res.json();
+}
+
+export async function getDependencyFindings(runId: string): Promise<{ findings: DependencyFinding[]; summary: DependencySummary; count: number }> {
+  const res = await fetch(`${BASE}/dependencies/${runId}?limit=500`);
+  if (!res.ok) throw new Error(`Dependency findings fetch failed: ${res.status}`);
+  return res.json();
 }

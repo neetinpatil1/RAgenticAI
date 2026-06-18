@@ -19,6 +19,7 @@ export interface Finding {
   ref_urls: string[];
   likelihood: string | null;
   impact: string | null;
+  blast_radius: number | null;
   is_baseline: boolean;
   created_at: string;
   verdict: string | null;
@@ -105,6 +106,54 @@ export interface RunSummary {
     low: number;
     total: number;
   };
+}
+
+export interface SecretFinding {
+  id: string;
+  run_id: string;
+  file_path: string;
+  line_start: number | null;
+  secret_type: string;
+  severity: Severity;
+  description: string;
+  match_preview: string;
+  entropy: number | null;
+  context_line: string | null;
+  created_at: string;
+}
+
+export interface SecretSummary {
+  total: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  files_with_secrets: number;
+}
+
+export interface DependencyFinding {
+  id: string;
+  run_id: string;
+  package_name: string;
+  installed_version: string | null;
+  fixed_version: string | null;
+  vulnerability_id: string;
+  severity: Severity;
+  description: string;
+  ecosystem: string;
+  file_path: string | null;
+  created_at: string;
+}
+
+export interface DependencySummary {
+  total: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  python: number;
+  npm: number;
+  maven: number;
 }
 
 // SSE event shapes

@@ -170,7 +170,7 @@ rules:
 
   - id: python-mutable-default-argument
     patterns:
-      - pattern: def $FUNC(..., $PARAM=[], ...): ...
+      - pattern: "def $FUNC(..., $PARAM=[], ...): ..."
     message: >
       Mutable default argument: the list [] is shared across ALL calls to $FUNC.
       Mutations persist between calls causing subtle state bugs. Use None as

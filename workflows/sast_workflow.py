@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TypedDict, Optional, Annotated
 import json
 
@@ -243,11 +245,83 @@ async def node_write_findings(state: SastWorkflowState, deps: dict) -> SastWorkf
                 },
             )
 
+    # Feature 2: Blast radius enrichment from code-review-graph
+    # For each finding, look up how many other files call into the finding's file.
+    # This surfaces high-impact vulnerable files in the UI ("called by N files").
+    _enrich_blast_radius(state["scan_path"], finding_db_ids, findings, pool)
+
     logger.info(
         "Findings written | run=%s count=%d baseline=%s",
         run_id, len(findings), is_first_scan
     )
     return {**state, "finding_db_ids": finding_db_ids}
+
+
+def _enrich_blast_radius(
+    scan_path: str,
+    finding_db_ids: dict[str, str],
+    findings: list,
+    pool: asyncpg.Pool,
+) -> None:
+    """
+    Feature 2: Query code-review-graph for blast radius of each HIGH/CRITICAL finding.
+
+    Blast radius = max caller_count across all symbols in that file.
+    Updates findings_reports.blast_radius in a fire-and-forget asyncio task
+    so it never blocks the pipeline.
+    """
+    db_path = Path(scan_path) / ".code-review-graph" / "graph.db"
+    if not db_path.exists():
+        return  # Graph not built yet — blast radius will be NULL
+
+    # Build file → max_caller_count from graph
+    file_blast: dict[str, int] = {}
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        rows = conn.execute(
+            "SELECT qualified_name, caller_count FROM risk_index WHERE caller_count > 0"
+        ).fetchall()
+        for qname, callers in rows:
+            fp = qname.split("::")[0] if "::" in qname else qname
+            if (callers or 0) > file_blast.get(fp, 0):
+                file_blast[fp] = int(callers)
+        conn.close()
+    except Exception as exc:
+        logger.warning("blast_radius: graph DB read failed: %s", exc)
+        return
+
+    if not file_blast:
+        return
+
+    # Schedule async DB updates as a background task
+    async def _update_blast_radii() -> None:
+        async with pool.acquire() as conn:
+            for finding in findings:
+                # Only enrich HIGH and CRITICAL findings
+                if finding.severity.value not in ("HIGH", "CRITICAL"):
+                    continue
+                blast = file_blast.get(finding.file_path, 0)
+                if blast == 0:
+                    continue
+                db_id = finding_db_ids.get(finding.fingerprint)
+                if not db_id:
+                    continue
+                try:
+                    await conn.execute(
+                        "UPDATE findings_reports SET blast_radius = $1 WHERE id = $2",
+                        blast, db_id,
+                    )
+                except Exception as exc:
+                    logger.warning("blast_radius: DB update failed for %s: %s", db_id, exc)
+
+        logger.info("blast_radius: enriched findings for run")
+
+    # Fire-and-forget — doesn't block the workflow
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_update_blast_radii())
+    except RuntimeError:
+        pass  # No running loop — skip silently
 
 
 async def node_run_fp_pipeline(state: SastWorkflowState, deps: dict) -> SastWorkflowState:

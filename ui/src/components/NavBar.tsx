@@ -1,7 +1,7 @@
 import { motion } from "framer-motion";
 import { ShieldCheck, History, ScanLine } from "lucide-react";
 
-type Screen = "input" | "progress" | "results" | "history";
+type Screen = "input" | "progress" | "results" | "history" | "graph";
 
 interface Props {
   current: Screen;

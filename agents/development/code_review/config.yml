@@ -8,7 +8,7 @@ description: >
 
 llm:
   tier: 1                          # Always use Tier 1 (Qwen 14B) for deep analysis
-  model: qwen2.5-coder:14b
+  model: llama3.2:3b
   temperature: 0.1                 # Low temperature for consistent structured output
   max_tokens: 2048
 

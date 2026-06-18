@@ -69,8 +69,8 @@ rules:
 
   - id: react-dangerous-innerhtml
     patterns:
-      - pattern: dangerouslySetInnerHTML={{__html: $DATA}}
-      - pattern-not: dangerouslySetInnerHTML={{__html: "..."}}
+      - pattern: "dangerouslySetInnerHTML={{__html: $DATA}}"
+      - pattern-not: 'dangerouslySetInnerHTML={{__html: "..."}}'
     message: >
       dangerouslySetInnerHTML with dynamic content causes React XSS. Sanitise
       $DATA with DOMPurify.sanitize() before passing, or redesign to avoid raw HTML.

@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,8 +52,15 @@ _PRIORITY_KEYWORDS = [
     "repository", "util", "helper", "config", "filter", "interceptor",
 ]
 
-_MAX_FILE_BYTES = 51_200    # 50 KB — larger files truncated
-_MAX_LINES     = 400        # max lines sent to LLM
+_MAX_FILE_BYTES = 15_360    # 15 KB
+_MAX_LINES     = 80         # 80 lines keeps total prompt well under 2048 tokens
+_MAX_FILES     = 50         # review only the top 50 most important files
+
+# Skip paths that rarely contain exploitable logic
+_SKIP_PATH_KEYWORDS = {
+    "test", "spec", "mock", "fixture", "generated", "gen-src",
+    "__generated__", "migration", "seed", "proto", "thrift",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -107,16 +116,22 @@ async def _load_sast_findings(pool: asyncpg.Pool, run_id: str) -> dict[str, list
 # Helper: call Ollama LLM
 # ---------------------------------------------------------------------------
 
-async def _call_llm(system_prompt: str, user_prompt: str, timeout: int = 180) -> str:
-    """Call Ollama chat API and return the response string."""
+async def _call_llm(system_prompt: str, user_prompt: str, timeout: int = 90) -> str:
+    """Call Ollama chat API."""
     payload = {
         "model": settings.ollama.tier1_model,
         "messages": [
-            {"role": "system",    "content": system_prompt},
-            {"role": "user",      "content": user_prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
         ],
         "stream":  False,
-        "options": {"temperature": 0.1, "num_predict": 2048},
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 512,   # concise JSON response
+            "num_ctx":     4096,  # full context window
+            "num_gpu":     99,    # force all layers onto Metal GPU
+            "num_thread":  8,     # CPU threads for prompt processing
+        },
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
@@ -192,7 +207,7 @@ async def _review_file(
     try:
         raw = await _call_llm(system_prompt, user_prompt)
     except Exception as exc:
-        logger.warning("LLM call failed for %s: %s", rel_path, exc)
+        logger.warning("LLM call failed for %s: %s %s", rel_path, type(exc).__name__, exc)
         return None
     elapsed_ms = int((time.time() - start) * 1000)
 
@@ -228,6 +243,28 @@ async def _review_file(
 # Workflow Nodes
 # ---------------------------------------------------------------------------
 
+async def _upsert_progress(pool: asyncpg.Pool, run_id: str, files_done: int, total: int, current_file: str, findings_so_far: int, status: str = "running") -> None:
+    """Write live progress into code_review_status so the API can stream it."""
+    pct = round((files_done / total) * 100) if total else 0
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO code_review_status
+                (run_id, status, files_done, total_files, pct, current_file, findings_count, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+            ON CONFLICT (run_id) DO UPDATE SET
+                status=EXCLUDED.status,
+                files_done=EXCLUDED.files_done,
+                total_files=EXCLUDED.total_files,
+                pct=EXCLUDED.pct,
+                current_file=EXCLUDED.current_file,
+                findings_count=EXCLUDED.findings_count,
+                updated_at=NOW()
+            """,
+            run_id, status, files_done, total, pct, current_file, findings_so_far,
+        )
+
+
 async def node_start(state: CodeReviewState, deps: dict) -> CodeReviewState:
     """Mark workflow as running and load SAST context."""
     run_id = state["run_id"]
@@ -256,52 +293,169 @@ async def node_start(state: CodeReviewState, deps: dict) -> CodeReviewState:
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cr_findings_run ON code_review_findings(run_id)"
         )
+        # Progress tracking table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS code_review_status (
+                run_id        TEXT PRIMARY KEY,
+                status        TEXT NOT NULL DEFAULT 'running',
+                files_done    INT  NOT NULL DEFAULT 0,
+                total_files   INT  NOT NULL DEFAULT 0,
+                pct           INT  NOT NULL DEFAULT 0,
+                current_file  TEXT,
+                findings_count INT NOT NULL DEFAULT 0,
+                updated_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
 
     sast_findings = await _load_sast_findings(pool, run_id)
     logger.info("Code review started | run=%s sast_context_files=%d", run_id, len(sast_findings))
     return {**state, "sast_findings": sast_findings}
 
 
+def _load_graph_data(root: Path) -> tuple[dict[str, float], dict[str, int]]:
+    """
+    Load hub scores and community IDs from code-review-graph SQLite DB.
+
+    Features 1 + 4:
+      - hub_scores: file → max risk_score + caller_count*0.1 (higher = more central)
+      - community_ids: file → community group (files in same community reviewed together)
+
+    Returns (hub_scores, community_ids) — both empty dicts if graph not built.
+    """
+    db_path = root / ".code-review-graph" / "graph.db"
+    if not db_path.exists():
+        # Trigger a background build so the next scan benefits
+        try:
+            subprocess.Popen(
+                ["python3.11", "-m", "code_review_graph", "build", str(root)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info("code-review-graph: started background build for %s", root)
+        except Exception as exc:
+            logger.debug("code-review-graph: could not start build: %s", exc)
+        return {}, {}
+
+    hub_scores: dict[str, float] = {}
+    community_ids: dict[str, int] = {}
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        # Per-file max hub score from risk_index (qualified_name = "filepath::Symbol")
+        rows = conn.execute(
+            "SELECT qualified_name, risk_score, caller_count FROM risk_index"
+        ).fetchall()
+        for qname, score, callers in rows:
+            fp = qname.split("::")[0] if "::" in qname else qname
+            combined = (score or 0.0) + (callers or 0) * 0.1
+            if hub_scores.get(fp, -1.0) < combined:
+                hub_scores[fp] = combined
+
+        # Per-file dominant community_id from nodes table
+        rows2 = conn.execute(
+            """
+            SELECT file_path, community_id, COUNT(*) AS cnt
+            FROM nodes
+            WHERE file_path IS NOT NULL AND community_id IS NOT NULL
+            GROUP BY file_path, community_id
+            ORDER BY file_path, cnt DESC
+            """
+        ).fetchall()
+        seen: set[str] = set()
+        for fp, comm_id, _ in rows2:
+            if fp not in seen:
+                community_ids[fp] = int(comm_id)
+                seen.add(fp)
+
+        conn.close()
+        logger.info(
+            "code-review-graph: hub scores for %d files, communities for %d files",
+            len(hub_scores), len(community_ids),
+        )
+    except Exception as exc:
+        logger.warning("code-review-graph: DB read failed: %s", exc)
+
+    return hub_scores, community_ids
+
+
 async def node_enumerate_files(state: CodeReviewState, deps: dict) -> CodeReviewState:
     """
     Walk the project and build a priority-ordered list of files to review.
 
-    Priority order:
+    Priority order (with code-review-graph):
       1. Files that already have SAST findings (review for deeper issues)
       2. Files in security-sensitive paths (controllers, services, auth, payment)
-      3. All remaining reviewable files, largest first
+      3. All remaining reviewable files, sorted by community then hub centrality score
+         (Feature 1: hub-first; Feature 4: community-grouped for richer LLM context)
+
+    Without graph DB: falls back to legacy size-based sort.
     """
     scan_path = state["scan_path"]
     sast_findings = state["sast_findings"]
     root = Path(scan_path)
 
-    # Collect all reviewable files
-    all_files: list[Path] = [
-        p for p in root.rglob("*")
-        if p.is_file()
-        and p.suffix.lower() in _REVIEWABLE_EXTS
-        and not any(part in {".git", "node_modules", ".venv", "venv", "__pycache__", "target", "build", "dist"}
-                    for part in p.parts)
-        and p.stat().st_size <= _MAX_FILE_BYTES * 2  # skip very large files
-    ]
+    # Load graph data (Features 1 + 4) — fast, synchronous SQLite read
+    hub_scores, community_ids = _load_graph_data(root)
 
-    # Build sets for prioritisation
+    # Collect reviewable files, skipping test/generated/build paths
+    _HARD_SKIP = {".git", "node_modules", ".venv", "venv", "__pycache__", "target", "build", "dist"}
+    all_files: list[Path] = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in _REVIEWABLE_EXTS:
+            continue
+        parts_lower = {part.lower() for part in p.parts}
+        if parts_lower & _HARD_SKIP:
+            continue
+        # Skip test/generated paths
+        rel_lower = str(p.relative_to(root)).lower()
+        if any(kw in rel_lower for kw in _SKIP_PATH_KEYWORDS):
+            continue
+        try:
+            if p.stat().st_size > _MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        all_files.append(p)
+
+    # Priority tier: SAST hits → security paths → rest
     sast_paths = set(sast_findings.keys())
 
     def priority(p: Path) -> int:
         rel = str(p.relative_to(root))
         if rel in sast_paths:
-            return 0  # highest priority
+            return 0
         path_lower = str(p).lower()
         for kw in _PRIORITY_KEYWORDS:
             if kw in path_lower:
                 return 1
         return 2
 
-    all_files.sort(key=lambda p: (priority(p), -p.stat().st_size))
+    if hub_scores:
+        # Feature 1 + 4: sort by (priority, community_id, -hub_score)
+        # Files in the same community are reviewed in sequence → richer LLM context
+        # Within each community, highest hub score (most-called file) goes first
+        def graph_sort_key(p: Path) -> tuple:
+            abs_path = str(p)
+            prio = priority(p)
+            comm = community_ids.get(abs_path, 9999)
+            hub = hub_scores.get(abs_path, 0.0)
+            return (prio, comm, -hub)
+
+        all_files.sort(key=graph_sort_key)
+        logger.info("code-review-graph: using hub+community sort for %d files", len(all_files))
+    else:
+        # Legacy sort: priority tier then largest-first
+        all_files.sort(key=lambda p: (priority(p), -p.stat().st_size))
+
+    # Cap at _MAX_FILES — review only the most important files
+    all_files = all_files[:_MAX_FILES]
 
     file_list = [str(p) for p in all_files]
-    logger.info("Code review: %d files queued | run=%s", len(file_list), state["run_id"])
+    logger.info("Code review: %d files selected (capped at %d) | run=%s", len(file_list), _MAX_FILES, state["run_id"])
+    # Write initial progress entry
+    pool: asyncpg.Pool = deps["pool"]
+    await _upsert_progress(pool, state["run_id"], 0, len(file_list), "", 0, "running")
     return {**state, "files_to_review": file_list, "total_files": len(file_list)}
 
 
@@ -328,48 +482,63 @@ async def node_review_files(state: CodeReviewState, deps: dict) -> CodeReviewSta
             "recommendation, confidence."
         )
 
+    total = len(files)
     reviewed = 0
+    processed = 0
     total_findings = 0
 
-    for abs_path in files:
-        result = await _review_file(abs_path, scan_path, sast_findings, system_prompt)
-        if result is None:
-            continue
+    # Semaphore = 2: send 2 files to Ollama concurrently (matches OLLAMA_NUM_PARALLEL=2)
+    semaphore = asyncio.Semaphore(2)
+    lock = asyncio.Lock()   # protect shared counters
 
-        reviewed += 1
+    async def review_one(abs_path: str) -> None:
+        nonlocal reviewed, processed, total_findings
 
-        # Store findings to DB
-        if result.findings:
-            async with pool.acquire() as conn:
-                for finding in result.findings:
-                    if finding.confidence < 0.5:
-                        continue
-                    await conn.execute(
-                        """
-                        INSERT INTO code_review_findings
-                            (run_id, file_path, language, category, severity,
-                             line_start, line_end, title, description, recommendation,
-                             confidence, overall_file_score)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-                        """,
-                        run_id, result.file_path, result.language,
-                        finding.category.value, finding.severity.value,
-                        finding.line_start, finding.line_end,
-                        finding.title, finding.description, finding.recommendation,
-                        finding.confidence, result.overall_score,
-                    )
-            total_findings += len(result.findings)
-            logger.info(
-                "Reviewed %s | score=%d findings=%d",
-                result.file_path, result.overall_score, len(result.findings),
-            )
-        else:
-            logger.debug("Reviewed %s | score=%d clean", result.file_path, result.overall_score)
+        rel = Path(abs_path).name
+        async with semaphore:
+            async with lock:
+                proc_now = processed
+                processed += 1
+            await _upsert_progress(pool, run_id, proc_now, total, rel, total_findings, "running")
 
-    logger.info(
-        "Code review complete | run=%s files=%d findings=%d",
-        run_id, reviewed, total_findings,
-    )
+            result = await _review_file(abs_path, scan_path, sast_findings, system_prompt)
+            if result is None:
+                return
+
+            async with lock:
+                reviewed += 1
+
+            if result.findings:
+                async with pool.acquire() as conn:
+                    for finding in result.findings:
+                        if finding.confidence < 0.5:
+                            continue
+                        await conn.execute(
+                            """
+                            INSERT INTO code_review_findings
+                                (run_id, file_path, language, category, severity,
+                                 line_start, line_end, title, description, recommendation,
+                                 confidence, overall_file_score)
+                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                            """,
+                            run_id, result.file_path, result.language,
+                            finding.category.value, finding.severity.value,
+                            finding.line_start, finding.line_end,
+                            finding.title, finding.description, finding.recommendation,
+                            finding.confidence, result.overall_score,
+                        )
+                async with lock:
+                    total_findings += len(result.findings)
+                logger.info("Reviewed %s | score=%d findings=%d", result.file_path, result.overall_score, len(result.findings))
+            else:
+                logger.debug("Reviewed %s | score=%d clean", result.file_path, result.overall_score)
+
+    # Run all files with concurrency=2
+    await asyncio.gather(*[review_one(f) for f in files])
+
+    # Mark done
+    await _upsert_progress(pool, run_id, total, total, "", total_findings, "completed")
+    logger.info("Code review complete | run=%s files=%d findings=%d", run_id, reviewed, total_findings)
     return {**state, "files_reviewed": reviewed, "findings_count": total_findings}
 
 

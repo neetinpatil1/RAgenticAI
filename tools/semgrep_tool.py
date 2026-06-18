@@ -121,9 +121,16 @@ class SemgrepTool:
 
         stdout, stderr, returncode = await self._run_command(cmd)
 
-        # Semgrep exit codes: 0=ok/no findings, 1=findings found, 2=error
+        # Semgrep exit codes: 0=ok/no findings, 1=findings found, 2=partial results with rule errors
+        # Exit code 2 means some rules failed but the scan still ran — parse what we have.
+        # Only treat it as fatal if stdout is empty (no JSON produced at all).
         if returncode == 2:
-            raise RuntimeError(f"Semgrep error (exit 2): {stderr[:500]}")
+            if not stdout.strip():
+                raise RuntimeError(f"Semgrep error (exit 2): {stderr[:500]}")
+            logger.warning(
+                "Semgrep exited with code 2 (some rules had errors) — continuing with partial results. "
+                "stderr: %s", stderr[:300]
+            )
 
         findings = self._parse_output(stdout, scan_path)
         findings, scan_stats = self._parse_output(stdout, scan_path)
