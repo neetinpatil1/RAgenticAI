@@ -6,12 +6,16 @@ rules:
 
   - id: java-db-call-inside-loop
     patterns:
-      - pattern: |
-          for (...) {
-            ...
-            $REPO.findById(...)
-            ...
-          }
+      - pattern: $REPO.findById(...)
+      - pattern-either:
+        - pattern-inside: |
+            for (...) {
+              ...
+            }
+        - pattern-inside: |
+            while (...) {
+              ...
+            }
     message: >
       N+1 query detected: repository.findById() called inside a loop. Each
       iteration triggers a separate DB round-trip. Replace with a batch fetch
@@ -25,12 +29,16 @@ rules:
 
   - id: java-jdbc-in-loop
     patterns:
-      - pattern: |
-          for (...) {
-            ...
-            $STMT.executeQuery(...)
-            ...
-          }
+      - pattern: $STMT.executeQuery(...)
+      - pattern-either:
+        - pattern-inside: |
+            for (...) {
+              ...
+            }
+        - pattern-inside: |
+            while (...) {
+              ...
+            }
     message: >
       Database query inside a loop causes N+1 problem. Rewrite to use a
       single query with IN clause or execute the query before the loop and
@@ -50,8 +58,8 @@ rules:
       - pattern: |
           FileInputStream $IS = new FileInputStream(...);
           ...
-      - pattern-not: |
-          try (...; FileInputStream $IS = new FileInputStream(...); ...) {
+      - pattern-not-inside: |
+          try ($TYPE $IS = new FileInputStream(...)) {
             ...
           }
     message: >
@@ -69,8 +77,8 @@ rules:
       - pattern: |
           Connection $CONN = $DS.getConnection();
           ...
-      - pattern-not: |
-          try (...; Connection $CONN = $DS.getConnection(); ...) {
+      - pattern-not-inside: |
+          try ($TYPE $CONN = $DS.getConnection()) {
             ...
           }
     message: >

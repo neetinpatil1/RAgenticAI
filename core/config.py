@@ -12,6 +12,7 @@ Phase 1+: extend with HashiCorp Vault integration (vault_client.py).
 
 import os
 from dataclasses import dataclass, field
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # Load .env file from project root (no-op if already loaded or file absent)
@@ -31,10 +32,11 @@ class DatabaseConfig:
 
     @property
     def dsn(self) -> str:
-        """Asyncpg-compatible DSN string."""
+        """Asyncpg-compatible DSN string. Password is URL-encoded to handle special characters."""
         return (
-            f"postgresql://{self.user}:{self.password}"
+            f"postgresql://{self.user}:{quote_plus(self.password)}"
             f"@{self.host}:{self.port}/{self.name}"
+            f"?sslmode=disable"
         )
 
 

@@ -25,6 +25,7 @@ Design (SSDLC_Design_v3.2.docx §14):
 import asyncio
 import json
 import logging
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -1218,7 +1219,7 @@ async def _run_graph_build(root: Path) -> None:
     key = str(root)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "python3.11", "-m", "code_review_graph", "build", "--repo", str(root),
+            sys.executable, "-m", "code_review_graph", "build", "--repo", str(root),
             stdout=_sp.PIPE, stderr=_sp.PIPE,
         )
         try:
@@ -1346,7 +1347,7 @@ async def get_graph_visualization(
         )
     try:
         proc = await asyncio.create_subprocess_exec(
-            "python3.11", "-m", "code_review_graph", "visualize",
+            sys.executable, "-m", "code_review_graph", "visualize",
             "--format", "html", "--mode", mode,
             "--repo", str(root),
             stdout=_sp.PIPE, stderr=_sp.PIPE,

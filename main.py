@@ -20,6 +20,7 @@ Phase 1+: add --repo git@github.com:org/repo.git for Git-based scans.
 import argparse
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import uuid
 from pathlib import Path
@@ -30,10 +31,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+_LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+_LOG_DATE   = "%Y-%m-%d %H:%M:%S"
+
+_file_handler = RotatingFileHandler(
+    Path(__file__).parent / "app.log",
+    maxBytes=10 * 1024 * 1024,  # 10 MB per file
+    backupCount=5,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE))
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format=_LOG_FORMAT,
+    datefmt=_LOG_DATE,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        _file_handler,
+    ],
 )
 logger = logging.getLogger(__name__)
 

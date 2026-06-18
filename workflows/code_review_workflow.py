@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import sys
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -444,7 +445,7 @@ def _load_graph_data(root: Path) -> tuple[dict[str, float], dict[str, int], dict
         # Trigger a background build so the next scan benefits
         try:
             subprocess.Popen(
-                ["python3.11", "-m", "code_review_graph", "build", "--repo", str(root)],
+                [sys.executable, "-m", "code_review_graph", "build", "--repo", str(root)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -596,7 +597,7 @@ async def _ensure_graph_built(root: Path) -> bool:
     logger.warning("code-review-graph: graph not found for %s — building now (first-time scan)", root)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "python3.11", "-m", "code_review_graph", "build", "--repo", str(root),
+            sys.executable, "-m", "code_review_graph", "build", "--repo", str(root),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )

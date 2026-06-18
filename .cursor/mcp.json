@@ -1,13 +1,13 @@
 {
   "mcpServers": {
     "code-review-graph": {
-      "command": "/opt/homebrew/opt/python@3.11/bin/python3.11",
+      "command": "/Users/paresh/IdeaProjects/RAgenticAI/.venv/bin/python",
       "args": [
         "-m",
         "code_review_graph",
         "serve"
       ],
-      "cwd": "/Users/nitinpatil/IdeaProjects/RAgenticAI",
+      "cwd": "/Users/paresh/IdeaProjects/RAgenticAI",
       "type": "stdio"
     }
   }
