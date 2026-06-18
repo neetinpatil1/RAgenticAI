@@ -218,13 +218,29 @@ def _build_workflow_deps() -> dict:
 
 async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     """
-    Run all Phase 1 agents in parallel:
-      - SAST Agent       (Semgrep + FP pipeline)
-      - Secret Scanner   (regex + entropy)
-      - SCA Agent        (pip-audit + npm audit + OSV API)
+    Orchestration order (guaranteed):
+      Step 1 — Code Knowledge Graph build (awaited, blocks step 2)
+               Graph must be ready before code review so it can enrich LLM prompts.
+      Step 2 — SAST + Secret Scanner + SCA run in parallel (graph already built)
+      Step 3 — Code Review runs after SAST/SCA complete with full graph context
 
     return_exceptions=True ensures one agent crashing does not cancel the others.
     """
+    import time as _t
+    root = Path(scan_path)
+    key  = str(root)
+
+    # ── Step 1: Build code knowledge graph first ──────────────────────────────
+    # Skip if already done (e.g. repeat scan of same project)
+    if _graph_build_status.get(key, {}).get("status") not in ("done",):
+        _graph_build_status[key] = {"status": "building", "error": None, "started_at": _t.time()}
+        logger.warning("graph/build: starting BEFORE SAST for %s", root)
+        await _run_graph_build(root)   # ← awaited: SAST waits for this
+        logger.warning("graph/build: finished, SAST starting now for %s", root)
+    else:
+        logger.warning("graph/build: already done, skipping rebuild for %s", root)
+
+    # ── Step 2: SAST + Secrets + SCA in parallel ──────────────────────────────
     logger.info("Phase 1 agents starting in parallel | run=%s", run_id)
     results = await asyncio.gather(
         run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
@@ -237,6 +253,41 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
             agent = ["sast", "secret_scanner", "sca"][i]
             logger.error("Agent failed | agent=%s run=%s error=%s", agent, run_id, r)
     logger.info("Phase 1 agents complete | run=%s", run_id)
+
+    # ── Step 3: Code Review after SAST/SCA complete ──────────────────────────
+    logger.info("Code review starting automatically | run=%s", run_id)
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS code_review_status (
+                    run_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    files_done INT NOT NULL DEFAULT 0,
+                    total_files INT NOT NULL DEFAULT 0,
+                    pct INT NOT NULL DEFAULT 0,
+                    current_file TEXT,
+                    findings_count INT NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO code_review_status
+                    (run_id, status, files_done, total_files, pct, current_file, findings_count, updated_at)
+                VALUES ($1, 'running', 0, 0, 0, NULL, 0, NOW())
+                ON CONFLICT (run_id) DO UPDATE SET
+                    status='running', files_done=0, total_files=0, pct=0,
+                    current_file=NULL, findings_count=0, updated_at=NOW()
+                """,
+                run_id,
+            )
+    except Exception as exc:
+        logger.warning("Could not pre-set code_review_status: %s", exc)
+
+    await run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
+    logger.info("Code review complete | run=%s", run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +347,14 @@ async def submit_scan(
         payload={"scan_path": str(scan_path.resolve()), "metadata": request.metadata},
     )
 
-    # Phase 1: run all agents in parallel as a single background task
+    # Mark graph as "building" immediately so the UI polling sees it right away
+    # (the actual build runs inside _run_all_agents as step 1, before SAST)
+    import time as _t
+    _key = str(scan_path.resolve())
+    if _graph_build_status.get(_key, {}).get("status") != "done":
+        _graph_build_status[_key] = {"status": "building", "error": None, "started_at": _t.time()}
+
+    # Phase 1: graph build → SAST/SCA/Secrets → Code Review (sequential steps inside)
     deps = _build_workflow_deps()
     background_tasks.add_task(
         _run_all_agents,
@@ -304,16 +362,6 @@ async def submit_scan(
         scan_path=str(scan_path.resolve()),
         deps=deps,
     )
-
-    # Kick off graph build immediately so it runs in parallel with SAST/SCA.
-    # Using _run_graph_build (not bare Popen) so the UI polling sees "building" → "done".
-    import time as _time
-    _root = scan_path.resolve()
-    _key  = str(_root)
-    if _graph_build_status.get(_key, {}).get("status") != "building":
-        _graph_build_status[_key] = {"status": "building", "error": None, "started_at": _time.time()}
-        background_tasks.add_task(_run_graph_build, _root)
-        logger.warning("graph/build: queued at scan start for %s", _root)
 
     logger.info("Scan submitted | run=%s path=%s", run_id, request.path)
     return ScanResponse(

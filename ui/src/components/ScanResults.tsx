@@ -130,6 +130,9 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
         } else if (prog.status === "fulfilled" && prog.value.status === "failed") {
           setCrTriggered(true);
           setCrError("Code review failed. Check logs or try again.");
+        } else if (prog.status === "fulfilled" && prog.value.status === "running") {
+          // Auto-triggered by backend — resume polling without manual button click
+          startCrPolling();
         }
       } catch { /* not yet */ }
       loadSecrets();
@@ -140,29 +143,29 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     // -------------------------------------------------------------------------
     // Graph build polling — tracks the background build fired at scan start
     // -------------------------------------------------------------------------
-    function startGraphBuildPolling() {
+    async function startGraphBuildPolling() {
       if (!scanPath) return;
+      const path = scanPath; // narrow type to string
 
-      // Optimistically show "building" immediately — the server starts the build
-      // in the same request that started this scan, so it's already in progress.
-      setGraphBuildStatus("building");
+      const MAX_POLLS = 60; // 60 × 4s = 4 minutes max, then give up
+      let polls = 0;
 
-      // Tick elapsed seconds
-      graphElapsedRef.current = setInterval(
-        () => setGraphBuildElapsed(s => s + 1), 1000
-      );
-
-      // Poll build status every 4s
-      graphPollRef.current = setInterval(async () => {
+      async function checkStatus() {
         try {
           const r = await fetch(
-            `/api/v1/graph/build/status?scan_path=${encodeURIComponent(scanPath)}`
+            `/api/v1/graph/build/status?scan_path=${encodeURIComponent(path)}`
           );
           if (!r.ok) return;
           const d = await r.json();
 
           if (d.status === "building") {
+            // Start elapsed ticker once we confirm build is actually running
             setGraphBuildStatus("building");
+            if (!graphElapsedRef.current) {
+              graphElapsedRef.current = setInterval(
+                () => setGraphBuildElapsed(s => s + 1), 1000
+              );
+            }
           } else if (d.status === "done" || (d.status === "idle" && d.graph_exists)) {
             stopGraphPolling();
             setGraphBuildStatus("done");
@@ -170,11 +173,18 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             stopGraphPolling();
             setGraphBuildStatus("failed");
             setGraphBuildError(d.error ?? "Graph build failed — check server logs.");
+          } else {
+            // idle + no graph: build not started or server restarted
+            // keep waiting up to MAX_POLLS, then stop silently (show nothing)
+            polls++;
+            if (polls >= MAX_POLLS) stopGraphPolling();
           }
-          // "idle" + graph doesn't exist yet → build not started or server restarted
-          // keep polling
         } catch { /* network blip — keep polling */ }
-      }, 4000);
+      }
+
+      // Check immediately, then every 4s
+      await checkStatus();
+      graphPollRef.current = setInterval(checkStatus, 4000);
     }
 
     function stopGraphPolling() {
@@ -253,21 +263,9 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   // ---------------------------------------------------------------------------
   // Code review trigger + progress polling
   // ---------------------------------------------------------------------------
-  async function handleRunCodeReview() {
+  function startCrPolling() {
     setCrLoading(true);
     setCrTriggered(true);
-    setCrError(null);
-    setCrCompleted(false);
-    setCrProgress(null);
-    try {
-      await triggerCodeReview(runId);
-    } catch (err) {
-      setCrLoading(false);
-      setCrError(`Failed to start code review: ${err instanceof Error ? err.message : "server error"}. Is the server running?`);
-      return;
-    }
-
-    // Poll for progress — stop on completed/failed or after 20 min
     let stalePct = -1;
     let staleCount = 0;
     const MAX_STALE_POLLS = 20; // 20 × 6s = 2 min with no change → stuck
@@ -317,6 +315,19 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       }
     };
     setTimeout(poll, 4000);
+  }
+
+  async function handleRunCodeReview() {
+    setCrError(null);
+    setCrCompleted(false);
+    setCrProgress(null);
+    try {
+      await triggerCodeReview(runId);
+    } catch (err) {
+      setCrError(`Failed to start code review: ${err instanceof Error ? err.message : "server error"}. Is the server running?`);
+      return;
+    }
+    startCrPolling();
   }
 
   // ---------------------------------------------------------------------------

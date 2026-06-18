@@ -55,6 +55,7 @@ export function CodeGraph({ scanPath }: Props) {
   const [elapsed,    setElapsed]    = useState(0);
   const pollRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollCount  = useRef(0);
 
   // -------------------------------------------------------------------------
   // Graph status
@@ -93,12 +94,20 @@ export function CodeGraph({ scanPath }: Props) {
   }
 
   async function pollBuildStatus() {
+    pollCount.current += 1;
+    // Safety cap: 80 polls × 3s = 4 minutes max
+    if (pollCount.current > 80) {
+      stopPolling();
+      setBuildPhase("failed");
+      setBuildError("Build is taking too long. Check server logs for details.");
+      return;
+    }
     try {
       const r = await fetch(`/api/v1/graph/build/status?scan_path=${encodeURIComponent(scanPath)}`);
       if (!r.ok) return; // transient — keep polling
       const d: BuildStatus = await r.json();
 
-      if (d.status === "done") {
+      if (d.status === "done" || (d.status === "idle" && d.graph_exists)) {
         stopPolling();
         setBuildPhase("done");
         await fetchStatus(scanPath); // refresh node/edge counts
@@ -107,7 +116,7 @@ export function CodeGraph({ scanPath }: Props) {
         setBuildPhase("failed");
         setBuildError(d.error ?? "Build failed — check server logs for details.");
       }
-      // "building" → keep polling
+      // "building" or "idle" (not yet written) → keep polling
     } catch { /* network blip — keep polling */ }
   }
 
@@ -116,6 +125,7 @@ export function CodeGraph({ scanPath }: Props) {
   // -------------------------------------------------------------------------
   async function triggerBuild() {
     stopPolling();
+    pollCount.current = 0;
     setBuildPhase("building");
     setBuildError(null);
     setError(null);
