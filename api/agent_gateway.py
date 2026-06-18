@@ -495,9 +495,15 @@ async def list_findings(
                 fr.is_baseline, fr.created_at,
                 COALESCE(fr.blast_radius, 0) AS blast_radius,
                 fp.verdict, fp.confidence, fp.fp_category, fp.reasoning,
-                fp.label_status
+                fp.label_status, fp.source AS fp_source
             FROM findings_reports fr
-            LEFT JOIN fp_decisions fp ON fp.finding_id = fr.id
+            LEFT JOIN LATERAL (
+                SELECT verdict, confidence, fp_category, reasoning, label_status, source
+                FROM fp_decisions
+                WHERE finding_id = fr.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) fp ON true
             {where}
             ORDER BY
                 CASE fr.severity

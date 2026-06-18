@@ -27,6 +27,7 @@ export interface Finding {
   fp_category: string | null;
   reasoning: string | null;
   label_status: string | null;
+  fp_source: string | null;
 }
 
 export interface ScanCoverage {

@@ -231,22 +231,54 @@ class SCATool:
 
         ns = {"m": "http://maven.apache.org/POM/4.0.0"}
         packages: list[tuple[str, str, str, str]] = []  # group, artifact, version, rel_path
+        seen: set[tuple[str, str, str]] = set()  # dedup across multi-module poms
 
         for pom in pom_files:
             rel = str(pom.relative_to(root))
             try:
                 tree = ET.parse(pom)
-                for dep in (tree.findall(".//m:dependency", ns) or tree.findall(".//dependency")):
+                root_el = tree.getroot()
+
+                # Collect <properties> from this pom so we can resolve ${...} refs
+                props: dict[str, str] = {}
+                props_el = root_el.find("m:properties", ns) or root_el.find("properties")
+                if props_el is not None:
+                    for child in props_el:
+                        tag = child.tag.split("}")[-1]  # strip namespace
+                        if child.text:
+                            props[tag] = child.text.strip()
+
+                def resolve(value: str) -> str:
+                    """Substitute ${prop} references using this pom's <properties>."""
+                    if not value or not value.startswith("${"):
+                        return value
+                    key = value[2:-1]  # strip ${ and }
+                    return props.get(key, "")  # empty string → will be filtered below
+
+                for dep in (root_el.findall(".//m:dependency", ns) or root_el.findall(".//dependency")):
                     group    = self._xml_text(dep, "groupId",    ns)
                     artifact = self._xml_text(dep, "artifactId", ns)
-                    version  = self._xml_text(dep, "version",    ns)
-                    if group and artifact and version and not version.startswith("$"):
-                        packages.append((group, artifact, version, rel))
+                    raw_ver  = self._xml_text(dep, "version",    ns)
+
+                    if not group or not artifact:
+                        continue
+
+                    # Resolve property references; skip if version is unknown
+                    version = resolve(raw_ver) if raw_ver else None
+                    if not version:
+                        continue
+
+                    key = (group, artifact, version)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    packages.append((group, artifact, version, rel))
             except Exception as exc:
                 logger.debug("pom.xml parse error %s: %s", rel, exc)
 
         stats["maven"]          += len(packages)
         stats["total_packages"] += len(packages)
+        logger.info("SCA Maven | pom_files=%d resolved_packages=%d", len(pom_files), len(packages))
         if not packages:
             return findings
 
@@ -310,15 +342,41 @@ class SCATool:
 
     @staticmethod
     def _xml_text(element, tag: str, ns: dict) -> Optional[str]:
-        child = element.find(f"m:{tag}", ns) or element.find(tag)
-        if child is not None and child.text:
-            return child.text.strip()
+        # Python's ElementTree C-extension lazily populates .text — find() can
+        # return an element with .text=None until its children are iterated.
+        # Iterate directly and match by local name to reliably get the text value.
+        for child in element:
+            local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if local == tag and child.text:
+                return child.text.strip()
         return None
 
     @staticmethod
     def _osv_severity(vuln: dict) -> str:
+        # 1. Try database_specific.severity (GHSA advisories)
         db  = vuln.get("database_specific") or {}
         raw = (db.get("severity") or "").upper()
-        return {"CRITICAL": "CRITICAL", "HIGH": "HIGH",
-                "MODERATE": "MEDIUM",   "MEDIUM": "MEDIUM",
-                "LOW": "LOW"}.get(raw, "MEDIUM")
+        if raw:
+            return {"CRITICAL": "CRITICAL", "HIGH": "HIGH",
+                    "MODERATE": "MEDIUM",   "MEDIUM": "MEDIUM",
+                    "LOW": "LOW"}.get(raw, "MEDIUM")
+        # 2. Try top-level severity[] (CVSS scores from OSV)
+        for sev in (vuln.get("severity") or []):
+            score_type = (sev.get("type") or "").upper()
+            score = sev.get("score", "")
+            # CVSS v3 base score: extract numeric value from vector or score string
+            if "CVSS" in score_type and score:
+                # score may be a vector like "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+                # Extract base score by checking the impact components
+                # Simpler: parse the score string as float if it's numeric
+                try:
+                    numeric = float(score)
+                    if numeric >= 9.0: return "CRITICAL"
+                    if numeric >= 7.0: return "HIGH"
+                    if numeric >= 4.0: return "MEDIUM"
+                    return "LOW"
+                except ValueError:
+                    # It's a vector string — count critical indicators
+                    if any(x in score for x in ("C:H/I:H", "C:H/I:H/A:H")): return "CRITICAL"
+                    if "C:H" in score or "I:H" in score:                      return "HIGH"
+        return "MEDIUM"

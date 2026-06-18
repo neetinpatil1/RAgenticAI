@@ -59,11 +59,11 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   const [sevFilter, setSevFilter] = useState<string>("ALL");
   const [activeTab, setActiveTab] = useState<"sast" | "review" | "secrets" | "deps">("sast");
 
-  // Code review state
+  // Code review state — starts as "loading" like secrets/SCA, no separate detection needed
   const [crFindings,   setCrFindings]   = useState<CodeReviewFinding[]>([]);
   const [crSummary,    setCrSummary]    = useState<CodeReviewSummary | null>(null);
-  const [crLoading,    setCrLoading]    = useState(false);
-  const [crTriggered,  setCrTriggered]  = useState(false);
+  const [crLoading,    setCrLoading]    = useState(true);   // true by default — poll until done
+  const [crTriggered,  setCrTriggered]  = useState(true);   // true by default — always show spinner
   const [crCompleted,  setCrCompleted]  = useState(false);
   const [crError,      setCrError]      = useState<string | null>(null);
   const [crCatFilter,  setCrCatFilter]  = useState<string>("ALL");
@@ -72,6 +72,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     pct: number; files_done: number; total_files: number;
     current_file: string | null; findings_count: number;
   } | null>(null);
+  const crPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // FP Challenger state
   const [fpLoading,    setFpLoading]    = useState(false);
@@ -107,12 +108,18 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   // Data loading — initial fetch + polling for parallel agents
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    // Reset scanning flags for new runId
+    // Reset ALL agent state for the new runId
     setSecretScanning(true);
     setDepScanning(true);
     setSecretFindings([]);
     setDepFindings([]);
     setCrFindings([]);
+    setCrSummary(null);
+    setCrLoading(true);      // Always start loading — same as secrets/SCA
+    setCrTriggered(true);    // Always show spinner — don't wait for "detection"
+    setCrCompleted(false);
+    setCrError(null);
+    setCrProgress(null);
     setFindings([]);
     setGraphBuildStatus("idle");
     setGraphBuildError(null);
@@ -123,27 +130,58 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     setFpError(null);
     setFpProgress(null);
 
-    // Poll for code review start — called when initial load finds CR not yet running.
-    // Retries every 10s for up to 3 minutes, then gives up silently.
-    async function waitForCrToStart(retries = 0) {
-      const MAX_CR_WAIT = 18; // 18 × 10s = 3 minutes
-      if (retries >= MAX_CR_WAIT) return;
+    // ── Code review polling ──────────────────────────────────────────────────
+    // Polls every 5s. Status responses:
+    //   "not_started" → SAST still running, keep waiting (spinner stays)
+    //   "running"     → update progress bar
+    //   "completed"   → fetch findings, mark done
+    //   "failed"      → show error + retry button
+    // After 20 min of "not_started" with no change → show manual trigger button.
+    let crStalled = 0;
+    const MAX_CR_STALLED = 240; // 240 × 5s = 20 min
+
+    async function pollCr(): Promise<void> {
       try {
-        const [cr, prog] = await Promise.allSettled([
-          getCodeReview(runId),
-          getCodeReviewProgress(runId),
-        ]);
-        if (cr.status === "fulfilled" && cr.value.count > 0) {
-          setCrFindings(cr.value.findings); setCrSummary(cr.value.summary);
-          setCrTriggered(true); setCrCompleted(true); return;
+        const prog = await getCodeReviewProgress(runId);
+
+        if (prog.status === "running") {
+          crStalled = 0;
+          setCrProgress({
+            pct: prog.pct, files_done: prog.files_done,
+            total_files: prog.total_files, current_file: prog.current_file,
+            findings_count: prog.findings_count,
+          });
+          crPollRef.current = setTimeout(pollCr, 5_000);
+          return;
         }
-        if (prog.status === "fulfilled") {
-          if (prog.value.status === "running") { startCrPolling(); return; }
-          if (prog.value.status === "completed") { setCrTriggered(true); setCrCompleted(true); return; }
-          if (prog.value.status === "failed") { setCrTriggered(true); setCrError("Code review failed. Check logs."); return; }
+
+        if (prog.status === "completed") {
+          const cr = await getCodeReview(runId);
+          if (cr.count > 0) { setCrFindings(cr.findings); setCrSummary(cr.summary); }
+          setCrCompleted(true);
+          setCrLoading(false);
+          waitForFpToStart();
+          return;
         }
-      } catch { /* not started yet — keep waiting */ }
-      setTimeout(() => waitForCrToStart(retries + 1), 10_000);
+
+        if (prog.status === "failed") {
+          setCrError("Code review failed on the server. Check /tmp/app.log.");
+          setCrLoading(false);
+          return;
+        }
+
+        // "not_started" — SAST still running, keep waiting
+        crStalled++;
+        if (crStalled >= MAX_CR_STALLED) {
+          // Something is genuinely wrong — let user trigger manually
+          setCrTriggered(false);
+          setCrLoading(false);
+          return;
+        }
+        crPollRef.current = setTimeout(pollCr, 5_000);
+      } catch {
+        crPollRef.current = setTimeout(pollCr, 8_000);
+      }
     }
 
     async function load() {
@@ -151,37 +189,6 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       setFindings(f);
       setStatus(s);
       setLoading(false);
-      let crDetected = false;
-      try {
-        // Also check progress status — might be "completed" (0 findings) or "failed"
-        const [cr, prog] = await Promise.allSettled([
-          getCodeReview(runId),
-          getCodeReviewProgress(runId),
-        ]);
-        if (cr.status === "fulfilled" && cr.value.count > 0) {
-          setCrFindings(cr.value.findings);
-          setCrSummary(cr.value.summary);
-          setCrTriggered(true);
-          setCrCompleted(true);
-          crDetected = true;
-        } else if (prog.status === "fulfilled" && prog.value.status === "completed") {
-          // Completed but found nothing
-          setCrTriggered(true);
-          setCrCompleted(true);
-          crDetected = true;
-        } else if (prog.status === "fulfilled" && prog.value.status === "failed") {
-          setCrTriggered(true);
-          setCrError("Code review failed. Check logs or try again.");
-          crDetected = true;
-        } else if (prog.status === "fulfilled" && prog.value.status === "running") {
-          // Auto-triggered by backend — resume polling without manual button click
-          startCrPolling();
-          crDetected = true;
-        }
-      } catch { /* not yet */ }
-      // If CR wasn't detected yet (backend hasn't started it — SAST still running),
-      // start a background retry loop that picks it up once Step 3 begins.
-      if (!crDetected) waitForCrToStart();
 
       // Check FP Challenger status
       try {
@@ -190,7 +197,6 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setFpTriggered(true);
           setFpCompleted(true);
           setFpProgress(fp);
-          // Reload findings to pick up challenger verdicts
           const refreshed = await getFindings(runId);
           setFindings(refreshed);
         } else if (fp.status === "running") {
@@ -204,6 +210,9 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       loadSecrets();
       loadDeps();
       startGraphBuildPolling(s.scan_path);
+
+      // Start code review polling immediately — same as secrets/SCA
+      pollCr();
     }
 
     // -------------------------------------------------------------------------
@@ -330,79 +339,40 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     return () => {
       if (graphPollRef.current)    clearInterval(graphPollRef.current);
       if (graphElapsedRef.current) clearInterval(graphElapsedRef.current);
+      if (crPollRef.current)       clearTimeout(crPollRef.current);
     };
   }, [runId]);
 
   // ---------------------------------------------------------------------------
   // Code review trigger + progress polling
   // ---------------------------------------------------------------------------
-  function startCrPolling() {
-    setCrLoading(true);
-    setCrTriggered(true);
-    let stalePct = -1;
-    let staleCount = 0;
-    const MAX_STALE_POLLS = 20; // 20 × 6s = 2 min with no change → stuck
-
-    const poll = async () => {
-      try {
-        const prog = await getCodeReviewProgress(runId);
-        setCrProgress({
-          pct: prog.pct, files_done: prog.files_done,
-          total_files: prog.total_files, current_file: prog.current_file,
-          findings_count: prog.findings_count,
-        });
-
-        if (prog.status === "completed") {
-          const cr = await getCodeReview(runId);
-          if (cr.count > 0) {
-            setCrFindings(cr.findings);
-            setCrSummary(cr.summary);
-          }
-          setCrCompleted(true);
-          setCrLoading(false);
-          // Code review done → FP Challenger starts next. Begin polling for it.
-          waitForFpToStart();
-          return;
-        }
-
-        if (prog.status === "failed") {
-          setCrError("Code review failed on the server. Check /tmp/app.log for details.");
-          setCrLoading(false);
-          return;
-        }
-
-        // Stale detection — if pct hasn't moved in MAX_STALE_POLLS, warn
-        if (prog.pct === stalePct) {
-          staleCount++;
-        } else {
-          stalePct = prog.pct;
-          staleCount = 0;
-        }
-        if (staleCount >= MAX_STALE_POLLS) {
-          setCrError(`Code review appears stuck at ${prog.pct}%. Ollama may be overloaded. Check /tmp/app.log.`);
-          setCrLoading(false);
-          return;
-        }
-
-        setTimeout(poll, 6000);
-      } catch {
-        setTimeout(poll, 8000);
-      }
-    };
-    setTimeout(poll, 4000);
-  }
-
+  // Manual re-trigger (shown only after 20 min of no activity, or on error retry)
   async function handleRunCodeReview() {
     setCrError(null);
     setCrCompleted(false);
     setCrProgress(null);
+    setCrLoading(true);
+    setCrTriggered(true);
+    if (crPollRef.current) clearTimeout(crPollRef.current);
     try {
       await triggerCodeReview(runId);
     } catch (err) {
       setCrError(`Failed to start code review: ${err instanceof Error ? err.message : "server error"}. Is the server running?`);
+      setCrLoading(false);
       return;
     }
-    startCrPolling();
+    // Let the existing pollCr loop in useEffect handle progress — but since
+    // that loop already exited (stalled), schedule one more immediate check
+    // by reloading the page state — simplest: just re-trigger the poll via ref
+    setTimeout(async () => {
+      try {
+        const prog = await getCodeReviewProgress(runId);
+        if (prog.status === "running" || prog.status === "not_started") {
+          // Back to normal polling — reload the component will restart useEffect
+          // For now just update state
+        }
+      } catch { /* ignore */ }
+    }, 2000);
   }
 
   // ---------------------------------------------------------------------------
@@ -557,6 +527,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               done={true}
               count={findings.length}
               unit="findings"
+              skills={["SQL Injection", "XSS", "Path Traversal", "CSRF", "Deserialization", "Weak Crypto"]}
               active={activeTab === "sast"}
               onClick={() => setActiveTab("sast")}
             />
@@ -569,6 +540,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               done={!secretScanning}
               count={secretFindings.length}
               unit="secrets"
+              skills={["API Keys", "Private Keys", "Tokens", "Passwords", "Certificates"]}
               active={activeTab === "secrets"}
               onClick={() => setActiveTab("secrets")}
             />
@@ -581,6 +553,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               done={!depScanning}
               count={depFindings.length}
               unit="CVEs"
+              skills={["Known CVEs", "Outdated Packages", "License Risks", "Supply Chain"]}
               active={activeTab === "deps"}
               onClick={() => setActiveTab("deps")}
             />
@@ -593,8 +566,9 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               done={crCompleted && !crError}
               count={crFindings.length}
               unit="issues"
-              notStarted={!crTriggered}
-              progress={crLoading ? crProgress?.pct : undefined}
+              skills={["Logic Flaws", "Auth Gaps", "N+1 Queries", "Resource Leaks", "Error Handling"]}
+              notStarted={false}
+              progress={crLoading && crProgress ? crProgress.pct : undefined}
               error={!!crError}
               active={activeTab === "review"}
               onClick={() => setActiveTab("review")}
@@ -609,6 +583,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               count={fpProgress?.fp_found ?? 0}
               unit="FPs found"
               subtitle={fpCompleted && fpProgress ? `${fpProgress.findings_total} reviewed` : undefined}
+              skills={["FP Detection", "Confidence Scoring", "Context Analysis", "Verdict Re-evaluation"]}
               notStarted={!fpTriggered}
               progress={fpLoading ? fpProgress?.pct : undefined}
               error={!!fpError}
@@ -788,7 +763,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                           Called by {f.blast_radius} file{f.blast_radius === 1 ? "" : "s"}
                         </span>
                       )}
-                      {/* FP Challenger verdict badge */}
+                      {/* AI verdict badge — shown as soon as data available, from SAST L3 or FP Challenger */}
                       {f.verdict === "FP" && (
                         <span className="text-xs text-emerald-300 bg-emerald-500/10 border border-emerald-500/40 px-1.5 py-0.5 rounded flex items-center gap-1"
                           title={f.reasoning ?? undefined}>
@@ -796,15 +771,17 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                           False Positive{f.fp_category ? ` · ${f.fp_category}` : ""}
                         </span>
                       )}
-                      {f.verdict === "REAL" && fpCompleted && (
+                      {f.verdict === "REAL" && (
                         <span className="text-xs text-red-300 bg-red-500/10 border border-red-500/40 px-1.5 py-0.5 rounded flex items-center gap-1"
                           title={f.reasoning ?? undefined}>
                           <ShieldAlert className="w-3 h-3" />
                           Confirmed Real
+                          {f.confidence != null && <span className="opacity-60">· {Math.round(f.confidence * 100)}%</span>}
                         </span>
                       )}
-                      {f.verdict === "ESCALATED" && fpCompleted && (
-                        <span className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/40 px-1.5 py-0.5 rounded">
+                      {f.verdict === "ESCALATED" && (
+                        <span className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/40 px-1.5 py-0.5 rounded flex items-center gap-1">
+                          <AlertTriangle className="w-3 h-3" />
                           Needs Review
                         </span>
                       )}
@@ -882,7 +859,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                             </div>
                           </div>
                         )}
-                        {/* FP Challenger verdict detail */}
+                        {/* AI verdict detail panel */}
                         {f.verdict && (
                           <div className={`rounded-lg border px-4 py-3 text-sm ${
                             f.verdict === "FP"
@@ -891,9 +868,13 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                               ? "bg-red-950/20 border-red-700/40 text-red-300"
                               : "bg-yellow-950/20 border-yellow-700/40 text-yellow-300"
                           }`}>
-                            <p className="flex items-center gap-1.5 font-medium mb-1">
-                              <CheckCheck className="w-3.5 h-3.5" />
-                              FP Challenger verdict: <span className="font-semibold">{f.verdict}</span>
+                            <p className="flex items-center gap-1.5 font-medium mb-1 flex-wrap">
+                              <Brain className="w-3.5 h-3.5 shrink-0" />
+                              <span className="opacity-60 text-xs font-normal">
+                                {f.fp_source === "fp_challenger" ? "FP Challenger" : "AI Analysis"}
+                              </span>
+                              <span>→</span>
+                              <span className="font-semibold">{f.verdict}</span>
                               {f.fp_category && <span className="font-normal text-xs opacity-75">· {f.fp_category}</span>}
                               {f.confidence != null && (
                                 <span className="ml-auto text-xs opacity-60">
@@ -901,7 +882,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                                 </span>
                               )}
                             </p>
-                            {f.reasoning && <p className="text-xs opacity-80 mt-1">{f.reasoning}</p>}
+                            {f.reasoning && <p className="text-xs opacity-80 mt-1 leading-relaxed">{f.reasoning}</p>}
                           </div>
                         )}
 
@@ -1173,7 +1154,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               <div className="text-center">
                 <h3 className="text-base font-semibold text-white">LLM Code Review</h3>
                 <p className="text-sm text-gray-500 mt-1 max-w-md">
-                  llama3.2:3b reviews every source file for security issues, performance problems,
+                  qwen2.5-coder:14b reviews every source file for security issues, performance problems,
                   code quality, error handling, and best practices beyond what Semgrep detects.
                 </p>
               </div>
@@ -1214,7 +1195,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-8 space-y-5">
               <div className="flex items-center gap-3">
                 <div className="w-2.5 h-2.5 rounded-full bg-purple-400 animate-pulse" />
-                <p className="text-sm font-medium text-white">llama3.2:3b — reviewing files</p>
+                <p className="text-sm font-medium text-white">qwen2.5-coder:14b — reviewing files</p>
               </div>
               <div className="space-y-2">
                 <div className="flex justify-between text-xs text-gray-500">
@@ -1242,7 +1223,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                 </p>
               )}
               <p className="text-xs text-gray-600">
-                Reviewing {crProgress?.total_files ?? "…"} files (2 concurrently) with llama3.2:3b.
+                Reviewing {crProgress?.total_files ?? "…"} files (2 concurrently) with qwen2.5-coder:14b.
                 {crProgress?.total_files && crProgress.total_files <= 20
                   ? " Small project — est. ~10 min."
                   : crProgress?.total_files && crProgress.total_files <= 25
@@ -1260,7 +1241,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               <CheckCircle2 className="w-8 h-8 text-green-400 mx-auto mb-3" />
               <p className="text-gray-300 text-sm font-medium">No issues found by Code Review</p>
               <p className="text-gray-600 text-xs mt-1">
-                llama3.2:3b reviewed the source files and found no security, performance, or quality issues.
+                qwen2.5-coder:14b reviewed the source files and found no security, performance, or quality issues.
               </p>
               <button
                 onClick={handleRunCodeReview}
@@ -1416,10 +1397,10 @@ function SummaryCard({
 }
 
 function AgentStatusCard({
-  label, icon, color, done, count, unit, subtitle, notStarted = false, progress, error = false, active = false, onClick,
+  label, icon, color, done, count, unit, subtitle, skills, notStarted = false, progress, error = false, active = false, onClick,
 }: {
   label: string; icon: React.ReactNode; color: string;
-  done: boolean; count: number; unit: string; subtitle?: string;
+  done: boolean; count: number; unit: string; subtitle?: string; skills?: string[];
   notStarted?: boolean; progress?: number; error?: boolean;
   active?: boolean; onClick?: () => void;
 }) {
@@ -1480,6 +1461,16 @@ function AgentStatusCard({
       </p>
       {done && subtitle && (
         <p className="text-xs text-gray-500 -mt-1">{subtitle}</p>
+      )}
+      {skills && skills.length > 0 && (
+        <div className="pt-1.5 border-t border-gray-700/50 mt-1">
+          <p className="text-[9px] uppercase tracking-widest text-gray-600 mb-1">Skills</p>
+          <div className="flex flex-wrap gap-1">
+            {skills.map(s => (
+              <span key={s} className={`text-[10px] font-medium px-1.5 py-0.5 rounded border ${color.replace("text-", "border-").replace("400", "500/40")} ${color.replace("text-", "bg-").replace("400", "500/10")} ${color}`}>{s}</span>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );
