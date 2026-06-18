@@ -116,7 +116,7 @@ async def _load_sast_findings(pool: asyncpg.Pool, run_id: str) -> dict[str, list
 # Helper: call Ollama LLM
 # ---------------------------------------------------------------------------
 
-async def _call_llm(system_prompt: str, user_prompt: str, timeout: int = 90) -> str:
+async def _call_llm(system_prompt: str, user_prompt: str, timeout: int = 120) -> str:
     """Call Ollama chat API."""
     payload = {
         "model": settings.ollama.tier1_model,
@@ -128,7 +128,7 @@ async def _call_llm(system_prompt: str, user_prompt: str, timeout: int = 90) -> 
         "options": {
             "temperature": 0.1,
             "num_predict": 512,   # concise JSON response
-            "num_ctx":     4096,  # full context window
+            "num_ctx":     2048,  # smaller context — llama3.2:3b works better with 2048
             "num_gpu":     99,    # force all layers onto Metal GPU
             "num_thread":  8,     # CPU threads for prompt processing
         },
@@ -204,12 +204,14 @@ async def _review_file(
 ```"""
 
     start = time.time()
+    logger.warning("LLM START | file=%s lang=%s lines=%d", rel_path, language, len(lines))
     try:
         raw = await _call_llm(system_prompt, user_prompt)
     except Exception as exc:
-        logger.warning("LLM call failed for %s: %s %s", rel_path, type(exc).__name__, exc)
+        logger.warning("LLM FAIL | file=%s error=%s: %s", rel_path, type(exc).__name__, exc)
         return None
     elapsed_ms = int((time.time() - start) * 1000)
+    logger.warning("LLM DONE | file=%s elapsed=%dms raw_len=%d", rel_path, elapsed_ms, len(raw))
 
     # Parse JSON from LLM response
     try:
@@ -220,7 +222,7 @@ async def _review_file(
             text = "\n".join(lines_r[1:-1] if lines_r[-1].strip() == "```" else lines_r[1:])
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("LLM JSON parse error for %s: %s | raw=%s", rel_path, exc, raw[:200])
+        logger.warning("LLM JSON PARSE ERROR | file=%s err=%s | raw_first_300=%r", rel_path, exc, raw[:300])
         return None
 
     # Validate through Pydantic
@@ -308,50 +310,120 @@ async def node_start(state: CodeReviewState, deps: dict) -> CodeReviewState:
         """)
 
     sast_findings = await _load_sast_findings(pool, run_id)
-    logger.info("Code review started | run=%s sast_context_files=%d", run_id, len(sast_findings))
+    logger.warning("CODE REVIEW STARTED | run=%s sast_context_files=%d model=%s", run_id, len(sast_findings), settings.ollama.tier1_model)
     return {**state, "sast_findings": sast_findings}
 
 
-def _load_graph_data(root: Path) -> tuple[dict[str, float], dict[str, int]]:
+class GraphContext:
+    """Per-file context extracted from the code-review-graph knowledge graph."""
+    __slots__ = (
+        "hub_score", "community_id", "community_name", "community_purpose",
+        "key_symbols", "caller_files", "flows", "risk_score",
+        "caller_count", "test_coverage", "security_relevant",
+    )
+
+    def __init__(self):
+        self.hub_score:          float      = 0.0
+        self.community_id:       int | None = None
+        self.community_name:     str        = ""
+        self.community_purpose:  str        = ""
+        self.key_symbols:        list[str]  = []
+        self.caller_files:       list[str]  = []   # other files that call into this file
+        self.flows:              list[str]  = []   # execution flow names passing through this file
+        self.risk_score:         float      = 0.0
+        self.caller_count:       int        = 0
+        self.test_coverage:      str        = "unknown"
+        self.security_relevant:  bool       = False
+
+    def to_prompt_section(self) -> str:
+        """
+        Returns a concise 3-6 line section for injection into the LLM prompt.
+        Kept short to fit within llama3.2:3b's 2048-token context alongside the code.
+        """
+        lines = ["## Graph Context (from code knowledge graph)"]
+
+        if self.community_name:
+            syms = ", ".join(self.key_symbols[:4]) if self.key_symbols else "—"
+            lines.append(f"- Module: {self.community_name} (purpose: {self.community_purpose or 'unknown'} | key symbols: {syms})")
+
+        risk_label = "LOW"
+        if self.risk_score >= 0.7:   risk_label = "CRITICAL"
+        elif self.risk_score >= 0.5: risk_label = "HIGH"
+        elif self.risk_score >= 0.3: risk_label = "MEDIUM"
+        lines.append(
+            f"- Risk: {risk_label} (score={self.risk_score:.2f}, callers={self.caller_count}, "
+            f"tests={self.test_coverage}, security_relevant={'YES' if self.security_relevant else 'no'})"
+        )
+
+        if self.caller_files:
+            callers_short = ", ".join(Path(f).name for f in self.caller_files[:4])
+            lines.append(f"- Called by: {callers_short}")
+        else:
+            lines.append("- Called by: (no callers — entry point or leaf file)")
+
+        if self.flows:
+            lines.append(f"- Execution flows through this file: {', '.join(self.flows[:3])}")
+
+        lines.append(
+            "Focus your review on issues appropriate to this module's risk level and callers above."
+        )
+        return "\n".join(lines)
+
+
+def _load_graph_data(root: Path) -> tuple[dict[str, float], dict[str, int], dict[str, GraphContext]]:
     """
-    Load hub scores and community IDs from code-review-graph SQLite DB.
+    Load hub scores, community IDs, and rich per-file GraphContext from the
+    code-review-graph SQLite DB.
 
-    Features 1 + 4:
-      - hub_scores: file → max risk_score + caller_count*0.1 (higher = more central)
-      - community_ids: file → community group (files in same community reviewed together)
+    Returns:
+      hub_scores     — file_path → combined hub score (for ordering)
+      community_ids  — file_path → community_id (for grouping)
+      graph_contexts — file_path → GraphContext (for LLM prompt enrichment)
 
-    Returns (hub_scores, community_ids) — both empty dicts if graph not built.
+    All three are empty/None if the graph DB is not built yet.
     """
     db_path = root / ".code-review-graph" / "graph.db"
     if not db_path.exists():
         # Trigger a background build so the next scan benefits
         try:
             subprocess.Popen(
-                ["python3.11", "-m", "code_review_graph", "build", str(root)],
+                ["python3.11", "-m", "code_review_graph", "build", "--repo", str(root)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            logger.info("code-review-graph: started background build for %s", root)
+            logger.warning("code-review-graph: started background build for %s", root)
         except Exception as exc:
-            logger.debug("code-review-graph: could not start build: %s", exc)
-        return {}, {}
+            logger.warning("code-review-graph: could not start build: %s", exc)
+        return {}, {}, {}
 
-    hub_scores: dict[str, float] = {}
-    community_ids: dict[str, int] = {}
+    hub_scores:     dict[str, float]        = {}
+    community_ids:  dict[str, int]          = {}
+    graph_contexts: dict[str, GraphContext] = {}
+
     try:
         conn = sqlite3.connect(str(db_path), timeout=5)
-        # Per-file max hub score from risk_index (qualified_name = "filepath::Symbol")
-        rows = conn.execute(
-            "SELECT qualified_name, risk_score, caller_count FROM risk_index"
+
+        # ── 1. Risk index → hub score + per-file risk data ────────────────────
+        risk_rows = conn.execute(
+            "SELECT qualified_name, risk_score, caller_count, test_coverage, security_relevant "
+            "FROM risk_index"
         ).fetchall()
-        for qname, score, callers in rows:
+        file_risk: dict[str, dict] = {}  # file_path → best (highest risk) row
+        for qname, score, callers, test_cov, sec_rel in risk_rows:
             fp = qname.split("::")[0] if "::" in qname else qname
             combined = (score or 0.0) + (callers or 0) * 0.1
             if hub_scores.get(fp, -1.0) < combined:
                 hub_scores[fp] = combined
+            if fp not in file_risk or (score or 0) > file_risk[fp]["risk_score"]:
+                file_risk[fp] = {
+                    "risk_score":        score or 0.0,
+                    "caller_count":      callers or 0,
+                    "test_coverage":     test_cov or "unknown",
+                    "security_relevant": bool(sec_rel),
+                }
 
-        # Per-file dominant community_id from nodes table
-        rows2 = conn.execute(
+        # ── 2. Community IDs from nodes table ─────────────────────────────────
+        node_rows = conn.execute(
             """
             SELECT file_path, community_id, COUNT(*) AS cnt
             FROM nodes
@@ -361,20 +433,95 @@ def _load_graph_data(root: Path) -> tuple[dict[str, float], dict[str, int]]:
             """
         ).fetchall()
         seen: set[str] = set()
-        for fp, comm_id, _ in rows2:
+        for fp, comm_id, _ in node_rows:
             if fp not in seen:
                 community_ids[fp] = int(comm_id)
                 seen.add(fp)
 
+        # ── 3. Community summaries → name, purpose, key symbols ───────────────
+        comm_info: dict[int, dict] = {}
+        for comm_id, name, purpose, key_syms, risk in conn.execute(
+            "SELECT community_id, name, purpose, key_symbols, risk FROM community_summaries"
+        ).fetchall():
+            try:
+                syms = json.loads(key_syms) if key_syms else []
+            except Exception:
+                syms = []
+            comm_info[int(comm_id)] = {"name": name or "", "purpose": purpose or "", "key_symbols": syms, "risk": risk}
+
+        # ── 4. Callers: edges where target is a node in this file ─────────────
+        # edge.source_qualified → the file that calls INTO our file
+        caller_rows = conn.execute(
+            """
+            SELECT DISTINCT
+                e.file_path           AS caller_file,
+                n.file_path           AS callee_file
+            FROM edges e
+            JOIN nodes n ON n.qualified_name = e.target_qualified
+            WHERE e.kind IN ('CALLS', 'CALLS_METHOD', 'INSTANTIATES')
+              AND e.file_path IS NOT NULL
+              AND n.file_path IS NOT NULL
+              AND e.file_path != n.file_path
+            """
+        ).fetchall()
+        file_callers: dict[str, set[str]] = {}
+        for caller_fp, callee_fp in caller_rows:
+            file_callers.setdefault(callee_fp, set()).add(caller_fp)
+
+        # ── 5. Flows: which execution flows pass through each file ────────────
+        flow_rows = conn.execute(
+            """
+            SELECT DISTINCT n.file_path, fs.name, fs.criticality
+            FROM flow_snapshots fs
+            JOIN flow_memberships fm ON fm.flow_id = fs.flow_id
+            JOIN nodes n ON n.id = fm.node_id
+            WHERE n.file_path IS NOT NULL
+            ORDER BY fs.criticality DESC
+            """
+        ).fetchall() if conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='flow_snapshots'"
+        ).fetchone() else []
+        file_flows: dict[str, list[str]] = {}
+        for fp, flow_name, criticality in flow_rows:
+            crit_label = "HIGH" if criticality >= 0.6 else ("MEDIUM" if criticality >= 0.3 else "LOW")
+            entry = f"{flow_name} ({crit_label})"
+            file_flows.setdefault(fp, []).append(entry)
+
         conn.close()
-        logger.info(
-            "code-review-graph: hub scores for %d files, communities for %d files",
-            len(hub_scores), len(community_ids),
+
+        # ── 6. Build GraphContext per file ────────────────────────────────────
+        all_files = set(hub_scores) | set(community_ids)
+        for fp in all_files:
+            ctx = GraphContext()
+            ctx.hub_score    = hub_scores.get(fp, 0.0)
+            ctx.community_id = community_ids.get(fp)
+
+            if ctx.community_id is not None and ctx.community_id in comm_info:
+                ci = comm_info[ctx.community_id]
+                ctx.community_name    = ci["name"]
+                ctx.community_purpose = ci["purpose"]
+                ctx.key_symbols       = ci["key_symbols"]
+
+            risk = file_risk.get(fp, {})
+            ctx.risk_score        = risk.get("risk_score",        0.0)
+            ctx.caller_count      = risk.get("caller_count",      0)
+            ctx.test_coverage     = risk.get("test_coverage",     "unknown")
+            ctx.security_relevant = risk.get("security_relevant", False)
+
+            ctx.caller_files = sorted(file_callers.get(fp, set()))
+            ctx.flows        = file_flows.get(fp, [])
+
+            graph_contexts[fp] = ctx
+
+        logger.warning(
+            "code-review-graph: enriched %d files | hub_scores=%d communities=%d",
+            len(graph_contexts), len(hub_scores), len(community_ids),
         )
+
     except Exception as exc:
         logger.warning("code-review-graph: DB read failed: %s", exc)
 
-    return hub_scores, community_ids
+    return hub_scores, community_ids, graph_contexts
 
 
 async def node_enumerate_files(state: CodeReviewState, deps: dict) -> CodeReviewState:
@@ -452,7 +599,7 @@ async def node_enumerate_files(state: CodeReviewState, deps: dict) -> CodeReview
     all_files = all_files[:_MAX_FILES]
 
     file_list = [str(p) for p in all_files]
-    logger.info("Code review: %d files selected (capped at %d) | run=%s", len(file_list), _MAX_FILES, state["run_id"])
+    logger.warning("CODE REVIEW FILES | run=%s selected=%d (cap=%d)", state["run_id"], len(file_list), _MAX_FILES)
     # Write initial progress entry
     pool: asyncpg.Pool = deps["pool"]
     await _upsert_progress(pool, state["run_id"], 0, len(file_list), "", 0, "running")
@@ -509,9 +656,11 @@ async def node_review_files(state: CodeReviewState, deps: dict) -> CodeReviewSta
                 reviewed += 1
 
             if result.findings:
+                logger.warning("REVIEW %s: %d raw findings (saving confidence >= 0.3)", result.file_path, len(result.findings))
                 async with pool.acquire() as conn:
                     for finding in result.findings:
-                        if finding.confidence < 0.5:
+                        if finding.confidence < 0.3:   # lowered from 0.5 — llama3.2:3b gives conservative scores
+                            logger.warning("  SKIP low-confidence finding: %s (%.2f)", finding.title, finding.confidence)
                             continue
                         await conn.execute(
                             """
@@ -531,14 +680,14 @@ async def node_review_files(state: CodeReviewState, deps: dict) -> CodeReviewSta
                     total_findings += len(result.findings)
                 logger.info("Reviewed %s | score=%d findings=%d", result.file_path, result.overall_score, len(result.findings))
             else:
-                logger.debug("Reviewed %s | score=%d clean", result.file_path, result.overall_score)
+                logger.warning("Reviewed %s | score=%d — LLM returned 0 findings", result.file_path, result.overall_score)
 
     # Run all files with concurrency=2
     await asyncio.gather(*[review_one(f) for f in files])
 
     # Mark done
     await _upsert_progress(pool, run_id, total, total, "", total_findings, "completed")
-    logger.info("Code review complete | run=%s files=%d findings=%d", run_id, reviewed, total_findings)
+    logger.warning("CODE REVIEW COMPLETE | run=%s files_reviewed=%d total_files=%d findings=%d", run_id, reviewed, total, total_findings)
     return {**state, "files_reviewed": reviewed, "findings_count": total_findings}
 
 
@@ -627,4 +776,23 @@ async def run_code_review_workflow(run_id: str, scan_path: str, deps: dict) -> d
         return await app.ainvoke(initial_state)
     except Exception as exc:
         logger.error("Code review workflow crashed | run=%s error=%s", run_id, exc, exc_info=True)
+        # Write "failed" status so the UI can show an error instead of spinning forever
+        try:
+            async with deps["pool"].acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO code_review_status
+                        (run_id, status, files_done, total_files, pct, current_file, findings_count, updated_at)
+                    VALUES ($1,'failed',$2,$3,$4,NULL,$5,NOW())
+                    ON CONFLICT (run_id) DO UPDATE SET
+                        status='failed', updated_at=NOW()
+                    """,
+                    run_id,
+                    initial_state.get("files_reviewed", 0),
+                    initial_state.get("total_files", 0),
+                    0,
+                    initial_state.get("findings_count", 0),
+                )
+        except Exception:
+            pass
         raise

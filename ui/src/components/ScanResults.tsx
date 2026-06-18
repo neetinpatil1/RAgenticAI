@@ -59,13 +59,15 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   const [activeTab, setActiveTab] = useState<"sast" | "review" | "secrets" | "deps">("sast");
 
   // Code review state
-  const [crFindings,  setCrFindings]  = useState<CodeReviewFinding[]>([]);
-  const [crSummary,   setCrSummary]   = useState<CodeReviewSummary | null>(null);
-  const [crLoading,   setCrLoading]   = useState(false);
-  const [crTriggered, setCrTriggered] = useState(false);
-  const [crCatFilter, setCrCatFilter] = useState<string>("ALL");
-  const [crExpanded,  setCrExpanded]  = useState<Set<string>>(new Set());
-  const [crProgress,  setCrProgress]  = useState<{
+  const [crFindings,   setCrFindings]   = useState<CodeReviewFinding[]>([]);
+  const [crSummary,    setCrSummary]    = useState<CodeReviewSummary | null>(null);
+  const [crLoading,    setCrLoading]    = useState(false);
+  const [crTriggered,  setCrTriggered]  = useState(false);
+  const [crCompleted,  setCrCompleted]  = useState(false);
+  const [crError,      setCrError]      = useState<string | null>(null);
+  const [crCatFilter,  setCrCatFilter]  = useState<string>("ALL");
+  const [crExpanded,   setCrExpanded]   = useState<Set<string>>(new Set());
+  const [crProgress,   setCrProgress]   = useState<{
     pct: number; files_done: number; total_files: number;
     current_file: string | null; findings_count: number;
   } | null>(null);
@@ -101,8 +103,24 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       setStatus(s);
       setLoading(false);
       try {
-        const cr = await getCodeReview(runId);
-        if (cr.count > 0) { setCrFindings(cr.findings); setCrSummary(cr.summary); setCrTriggered(true); }
+        // Also check progress status — might be "completed" (0 findings) or "failed"
+        const [cr, prog] = await Promise.allSettled([
+          getCodeReview(runId),
+          getCodeReviewProgress(runId),
+        ]);
+        if (cr.status === "fulfilled" && cr.value.count > 0) {
+          setCrFindings(cr.value.findings);
+          setCrSummary(cr.value.summary);
+          setCrTriggered(true);
+          setCrCompleted(true);
+        } else if (prog.status === "fulfilled" && prog.value.status === "completed") {
+          // Completed but found nothing
+          setCrTriggered(true);
+          setCrCompleted(true);
+        } else if (prog.status === "fulfilled" && prog.value.status === "failed") {
+          setCrTriggered(true);
+          setCrError("Code review failed. Check logs or try again.");
+        }
       } catch { /* not yet */ }
       loadSecrets();
       loadDeps();
@@ -178,32 +196,67 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   async function handleRunCodeReview() {
     setCrLoading(true);
     setCrTriggered(true);
+    setCrError(null);
+    setCrCompleted(false);
+    setCrProgress(null);
     try {
       await triggerCodeReview(runId);
-      const poll = async () => {
-        try {
-          const prog = await getCodeReviewProgress(runId);
-          setCrProgress({
-            pct: prog.pct, files_done: prog.files_done,
-            total_files: prog.total_files, current_file: prog.current_file,
-            findings_count: prog.findings_count,
-          });
-          if (prog.status === "completed") {
-            const cr = await getCodeReview(runId);
+    } catch (err) {
+      setCrLoading(false);
+      setCrError(`Failed to start code review: ${err instanceof Error ? err.message : "server error"}. Is the server running?`);
+      return;
+    }
+
+    // Poll for progress — stop on completed/failed or after 20 min
+    let stalePct = -1;
+    let staleCount = 0;
+    const MAX_STALE_POLLS = 20; // 20 × 6s = 2 min with no change → stuck
+
+    const poll = async () => {
+      try {
+        const prog = await getCodeReviewProgress(runId);
+        setCrProgress({
+          pct: prog.pct, files_done: prog.files_done,
+          total_files: prog.total_files, current_file: prog.current_file,
+          findings_count: prog.findings_count,
+        });
+
+        if (prog.status === "completed") {
+          const cr = await getCodeReview(runId);
+          if (cr.count > 0) {
             setCrFindings(cr.findings);
             setCrSummary(cr.summary);
-            setCrLoading(false);
-          } else {
-            setTimeout(poll, 3000);
           }
-        } catch {
-          setTimeout(poll, 5000);
+          setCrCompleted(true);
+          setCrLoading(false);
+          return;
         }
-      };
-      setTimeout(poll, 3000);
-    } catch {
-      setCrLoading(false);
-    }
+
+        if (prog.status === "failed") {
+          setCrError("Code review failed on the server. Check /tmp/app.log for details.");
+          setCrLoading(false);
+          return;
+        }
+
+        // Stale detection — if pct hasn't moved in MAX_STALE_POLLS, warn
+        if (prog.pct === stalePct) {
+          staleCount++;
+        } else {
+          stalePct = prog.pct;
+          staleCount = 0;
+        }
+        if (staleCount >= MAX_STALE_POLLS) {
+          setCrError(`Code review appears stuck at ${prog.pct}%. Ollama may be overloaded. Check /tmp/app.log.`);
+          setCrLoading(false);
+          return;
+        }
+
+        setTimeout(poll, 6000);
+      } catch {
+        setTimeout(poll, 8000);
+      }
+    };
+    setTimeout(poll, 4000);
   }
 
   // ---------------------------------------------------------------------------
@@ -337,11 +390,12 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               label="Code Review"
               icon={<Brain className="w-4 h-4" />}
               color="text-purple-400"
-              done={crTriggered && !crLoading && crFindings.length > 0}
+              done={crCompleted && !crError}
               count={crFindings.length}
               unit="issues"
               notStarted={!crTriggered}
               progress={crLoading ? crProgress?.pct : undefined}
+              error={!!crError}
               active={activeTab === "review"}
               onClick={() => setActiveTab("review")}
             />
@@ -868,6 +922,28 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             </div>
           )}
 
+          {/* Error state */}
+          {crError && (
+            <div className="rounded-xl bg-red-950/20 border border-red-700/40 p-5 flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-red-300">Code Review Failed</p>
+                <p className="text-xs text-gray-400 mt-1">{crError}</p>
+                <p className="text-xs text-gray-600 mt-1">
+                  Run <code className="text-gray-400 bg-gray-800 px-1 rounded">tail -f /tmp/app.log</code> in a terminal to see live logs.
+                </p>
+              </div>
+              <button
+                onClick={handleRunCodeReview}
+                className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs
+                           bg-gray-800 border border-gray-700 text-gray-300 hover:text-white
+                           hover:border-gray-500 transition-colors"
+              >
+                <RotateCcw className="w-3 h-3" /> Retry
+              </button>
+            </div>
+          )}
+
           {crTriggered && crLoading && (
             <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-8 space-y-5">
               <div className="flex items-center gap-3">
@@ -903,7 +979,26 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             </div>
           )}
 
-          {crTriggered && !crLoading && crFindings.length > 0 && (
+          {/* Completed with no findings */}
+          {crCompleted && !crLoading && !crError && crFindings.length === 0 && (
+            <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-10 text-center">
+              <CheckCircle2 className="w-8 h-8 text-green-400 mx-auto mb-3" />
+              <p className="text-gray-300 text-sm font-medium">No issues found by Code Review</p>
+              <p className="text-gray-600 text-xs mt-1">
+                llama3.2:3b reviewed the source files and found no security, performance, or quality issues.
+              </p>
+              <button
+                onClick={handleRunCodeReview}
+                className="mt-4 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs mx-auto
+                           bg-gray-800 border border-gray-700 text-gray-400 hover:text-white
+                           hover:border-gray-500 transition-colors"
+              >
+                <RotateCcw className="w-3 h-3" /> Re-run Review
+              </button>
+            </div>
+          )}
+
+          {crTriggered && !crLoading && !crError && crFindings.length > 0 && (
             <>
               {crSummary && (
                 <div className="grid grid-cols-3 lg:grid-cols-5 gap-3">
@@ -1015,6 +1110,12 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           )}
         </div>
       )}
+
+      {/* ── Code Knowledge Graph — shown when scanPath is known ── */}
+      {!loading && scanPath && (
+        <CodeGraph scanPath={scanPath} />
+      )}
+
     </div>
   );
 }
@@ -1040,11 +1141,11 @@ function SummaryCard({
 }
 
 function AgentStatusCard({
-  label, icon, color, done, count, unit, notStarted = false, progress, active = false, onClick,
+  label, icon, color, done, count, unit, notStarted = false, progress, error = false, active = false, onClick,
 }: {
   label: string; icon: React.ReactNode; color: string;
   done: boolean; count: number; unit: string;
-  notStarted?: boolean; progress?: number;
+  notStarted?: boolean; progress?: number; error?: boolean;
   active?: boolean; onClick?: () => void;
 }) {
   return (
@@ -1053,14 +1154,18 @@ function AgentStatusCard({
       className={`rounded-lg px-4 py-3 space-y-2 transition-all cursor-pointer
         ${active
           ? "bg-gray-700/80 border-2 border-brand-500/70 shadow-lg shadow-brand-500/10"
-          : "bg-gray-800/60 border border-gray-700/40 hover:border-gray-500/60 hover:bg-gray-800"
+          : error
+            ? "bg-red-950/20 border border-red-700/40 hover:border-red-500/60"
+            : "bg-gray-800/60 border border-gray-700/40 hover:border-gray-500/60 hover:bg-gray-800"
         }`}
     >
       <div className="flex items-center justify-between">
         <div className={`flex items-center gap-2 text-xs font-semibold ${color}`}>
           {icon} {label}
         </div>
-        {done ? (
+        {error ? (
+          <AlertTriangle className="w-4 h-4 text-red-400" />
+        ) : done ? (
           <CheckCheck className="w-4 h-4 text-green-400" />
         ) : notStarted ? (
           <span className="text-xs text-gray-600">not started</span>
@@ -1070,7 +1175,7 @@ function AgentStatusCard({
       </div>
 
       {/* Indeterminate progress bar while running */}
-      {!done && !notStarted && progress === undefined && (
+      {!done && !notStarted && !error && progress === undefined && (
         <div className="h-1 bg-gray-700 rounded-full overflow-hidden">
           <motion.div
             className="h-full w-1/3 rounded-full"
@@ -1082,7 +1187,7 @@ function AgentStatusCard({
       )}
 
       {/* Determinate progress bar (code review) */}
-      {progress !== undefined && !done && (
+      {progress !== undefined && !done && !error && (
         <div className="space-y-1">
           <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
             <motion.div
@@ -1095,8 +1200,8 @@ function AgentStatusCard({
         </div>
       )}
 
-      <p className={`text-sm font-bold tabular-nums ${done ? color : "text-gray-500"}`}>
-        {done ? `${count} ${unit}` : notStarted ? "—" : "running…"}
+      <p className={`text-sm font-bold tabular-nums ${error ? "text-red-400" : done ? color : "text-gray-500"}`}>
+        {error ? "failed" : done ? `${count} ${unit}` : notStarted ? "—" : "running…"}
       </p>
     </div>
   );

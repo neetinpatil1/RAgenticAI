@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Network, FileCode, GitBranch, ExternalLink, RefreshCw, AlertCircle, Layers, Share2 } from "lucide-react";
+import { Network, FileCode, GitBranch, ExternalLink, RefreshCw, AlertCircle, Layers, Share2, CheckCircle2 } from "lucide-react";
 
 interface GraphStatus {
   available: boolean;
@@ -17,16 +17,26 @@ interface Props {
 }
 
 export function CodeGraph({ scanPath }: Props) {
-  const [status,   setStatus]   = useState<GraphStatus | null>(null);
-  const [loading,  setLoading]  = useState(true);
-  const [building, setBuilding] = useState(false);
+  const [status,    setStatus]    = useState<GraphStatus | null>(null);
+  const [loading,   setLoading]   = useState(true);
+  const [building,  setBuilding]  = useState(false);
+  const [error,     setError]     = useState<string | null>(null);
+  const [buildDone, setBuildDone] = useState(false);
 
-  function fetchStatus(path: string) {
+  async function fetchStatus(path: string) {
     setLoading(true);
-    fetch(`/api/v1/graph/status?scan_path=${encodeURIComponent(path)}`)
-      .then(r => r.json())
-      .then(d => { setStatus(d); setLoading(false); })
-      .catch(() => { setStatus({ available: false }); setLoading(false); });
+    setError(null);
+    try {
+      const r = await fetch(`/api/v1/graph/status?scan_path=${encodeURIComponent(path)}`);
+      if (!r.ok) throw new Error(`Server returned ${r.status}`);
+      const d = await r.json();
+      setStatus(d);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to fetch graph status");
+      setStatus({ available: false });
+    } finally {
+      setLoading(false);
+    }
   }
 
   useEffect(() => {
@@ -43,12 +53,26 @@ export function CodeGraph({ scanPath }: Props) {
 
   async function triggerBuild() {
     setBuilding(true);
-    // Fire build via visualization endpoint (it will build then return HTML)
+    setBuildDone(false);
+    setError(null);
     try {
-      await fetch(`/api/v1/graph/visualization?scan_path=${encodeURIComponent(scanPath)}`);
-    } catch { /* ignore */ }
-    fetchStatus(scanPath);
-    setBuilding(false);
+      // POST to the dedicated build endpoint (runs code_review_graph build <path>)
+      const r = await fetch(
+        `/api/v1/graph/build?scan_path=${encodeURIComponent(scanPath)}`,
+        { method: "POST" }
+      );
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({ detail: r.statusText }));
+        throw new Error(body.detail ?? `Build failed (${r.status})`);
+      }
+      setBuildDone(true);
+      // Refresh status to show the new stats
+      await fetchStatus(scanPath);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Build failed — check /tmp/app.log");
+    } finally {
+      setBuilding(false);
+    }
   }
 
   const langs = status?.languages?.split(",").map(l => l.trim()).filter(Boolean) ?? [];
@@ -66,10 +90,11 @@ export function CodeGraph({ scanPath }: Props) {
         <div className="flex items-center gap-2">
           <button
             onClick={() => fetchStatus(scanPath)}
-            className="p-1.5 rounded-lg text-gray-500 hover:text-gray-300 hover:bg-gray-800 transition-colors"
+            disabled={loading}
+            className="p-1.5 rounded-lg text-gray-500 hover:text-gray-300 hover:bg-gray-800 transition-colors disabled:opacity-40"
             title="Refresh stats"
           >
-            <RefreshCw className="w-3.5 h-3.5" />
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
           </button>
           {status?.available && (
             <button
@@ -84,6 +109,20 @@ export function CodeGraph({ scanPath }: Props) {
       </div>
 
       {/* Body */}
+      {error && (
+        <div className="flex items-start gap-2 rounded-lg bg-red-950/20 border border-red-700/30 px-3 py-2.5 text-xs">
+          <AlertCircle className="w-3.5 h-3.5 text-red-400 mt-0.5 shrink-0" />
+          <span className="text-red-300">{error}</span>
+        </div>
+      )}
+
+      {buildDone && !error && (
+        <div className="flex items-center gap-2 rounded-lg bg-green-950/20 border border-green-700/30 px-3 py-2 text-xs">
+          <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+          <span className="text-green-300">Graph built successfully! Stats updated below.</span>
+        </div>
+      )}
+
       {loading ? (
         <div className="grid grid-cols-3 gap-3">
           {[...Array(3)].map((_, i) => (
@@ -96,7 +135,10 @@ export function CodeGraph({ scanPath }: Props) {
           <div className="flex-1 min-w-0">
             <p className="text-xs font-medium text-yellow-300">Graph not built for this project</p>
             <p className="text-xs text-gray-500 mt-0.5">
-              The knowledge graph will be built automatically on the next Code Review scan.
+              Click "Build Now" to build the code knowledge graph, or it will build automatically on the next Code Review scan.
+            </p>
+            <p className="text-xs text-gray-600 mt-1">
+              Path: <code className="text-gray-500">{scanPath}</code>
             </p>
           </div>
           <button
@@ -107,7 +149,7 @@ export function CodeGraph({ scanPath }: Props) {
                        hover:border-gray-500 transition-colors disabled:opacity-50"
           >
             {building ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Share2 className="w-3 h-3" />}
-            {building ? "Building…" : "Build Now"}
+            {building ? "Building… (may take 1-2 min)" : "Build Now"}
           </button>
         </div>
       ) : (

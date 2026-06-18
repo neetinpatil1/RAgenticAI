@@ -55,6 +55,16 @@ from workflows.code_review_workflow import run_code_review_workflow
 from workflows.secret_scan_workflow import run_secret_scan_workflow
 from workflows.sca_workflow import run_sca_workflow
 
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+# Silence noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
+logging.getLogger("asyncpg").setLevel(logging.ERROR)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -951,13 +961,56 @@ async def trigger_code_review(
     if not run:
         raise HTTPException(404, f"Run not found: {run_id}")
 
-    # Check if code review already running / done
+    # Check if a code review is already running (status=running in status table)
+    # — do NOT block re-runs when previous completed with 0 findings (LLM may have failed)
     async with pool.acquire() as conn:
-        existing = await conn.fetchval(
+        # Check for actual findings
+        existing_findings = await conn.fetchval(
             "SELECT COUNT(*) FROM code_review_findings WHERE run_id = $1", run_id
         )
-    if existing:
-        return {"message": "Code review already completed for this run", "run_id": run_id}
+        if existing_findings:
+            return {"message": "Code review already completed for this run", "run_id": run_id}
+
+        # Check if currently running
+        try:
+            current_status = await conn.fetchval(
+                "SELECT status FROM code_review_status WHERE run_id = $1", run_id
+            )
+        except Exception:
+            current_status = None
+
+        if current_status == "running":
+            return {"message": "Code review is already running", "run_id": run_id, "status": "running"}
+
+        # Immediately write "running" to the status table so polls don't see stale "completed"
+        try:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS code_review_status (
+                    run_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    files_done INT NOT NULL DEFAULT 0,
+                    total_files INT NOT NULL DEFAULT 0,
+                    pct INT NOT NULL DEFAULT 0,
+                    current_file TEXT,
+                    findings_count INT NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO code_review_status
+                    (run_id, status, files_done, total_files, pct, current_file, findings_count, updated_at)
+                VALUES ($1, 'running', 0, 0, 0, NULL, 0, NOW())
+                ON CONFLICT (run_id) DO UPDATE SET
+                    status='running', files_done=0, total_files=0, pct=0,
+                    current_file=NULL, findings_count=0, updated_at=NOW()
+                """,
+                run_id,
+            )
+        except Exception as exc:
+            logger.warning("Could not pre-set code_review_status: %s", exc)
 
     scan_path = run["scan_path"]
     deps = _build_workflow_deps()
@@ -1062,7 +1115,7 @@ _GRAPH_HTML = Path(__file__).parent.parent / ".code-review-graph" / "graph.html"
 
 
 @app.get("/api/v1/graph/status")
-async def get_graph_status(scan_path: str | None = None):
+async def get_graph_status(scan_path: Optional[str] = None):
     """Return code-review-graph stats for a given scan_path (defaults to project root)."""
     root = Path(scan_path) if scan_path else _GRAPH_DB.parent.parent
     db   = root / ".code-review-graph" / "graph.db"
@@ -1096,8 +1149,46 @@ async def get_graph_status(scan_path: str | None = None):
         return {"available": False, "error": str(exc)}
 
 
+@app.post("/api/v1/graph/build")
+async def build_graph(scan_path: Optional[str] = None):
+    """
+    Build (or rebuild) the code-review-graph knowledge graph for a project.
+    Runs synchronously — takes 10-60s depending on project size.
+    Returns 200 on success, 500 on failure with error detail.
+    """
+    import asyncio, subprocess as _sp
+    root = Path(scan_path) if scan_path else _GRAPH_DB.parent.parent
+    if not root.exists():
+        raise HTTPException(404, f"Path does not exist: {root}")
+
+    logger.warning("graph/build: starting build for %s", root)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3.11", "-m", "code_review_graph", "build", "--repo", str(root),
+            stdout=_sp.PIPE, stderr=_sp.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        if proc.returncode != 0:
+            err_msg = stderr.decode(errors="replace")[-500:] if stderr else "unknown error"
+            logger.warning("graph/build failed: rc=%d stderr=%s", proc.returncode, err_msg)
+            raise HTTPException(500, f"Build failed (exit {proc.returncode}): {err_msg}")
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Graph build timed out after 120s. Try a smaller project.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Build error: {exc}")
+
+    db = root / ".code-review-graph" / "graph.db"
+    if not db.exists():
+        raise HTTPException(500, "Build command succeeded but graph.db was not created")
+
+    logger.warning("graph/build: completed for %s", root)
+    return {"status": "ok", "message": f"Graph built for {root.name}", "path": str(root)}
+
+
 @app.get("/api/v1/graph/visualization", response_class=HTMLResponse)
-async def get_graph_visualization(scan_path: str | None = None):
+async def get_graph_visualization(scan_path: Optional[str] = None):
     """
     Regenerate and serve the interactive graph HTML for a given scan_path.
     Opens full-screen — not meant for iframe embedding (graph uses CDN JS).
@@ -1119,7 +1210,8 @@ async def get_graph_visualization(scan_path: str | None = None):
         )
     try:
         proc = await asyncio.create_subprocess_exec(
-            "python3.11", "-m", "code_review_graph", "visualize", "--format", "html",
+            "python3.11", "-m", "code_review_graph", "visualize",
+            "--format", "html", "--mode", "community",
             "--repo", str(root),
             stdout=_sp.PIPE, stderr=_sp.PIPE,
         )
