@@ -11,6 +11,7 @@ import {
 import {
   getFindings, getScanStatus, triggerCodeReview, getCodeReview,
   getCodeReviewProgress, getSecretFindings, getDependencyFindings,
+  getFpChallengeProgress,
 } from "../lib/api";
 import type {
   Finding, ScanStatus, CodeReviewFinding, CodeReviewSummary,
@@ -72,6 +73,16 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     current_file: string | null; findings_count: number;
   } | null>(null);
 
+  // FP Challenger state
+  const [fpLoading,    setFpLoading]    = useState(false);
+  const [fpTriggered,  setFpTriggered]  = useState(false);
+  const [fpCompleted,  setFpCompleted]  = useState(false);
+  const [fpError,      setFpError]      = useState<string | null>(null);
+  const [fpProgress,   setFpProgress]   = useState<{
+    pct: number; findings_done: number; findings_total: number;
+    fp_found: number; current_finding: string | null;
+  } | null>(null);
+
   // Secrets state
   const [secretFindings,  setSecretFindings]  = useState<SecretFinding[]>([]);
   const [secretSummary,   setSecretSummary]   = useState<SecretSummary | null>(null);
@@ -106,12 +117,41 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     setGraphBuildStatus("idle");
     setGraphBuildError(null);
     setGraphBuildElapsed(0);
+    setFpTriggered(false);
+    setFpCompleted(false);
+    setFpLoading(false);
+    setFpError(null);
+    setFpProgress(null);
+
+    // Poll for code review start — called when initial load finds CR not yet running.
+    // Retries every 10s for up to 3 minutes, then gives up silently.
+    async function waitForCrToStart(retries = 0) {
+      const MAX_CR_WAIT = 18; // 18 × 10s = 3 minutes
+      if (retries >= MAX_CR_WAIT) return;
+      try {
+        const [cr, prog] = await Promise.allSettled([
+          getCodeReview(runId),
+          getCodeReviewProgress(runId),
+        ]);
+        if (cr.status === "fulfilled" && cr.value.count > 0) {
+          setCrFindings(cr.value.findings); setCrSummary(cr.value.summary);
+          setCrTriggered(true); setCrCompleted(true); return;
+        }
+        if (prog.status === "fulfilled") {
+          if (prog.value.status === "running") { startCrPolling(); return; }
+          if (prog.value.status === "completed") { setCrTriggered(true); setCrCompleted(true); return; }
+          if (prog.value.status === "failed") { setCrTriggered(true); setCrError("Code review failed. Check logs."); return; }
+        }
+      } catch { /* not started yet — keep waiting */ }
+      setTimeout(() => waitForCrToStart(retries + 1), 10_000);
+    }
 
     async function load() {
       const [f, s] = await Promise.all([getFindings(runId), getScanStatus(runId)]);
       setFindings(f);
       setStatus(s);
       setLoading(false);
+      let crDetected = false;
       try {
         // Also check progress status — might be "completed" (0 findings) or "failed"
         const [cr, prog] = await Promise.allSettled([
@@ -123,29 +163,55 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setCrSummary(cr.value.summary);
           setCrTriggered(true);
           setCrCompleted(true);
+          crDetected = true;
         } else if (prog.status === "fulfilled" && prog.value.status === "completed") {
           // Completed but found nothing
           setCrTriggered(true);
           setCrCompleted(true);
+          crDetected = true;
         } else if (prog.status === "fulfilled" && prog.value.status === "failed") {
           setCrTriggered(true);
           setCrError("Code review failed. Check logs or try again.");
+          crDetected = true;
         } else if (prog.status === "fulfilled" && prog.value.status === "running") {
           // Auto-triggered by backend — resume polling without manual button click
           startCrPolling();
+          crDetected = true;
         }
       } catch { /* not yet */ }
+      // If CR wasn't detected yet (backend hasn't started it — SAST still running),
+      // start a background retry loop that picks it up once Step 3 begins.
+      if (!crDetected) waitForCrToStart();
+
+      // Check FP Challenger status
+      try {
+        const fp = await getFpChallengeProgress(runId);
+        if (fp.status === "completed") {
+          setFpTriggered(true);
+          setFpCompleted(true);
+          setFpProgress(fp);
+          // Reload findings to pick up challenger verdicts
+          const refreshed = await getFindings(runId);
+          setFindings(refreshed);
+        } else if (fp.status === "running") {
+          startFpPolling();
+        } else if (fp.status === "failed") {
+          setFpTriggered(true);
+          setFpError("FP challenge failed. Check server logs.");
+        }
+      } catch { /* not started yet */ }
+
       loadSecrets();
       loadDeps();
-      startGraphBuildPolling();
+      startGraphBuildPolling(s.scan_path);
     }
 
     // -------------------------------------------------------------------------
     // Graph build polling — tracks the background build fired at scan start
     // -------------------------------------------------------------------------
-    async function startGraphBuildPolling() {
-      if (!scanPath) return;
-      const path = scanPath; // narrow type to string
+    async function startGraphBuildPolling(fallbackPath?: string) {
+      const path: string | undefined = scanPath || fallbackPath;
+      if (!path) return;
 
       const MAX_POLLS = 60; // 60 × 4s = 4 minutes max, then give up
       let polls = 0;
@@ -153,7 +219,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       async function checkStatus() {
         try {
           const r = await fetch(
-            `/api/v1/graph/build/status?scan_path=${encodeURIComponent(path)}`
+            `/api/v1/graph/build/status?scan_path=${encodeURIComponent(path as string)}`
           );
           if (!r.ok) return;
           const d = await r.json();
@@ -193,8 +259,10 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     }
 
     async function loadSecrets(retries = 0) {
-      // Max ~2.5 minutes of polling (30 attempts × 5s). After that assume scan
-      // completed with no secrets — stop the spinner rather than loop forever.
+      // Poll for up to 150s (30 × 5s). Do NOT check getScanStatus — scan status
+      // "completed" means SAST is done, not Secrets. Secrets runs in parallel with
+      // SCA and Code Review AFTER SAST, so scan status is always "completed" before
+      // Secrets has a chance to write findings.
       const MAX_RETRIES = 30;
       try {
         const sec = await getSecretFindings(runId);
@@ -204,16 +272,10 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setSecretScanning(false);
           return;
         }
-        // Check if the overall scan has already finished — if so, no more secrets coming
-        const scanState = await getScanStatus(runId);
-        if (scanState.status === "completed" || scanState.status === "failed") {
-          setSecretScanning(false);
-          return;
-        }
         if (retries < MAX_RETRIES) {
           setTimeout(() => loadSecrets(retries + 1), 5000);
         } else {
-          setSecretScanning(false);  // give up after timeout
+          setSecretScanning(false);  // give up — no secrets found
         }
       } catch {
         if (retries < MAX_RETRIES) {
@@ -225,11 +287,12 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     }
 
     async function loadDeps(retries = 0) {
-      // SCA runs independently of SAST — its completion is signalled by findings
-      // appearing in the DB, NOT by workflow_runs.state. Do NOT check getScanStatus
-      // here: SAST sets state="completed" in ~15s but SCA can take ~25-60s, so
-      // checking scan state causes a premature stop with 0 findings every time.
-      const MAX_RETRIES = 30; // 30 × 5s = 150s max wait
+      // SCA runs after SAST. "completed" scan status only means SAST is done.
+      // Wait at least 10 retries (50s) before checking scan status, to give SCA
+      // time to finish. After that, if scan is completed AND SCA still has no
+      // findings, it genuinely found nothing — stop the spinner.
+      const MAX_RETRIES = 30; // 30 × 5s = 150s absolute max
+      const SCAN_STATUS_CHECK_AFTER = 10; // wait 50s before trusting scan status
       try {
         const dep = await getDependencyFindings(runId);
         if (dep.count > 0) {
@@ -237,6 +300,16 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setDepSummary(dep.summary);
           setDepScanning(false);
           return;
+        }
+        // After 50s, check if scan is fully done — if so SCA found nothing
+        if (retries >= SCAN_STATUS_CHECK_AFTER) {
+          try {
+            const scanState = await getScanStatus(runId);
+            if (scanState.status === "completed" || scanState.status === "failed") {
+              setDepScanning(false);
+              return;
+            }
+          } catch { /* ignore */ }
         }
         if (retries < MAX_RETRIES) {
           setTimeout(() => loadDeps(retries + 1), 5000);
@@ -287,6 +360,8 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           }
           setCrCompleted(true);
           setCrLoading(false);
+          // Code review done → FP Challenger starts next. Begin polling for it.
+          waitForFpToStart();
           return;
         }
 
@@ -328,6 +403,59 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       return;
     }
     startCrPolling();
+  }
+
+  // ---------------------------------------------------------------------------
+  // FP Challenger progress polling
+  // ---------------------------------------------------------------------------
+  async function waitForFpToStart(retries = 0) {
+    const MAX_FP_WAIT = 18; // 18 × 10s = 3 minutes
+    if (retries >= MAX_FP_WAIT) return;
+    try {
+      const fp = await getFpChallengeProgress(runId);
+      if (fp.status === "running")   { startFpPolling(); return; }
+      if (fp.status === "completed") { setFpTriggered(true); setFpCompleted(true); setFpProgress(fp); getFindings(runId).then(setFindings).catch(() => {}); return; }
+      if (fp.status === "failed")    { setFpTriggered(true); setFpError("FP challenge failed. Check /tmp/app.log."); return; }
+    } catch { /* not started yet */ }
+    setTimeout(() => waitForFpToStart(retries + 1), 10_000);
+  }
+
+  function startFpPolling() {
+    setFpLoading(true);
+    setFpTriggered(true);
+    let stalePct = -1;
+    let staleCount = 0;
+    const MAX_STALE_POLLS = 20;
+
+    const poll = async () => {
+      try {
+        const prog = await getFpChallengeProgress(runId);
+        setFpProgress({ pct: prog.pct, findings_done: prog.findings_done,
+          findings_total: prog.findings_total, fp_found: prog.fp_found,
+          current_finding: prog.current_finding });
+
+        if (prog.status === "completed") {
+          setFpCompleted(true);
+          setFpLoading(false);
+          // Reload SAST findings — verdict/fp_category/reasoning are now populated
+          getFindings(runId).then(setFindings).catch(() => {});
+          return;
+        }
+        if (prog.status === "failed") {
+          setFpError("FP challenge failed on the server. Check /tmp/app.log.");
+          setFpLoading(false);
+          return;
+        }
+        if (prog.pct === stalePct) { staleCount++; } else { stalePct = prog.pct; staleCount = 0; }
+        if (staleCount >= MAX_STALE_POLLS) {
+          setFpError(`FP challenge appears stuck at ${prog.pct}%. Check /tmp/app.log.`);
+          setFpLoading(false);
+          return;
+        }
+        setTimeout(poll, 6000);
+      } catch { setTimeout(poll, 8000); }
+    };
+    setTimeout(poll, 4000);
   }
 
   // ---------------------------------------------------------------------------
@@ -379,7 +507,8 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   const cov = status?.scan_coverage;
 
   // Are any parallel agents still running?
-  const agentsRunning = depScanning || secretScanning || graphBuildStatus === "building";
+  const agentsRunning = depScanning || secretScanning || graphBuildStatus === "building"
+    || crLoading || (fpTriggered && !fpCompleted && !fpError);
 
   if (loading) {
     return (
@@ -469,6 +598,22 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               error={!!crError}
               active={activeTab === "review"}
               onClick={() => setActiveTab("review")}
+            />
+
+            {/* FP Challenger */}
+            <AgentStatusCard
+              label="FP Challenger"
+              icon={<CheckCheck className="w-4 h-4" />}
+              color="text-emerald-400"
+              done={fpCompleted && !fpError}
+              count={fpProgress?.fp_found ?? 0}
+              unit="FPs found"
+              subtitle={fpCompleted && fpProgress ? `${fpProgress.findings_total} reviewed` : undefined}
+              notStarted={!fpTriggered}
+              progress={fpLoading ? fpProgress?.pct : undefined}
+              error={!!fpError}
+              active={false}
+              onClick={() => {}}
             />
 
             {/* Code Knowledge Graph */}
@@ -643,6 +788,26 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                           Called by {f.blast_radius} file{f.blast_radius === 1 ? "" : "s"}
                         </span>
                       )}
+                      {/* FP Challenger verdict badge */}
+                      {f.verdict === "FP" && (
+                        <span className="text-xs text-emerald-300 bg-emerald-500/10 border border-emerald-500/40 px-1.5 py-0.5 rounded flex items-center gap-1"
+                          title={f.reasoning ?? undefined}>
+                          <CheckCheck className="w-3 h-3" />
+                          False Positive{f.fp_category ? ` · ${f.fp_category}` : ""}
+                        </span>
+                      )}
+                      {f.verdict === "REAL" && fpCompleted && (
+                        <span className="text-xs text-red-300 bg-red-500/10 border border-red-500/40 px-1.5 py-0.5 rounded flex items-center gap-1"
+                          title={f.reasoning ?? undefined}>
+                          <ShieldAlert className="w-3 h-3" />
+                          Confirmed Real
+                        </span>
+                      )}
+                      {f.verdict === "ESCALATED" && fpCompleted && (
+                        <span className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/40 px-1.5 py-0.5 rounded">
+                          Needs Review
+                        </span>
+                      )}
                     </div>
                     <p className="text-xs text-gray-400 mt-1 line-clamp-2">{f.message}</p>
                     <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-600">
@@ -717,6 +882,29 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                             </div>
                           </div>
                         )}
+                        {/* FP Challenger verdict detail */}
+                        {f.verdict && (
+                          <div className={`rounded-lg border px-4 py-3 text-sm ${
+                            f.verdict === "FP"
+                              ? "bg-emerald-950/30 border-emerald-700/40 text-emerald-300"
+                              : f.verdict === "REAL"
+                              ? "bg-red-950/20 border-red-700/40 text-red-300"
+                              : "bg-yellow-950/20 border-yellow-700/40 text-yellow-300"
+                          }`}>
+                            <p className="flex items-center gap-1.5 font-medium mb-1">
+                              <CheckCheck className="w-3.5 h-3.5" />
+                              FP Challenger verdict: <span className="font-semibold">{f.verdict}</span>
+                              {f.fp_category && <span className="font-normal text-xs opacity-75">· {f.fp_category}</span>}
+                              {f.confidence != null && (
+                                <span className="ml-auto text-xs opacity-60">
+                                  confidence {Math.round(f.confidence * 100)}%
+                                </span>
+                              )}
+                            </p>
+                            {f.reasoning && <p className="text-xs opacity-80 mt-1">{f.reasoning}</p>}
+                          </div>
+                        )}
+
                         {Array.isArray(f.ref_urls) && f.ref_urls.length > 0 && (
                           <div>
                             <p className="text-xs text-gray-500 uppercase tracking-wide mb-2 flex items-center gap-1">
@@ -1228,10 +1416,10 @@ function SummaryCard({
 }
 
 function AgentStatusCard({
-  label, icon, color, done, count, unit, notStarted = false, progress, error = false, active = false, onClick,
+  label, icon, color, done, count, unit, subtitle, notStarted = false, progress, error = false, active = false, onClick,
 }: {
   label: string; icon: React.ReactNode; color: string;
-  done: boolean; count: number; unit: string;
+  done: boolean; count: number; unit: string; subtitle?: string;
   notStarted?: boolean; progress?: number; error?: boolean;
   active?: boolean; onClick?: () => void;
 }) {
@@ -1290,6 +1478,9 @@ function AgentStatusCard({
       <p className={`text-sm font-bold tabular-nums ${error ? "text-red-400" : done ? color : "text-gray-500"}`}>
         {error ? "failed" : done ? `${count} ${unit}` : notStarted ? "—" : "running…"}
       </p>
+      {done && subtitle && (
+        <p className="text-xs text-gray-500 -mt-1">{subtitle}</p>
+      )}
     </div>
   );
 }

@@ -109,6 +109,7 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
     await _create_code_review_table(pool)
     await _create_secret_findings_table(pool)
     await _create_dependency_findings_table(pool)
+    await _create_fp_challenge_status_table(pool)
 
 
 async def _add_columns_if_missing(pool: asyncpg.Pool) -> None:
@@ -199,6 +200,24 @@ async def _create_secret_findings_table(pool: asyncpg.Pool) -> None:
             "CREATE INDEX IF NOT EXISTS idx_secrets_run ON secret_findings(run_id)"
         )
     logger.info("secret_findings table ready")
+
+
+async def _create_fp_challenge_status_table(pool: asyncpg.Pool) -> None:
+    """Create fp_challenge_status table for real-time progress tracking."""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS fp_challenge_status (
+                run_id          TEXT PRIMARY KEY,
+                status          TEXT NOT NULL DEFAULT 'running',
+                findings_total  INT NOT NULL DEFAULT 0,
+                findings_done   INT NOT NULL DEFAULT 0,
+                pct             INT NOT NULL DEFAULT 0,
+                fp_found        INT NOT NULL DEFAULT 0,
+                current_finding TEXT,
+                updated_at      TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+    logger.info("fp_challenge_status table ready")
 
 
 async def _create_dependency_findings_table(pool: asyncpg.Pool) -> None:

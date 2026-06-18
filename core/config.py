@@ -43,7 +43,7 @@ class OllamaConfig:
     """Ollama LLM server settings. Runs natively on Mac with Metal GPU."""
     base_url: str = field(default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
     # Tier 1 — primary model for SAST analysis, code review, FP arbitration
-    tier1_model: str = field(default_factory=lambda: os.getenv("OLLAMA_TIER1_MODEL", "llama3.2:3b"))
+    tier1_model: str = field(default_factory=lambda: os.getenv("OLLAMA_TIER1_MODEL", "qwen2.5-coder:14b-instruct-q5_K_M"))
     # Tier 2 — fast model for classification, routing, simple extraction
     tier2_model: str = field(default_factory=lambda: os.getenv("OLLAMA_TIER2_MODEL", "llama3.2:3b"))
     # Escalation threshold: re-run on Tier 1 if LLM confidence below this
