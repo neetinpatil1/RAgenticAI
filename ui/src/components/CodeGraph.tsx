@@ -1,5 +1,8 @@
-import { useEffect, useState } from "react";
-import { Network, FileCode, GitBranch, ExternalLink, RefreshCw, AlertCircle, Layers, Share2, CheckCircle2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  Network, FileCode, GitBranch, ExternalLink, RefreshCw,
+  AlertCircle, Layers, Share2, CheckCircle2, Loader2, XCircle,
+} from "lucide-react";
 
 interface GraphStatus {
   available: boolean;
@@ -12,25 +15,57 @@ interface GraphStatus {
   commit?: string;
 }
 
+interface BuildStatus {
+  status: "idle" | "building" | "done" | "failed";
+  error?: string | null;
+  elapsed_sec?: number;
+  graph_exists?: boolean;
+}
+
 interface Props {
   scanPath: string;
 }
 
-export function CodeGraph({ scanPath }: Props) {
-  const [status,    setStatus]    = useState<GraphStatus | null>(null);
-  const [loading,   setLoading]   = useState(true);
-  const [building,  setBuilding]  = useState(false);
-  const [error,     setError]     = useState<string | null>(null);
-  const [buildDone, setBuildDone] = useState(false);
+// Approximate build stage labels shown to the user while elapsed time increases
+const STAGE_LABELS: Array<[number, string]> = [
+  [0,  "Initialising build…"],
+  [8,  "Parsing source files…"],
+  [20, "Resolving imports & call graphs…"],
+  [40, "Computing communities & hub scores…"],
+  [60, "Persisting graph to SQLite…"],
+  [80, "Almost done — finalising…"],
+];
 
+function stageLabel(elapsed: number): string {
+  let label = STAGE_LABELS[0][1];
+  for (const [t, msg] of STAGE_LABELS) {
+    if (elapsed >= t) label = msg;
+  }
+  return label;
+}
+
+export function CodeGraph({ scanPath }: Props) {
+  const [status,     setStatus]     = useState<GraphStatus | null>(null);
+  const [loading,    setLoading]    = useState(true);
+  const [error,      setError]      = useState<string | null>(null);
+
+  // Build state
+  const [buildPhase, setBuildPhase] = useState<"idle" | "building" | "done" | "failed">("idle");
+  const [buildError, setBuildError] = useState<string | null>(null);
+  const [elapsed,    setElapsed]    = useState(0);
+  const pollRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // -------------------------------------------------------------------------
+  // Graph status
+  // -------------------------------------------------------------------------
   async function fetchStatus(path: string) {
     setLoading(true);
     setError(null);
     try {
       const r = await fetch(`/api/v1/graph/status?scan_path=${encodeURIComponent(path)}`);
       if (!r.ok) throw new Error(`Server returned ${r.status}`);
-      const d = await r.json();
-      setStatus(d);
+      setStatus(await r.json());
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to fetch graph status");
       setStatus({ available: false });
@@ -41,7 +76,71 @@ export function CodeGraph({ scanPath }: Props) {
 
   useEffect(() => {
     if (scanPath) fetchStatus(scanPath);
+    return () => stopPolling();
   }, [scanPath]);
+
+  // -------------------------------------------------------------------------
+  // Build polling helpers
+  // -------------------------------------------------------------------------
+  function stopPolling() {
+    if (pollRef.current)    { clearInterval(pollRef.current);    pollRef.current    = null; }
+    if (elapsedRef.current) { clearInterval(elapsedRef.current); elapsedRef.current = null; }
+  }
+
+  function startElapsedTicker() {
+    setElapsed(0);
+    elapsedRef.current = setInterval(() => setElapsed(s => s + 1), 1000);
+  }
+
+  async function pollBuildStatus() {
+    try {
+      const r = await fetch(`/api/v1/graph/build/status?scan_path=${encodeURIComponent(scanPath)}`);
+      if (!r.ok) return; // transient — keep polling
+      const d: BuildStatus = await r.json();
+
+      if (d.status === "done") {
+        stopPolling();
+        setBuildPhase("done");
+        await fetchStatus(scanPath); // refresh node/edge counts
+      } else if (d.status === "failed") {
+        stopPolling();
+        setBuildPhase("failed");
+        setBuildError(d.error ?? "Build failed — check server logs for details.");
+      }
+      // "building" → keep polling
+    } catch { /* network blip — keep polling */ }
+  }
+
+  // -------------------------------------------------------------------------
+  // Trigger build
+  // -------------------------------------------------------------------------
+  async function triggerBuild() {
+    stopPolling();
+    setBuildPhase("building");
+    setBuildError(null);
+    setError(null);
+    startElapsedTicker();
+
+    try {
+      const r = await fetch(
+        `/api/v1/graph/build?scan_path=${encodeURIComponent(scanPath)}`,
+        { method: "POST" }
+      );
+      const body = await r.json().catch(() => ({ detail: r.statusText }));
+      if (!r.ok) {
+        stopPolling();
+        setBuildPhase("failed");
+        setBuildError(body.detail ?? `Server error ${r.status}`);
+        return;
+      }
+      // 200 → build started in background; poll for completion
+      pollRef.current = setInterval(pollBuildStatus, 3000);
+    } catch (err) {
+      stopPolling();
+      setBuildPhase("failed");
+      setBuildError(err instanceof Error ? err.message : "Could not reach the server.");
+    }
+  }
 
   function openGraph() {
     window.open(
@@ -51,31 +150,11 @@ export function CodeGraph({ scanPath }: Props) {
     );
   }
 
-  async function triggerBuild() {
-    setBuilding(true);
-    setBuildDone(false);
-    setError(null);
-    try {
-      // POST to the dedicated build endpoint (runs code_review_graph build <path>)
-      const r = await fetch(
-        `/api/v1/graph/build?scan_path=${encodeURIComponent(scanPath)}`,
-        { method: "POST" }
-      );
-      if (!r.ok) {
-        const body = await r.json().catch(() => ({ detail: r.statusText }));
-        throw new Error(body.detail ?? `Build failed (${r.status})`);
-      }
-      setBuildDone(true);
-      // Refresh status to show the new stats
-      await fetchStatus(scanPath);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Build failed — check /tmp/app.log");
-    } finally {
-      setBuilding(false);
-    }
-  }
-
+  // -------------------------------------------------------------------------
+  // Render helpers
+  // -------------------------------------------------------------------------
   const langs = status?.languages?.split(",").map(l => l.trim()).filter(Boolean) ?? [];
+  const isBuilding = buildPhase === "building";
 
   return (
     <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-5 space-y-4">
@@ -85,18 +164,21 @@ export function CodeGraph({ scanPath }: Props) {
         <div className="flex items-center gap-2">
           <Network className="w-4 h-4 text-brand-500" />
           <h3 className="text-sm font-semibold text-white">Code Knowledge Graph</h3>
-          <span className="text-xs text-gray-600 font-mono truncate max-w-xs">{scanPath.split("/").slice(-2).join("/")}</span>
+          <span className="text-xs text-gray-600 font-mono truncate max-w-xs">
+            {scanPath.split("/").slice(-2).join("/")}
+          </span>
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => fetchStatus(scanPath)}
-            disabled={loading}
-            className="p-1.5 rounded-lg text-gray-500 hover:text-gray-300 hover:bg-gray-800 transition-colors disabled:opacity-40"
+            disabled={loading || isBuilding}
+            className="p-1.5 rounded-lg text-gray-500 hover:text-gray-300 hover:bg-gray-800
+                       transition-colors disabled:opacity-40"
             title="Refresh stats"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
           </button>
-          {status?.available && (
+          {status?.available && !isBuilding && (
             <button
               onClick={openGraph}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium
@@ -108,34 +190,89 @@ export function CodeGraph({ scanPath }: Props) {
         </div>
       </div>
 
-      {/* Body */}
+      {/* Status fetch error */}
       {error && (
-        <div className="flex items-start gap-2 rounded-lg bg-red-950/20 border border-red-700/30 px-3 py-2.5 text-xs">
+        <div className="flex items-start gap-2 rounded-lg bg-red-950/20 border border-red-700/30
+                        px-3 py-2.5 text-xs">
           <AlertCircle className="w-3.5 h-3.5 text-red-400 mt-0.5 shrink-0" />
           <span className="text-red-300">{error}</span>
         </div>
       )}
 
-      {buildDone && !error && (
-        <div className="flex items-center gap-2 rounded-lg bg-green-950/20 border border-green-700/30 px-3 py-2 text-xs">
+      {/* Build success */}
+      {buildPhase === "done" && (
+        <div className="flex items-center gap-2 rounded-lg bg-green-950/20 border border-green-700/30
+                        px-3 py-2 text-xs">
           <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
-          <span className="text-green-300">Graph built successfully! Stats updated below.</span>
+          <span className="text-green-300">
+            Graph built successfully in {elapsed}s — stats updated below.
+          </span>
         </div>
       )}
 
+      {/* Build error */}
+      {buildPhase === "failed" && buildError && (
+        <div className="rounded-lg bg-red-950/20 border border-red-700/30 px-3 py-2.5 space-y-1.5">
+          <div className="flex items-start gap-2 text-xs">
+            <XCircle className="w-3.5 h-3.5 text-red-400 mt-0.5 shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-red-300 font-medium">Build failed</p>
+              <p className="text-red-400/80 mt-0.5 font-mono break-all">{buildError}</p>
+            </div>
+          </div>
+          <button
+            onClick={triggerBuild}
+            className="mt-1 flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs
+                       bg-gray-800 border border-gray-700 text-gray-300 hover:text-white
+                       hover:border-gray-500 transition-colors"
+          >
+            <RefreshCw className="w-3 h-3" /> Retry
+          </button>
+        </div>
+      )}
+
+      {/* In-progress banner */}
+      {isBuilding && (
+        <div className="rounded-lg bg-brand-950/20 border border-brand-700/30 px-4 py-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Loader2 className="w-4 h-4 text-brand-400 animate-spin shrink-0" />
+              <span className="text-sm font-medium text-brand-300">Building graph…</span>
+            </div>
+            <span className="text-xs text-gray-500 tabular-nums">{elapsed}s elapsed</span>
+          </div>
+
+          {/* Progress bar (indeterminate but moves with elapsed) */}
+          <div className="h-1.5 rounded-full bg-gray-800 overflow-hidden">
+            <div
+              className="h-full rounded-full bg-brand-500 transition-all duration-1000"
+              style={{ width: `${Math.min(95, (elapsed / 90) * 100)}%` }}
+            />
+          </div>
+
+          <p className="text-xs text-gray-400">{stageLabel(elapsed)}</p>
+          <p className="text-xs text-gray-600">
+            This runs once per project — future scans reuse the graph automatically.
+          </p>
+        </div>
+      )}
+
+      {/* Main body */}
       {loading ? (
         <div className="grid grid-cols-3 gap-3">
           {[...Array(3)].map((_, i) => (
             <div key={i} className="h-14 rounded-lg bg-gray-800 animate-pulse" />
           ))}
         </div>
-      ) : !status?.available ? (
-        <div className="flex items-start gap-3 rounded-lg bg-yellow-900/10 border border-yellow-700/30 px-4 py-3">
+      ) : !status?.available && !isBuilding ? (
+        <div className="flex items-start gap-3 rounded-lg bg-yellow-900/10 border border-yellow-700/30
+                        px-4 py-3">
           <AlertCircle className="w-4 h-4 text-yellow-400 mt-0.5 shrink-0" />
           <div className="flex-1 min-w-0">
             <p className="text-xs font-medium text-yellow-300">Graph not built for this project</p>
             <p className="text-xs text-gray-500 mt-0.5">
-              Click "Build Now" to build the code knowledge graph, or it will build automatically on the next Code Review scan.
+              Click "Build Now" to analyse call relationships, hub files, and communities.
+              It builds automatically on the next Code Review scan too.
             </p>
             <p className="text-xs text-gray-600 mt-1">
               Path: <code className="text-gray-500">{scanPath}</code>
@@ -143,36 +280,42 @@ export function CodeGraph({ scanPath }: Props) {
           </div>
           <button
             onClick={triggerBuild}
-            disabled={building}
+            disabled={isBuilding}
             className="shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs
                        bg-gray-800 border border-gray-700 text-gray-300 hover:text-white
                        hover:border-gray-500 transition-colors disabled:opacity-50"
           >
-            {building ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Share2 className="w-3 h-3" />}
-            {building ? "Building… (may take 1-2 min)" : "Build Now"}
+            <Share2 className="w-3 h-3" />
+            Build Now
           </button>
         </div>
-      ) : (
+      ) : status?.available ? (
         <>
-          {/* Stats */}
+          {/* Stats grid */}
           <div className="grid grid-cols-3 gap-3">
             <div className="rounded-lg bg-gray-800/60 border border-gray-700/40 px-3 py-2.5">
               <p className="text-xs text-gray-500 flex items-center gap-1 mb-1">
                 <Network className="w-3 h-3 text-brand-400" /> Nodes
               </p>
-              <p className="text-lg font-bold text-brand-400 tabular-nums">{status.nodes?.toLocaleString()}</p>
+              <p className="text-lg font-bold text-brand-400 tabular-nums">
+                {status.nodes?.toLocaleString()}
+              </p>
             </div>
             <div className="rounded-lg bg-gray-800/60 border border-gray-700/40 px-3 py-2.5">
               <p className="text-xs text-gray-500 flex items-center gap-1 mb-1">
                 <Share2 className="w-3 h-3 text-purple-400" /> Edges
               </p>
-              <p className="text-lg font-bold text-purple-400 tabular-nums">{status.edges?.toLocaleString()}</p>
+              <p className="text-lg font-bold text-purple-400 tabular-nums">
+                {status.edges?.toLocaleString()}
+              </p>
             </div>
             <div className="rounded-lg bg-gray-800/60 border border-gray-700/40 px-3 py-2.5">
               <p className="text-xs text-gray-500 flex items-center gap-1 mb-1">
                 <FileCode className="w-3 h-3 text-orange-400" /> Files
               </p>
-              <p className="text-lg font-bold text-orange-400 tabular-nums">{status.files?.toLocaleString()}</p>
+              <p className="text-lg font-bold text-orange-400 tabular-nums">
+                {status.files?.toLocaleString()}
+              </p>
             </div>
           </div>
 
@@ -181,7 +324,9 @@ export function CodeGraph({ scanPath }: Props) {
             <div className="flex items-center gap-1.5 flex-wrap">
               <Layers className="w-3.5 h-3.5 text-gray-600" />
               {langs.map(l => (
-                <span key={l} className="text-xs px-2 py-0.5 rounded-full bg-gray-800 text-gray-400 border border-gray-700">
+                <span key={l}
+                  className="text-xs px-2 py-0.5 rounded-full bg-gray-800 text-gray-400
+                             border border-gray-700">
                   {l}
                 </span>
               ))}
@@ -199,13 +344,25 @@ export function CodeGraph({ scanPath }: Props) {
             </div>
           </div>
 
-          {/* Call to action hint */}
-          <p className="text-xs text-gray-600 flex items-center gap-1.5">
-            <ExternalLink className="w-3 h-3" />
-            Click <span className="text-brand-400 font-medium">Open Graph</span> to explore call relationships, hub files, and community clusters interactively.
-          </p>
+          {/* Rebuild link */}
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-gray-600 flex items-center gap-1.5">
+              <ExternalLink className="w-3 h-3" />
+              Click <span className="text-brand-400 font-medium">Open Graph</span> to explore
+              call relationships, hub files, and community clusters interactively.
+            </p>
+            <button
+              onClick={triggerBuild}
+              disabled={isBuilding}
+              className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-400
+                         transition-colors disabled:opacity-40"
+              title="Rebuild graph"
+            >
+              <RefreshCw className="w-3 h-3" /> Rebuild
+            </button>
+          </div>
         </>
-      )}
+      ) : null}
     </div>
   );
 }

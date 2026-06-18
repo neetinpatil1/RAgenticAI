@@ -89,7 +89,10 @@ class SastWorkflowState(TypedDict):
 async def node_start_scan(state: SastWorkflowState, deps: dict) -> SastWorkflowState:
     """
     Node 1: Mark workflow as running in PostgreSQL.
-    This is the recovery checkpoint — watchdog knows the scan started.
+
+    Graph build is now triggered in POST /api/v1/scan (agent_gateway.py) using
+    the proper _run_graph_build background task so the UI polling sees
+    "building" → "done" immediately when a scan starts.
     """
     run_id = state["run_id"]
     wf_state: WorkflowState = deps["workflow_state"]
@@ -104,6 +107,7 @@ async def node_start_scan(state: SastWorkflowState, deps: dict) -> SastWorkflowS
         entity_id=run_id,
         payload={"scan_path": state["scan_path"]},
     )
+
     logger.info("SAST workflow started | run=%s path=%s", run_id, state["scan_path"])
     return state
 
@@ -505,6 +509,7 @@ async def node_enqueue_next(state: SastWorkflowState, deps: dict) -> SastWorkflo
         fp_summary.get("escalated", 0),
         fp_summary.get("deadlock", 0),
     )
+
     return state
 
 

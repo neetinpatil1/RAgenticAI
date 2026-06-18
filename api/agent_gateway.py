@@ -305,6 +305,16 @@ async def submit_scan(
         deps=deps,
     )
 
+    # Kick off graph build immediately so it runs in parallel with SAST/SCA.
+    # Using _run_graph_build (not bare Popen) so the UI polling sees "building" → "done".
+    import time as _time
+    _root = scan_path.resolve()
+    _key  = str(_root)
+    if _graph_build_status.get(_key, {}).get("status") != "building":
+        _graph_build_status[_key] = {"status": "building", "error": None, "started_at": _time.time()}
+        background_tasks.add_task(_run_graph_build, _root)
+        logger.warning("graph/build: queued at scan start for %s", _root)
+
     logger.info("Scan submitted | run=%s path=%s", run_id, request.path)
     return ScanResponse(
         run_id=run_id,
@@ -1149,42 +1159,114 @@ async def get_graph_status(scan_path: Optional[str] = None):
         return {"available": False, "error": str(exc)}
 
 
-@app.post("/api/v1/graph/build")
-async def build_graph(scan_path: Optional[str] = None):
-    """
-    Build (or rebuild) the code-review-graph knowledge graph for a project.
-    Runs synchronously — takes 10-60s depending on project size.
-    Returns 200 on success, 500 on failure with error detail.
-    """
-    import asyncio, subprocess as _sp
-    root = Path(scan_path) if scan_path else _GRAPH_DB.parent.parent
-    if not root.exists():
-        raise HTTPException(404, f"Path does not exist: {root}")
+# In-memory build status store: keyed by str(root)
+# Each entry: {"status": "building"|"done"|"failed", "error": str|None, "started_at": float}
+_graph_build_status: dict[str, dict] = {}
 
-    logger.warning("graph/build: starting build for %s", root)
+
+async def _run_graph_build(root: Path) -> None:
+    """Background task: builds the graph and updates _graph_build_status."""
+    import asyncio, subprocess as _sp, time
+    key = str(root)
     try:
         proc = await asyncio.create_subprocess_exec(
             "python3.11", "-m", "code_review_graph", "build", "--repo", str(root),
             stdout=_sp.PIPE, stderr=_sp.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            _graph_build_status[key] = {
+                "status": "failed",
+                "error": "Build timed out after 3 minutes. Try a smaller project.",
+                "started_at": _graph_build_status[key]["started_at"],
+            }
+            logger.warning("graph/build timed out for %s", root)
+            return
+
         if proc.returncode != 0:
-            err_msg = stderr.decode(errors="replace")[-500:] if stderr else "unknown error"
-            logger.warning("graph/build failed: rc=%d stderr=%s", proc.returncode, err_msg)
-            raise HTTPException(500, f"Build failed (exit {proc.returncode}): {err_msg}")
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "Graph build timed out after 120s. Try a smaller project.")
-    except HTTPException:
-        raise
+            err_raw = stderr.decode(errors="replace") if stderr else ""
+            # surface the last meaningful line (skip blank lines)
+            lines = [l.strip() for l in err_raw.splitlines() if l.strip()]
+            err_msg = lines[-1] if lines else f"exit code {proc.returncode}"
+            _graph_build_status[key] = {
+                "status": "failed",
+                "error": err_msg,
+                "started_at": _graph_build_status[key]["started_at"],
+            }
+            logger.warning("graph/build failed rc=%d: %s", proc.returncode, err_msg)
+            return
+
+        db = root / ".code-review-graph" / "graph.db"
+        if not db.exists():
+            _graph_build_status[key] = {
+                "status": "failed",
+                "error": "Build succeeded but graph.db was not created — check that code_review_graph is installed correctly.",
+                "started_at": _graph_build_status[key]["started_at"],
+            }
+            return
+
+        _graph_build_status[key] = {
+            "status": "done",
+            "error": None,
+            "started_at": _graph_build_status[key]["started_at"],
+        }
+        logger.warning("graph/build done for %s", root)
+
     except Exception as exc:
-        raise HTTPException(500, f"Build error: {exc}")
+        _graph_build_status[key] = {
+            "status": "failed",
+            "error": str(exc),
+            "started_at": _graph_build_status.get(key, {}).get("started_at", 0),
+        }
+        logger.warning("graph/build exception for %s: %s", root, exc)
 
-    db = root / ".code-review-graph" / "graph.db"
-    if not db.exists():
-        raise HTTPException(500, "Build command succeeded but graph.db was not created")
 
-    logger.warning("graph/build: completed for %s", root)
-    return {"status": "ok", "message": f"Graph built for {root.name}", "path": str(root)}
+@app.post("/api/v1/graph/build")
+async def build_graph(background_tasks: BackgroundTasks, scan_path: Optional[str] = None):
+    """
+    Start an async graph build for *scan_path* and return immediately.
+    Poll GET /api/v1/graph/build/status?scan_path=… to track progress.
+    """
+    import time
+    root = Path(scan_path) if scan_path else _GRAPH_DB.parent.parent
+    if not root.exists():
+        raise HTTPException(404, f"Path does not exist: {root}")
+
+    key = str(root)
+    # Reject a duplicate in-flight build
+    if _graph_build_status.get(key, {}).get("status") == "building":
+        return {"status": "building", "message": "Build already in progress"}
+
+    _graph_build_status[key] = {"status": "building", "error": None, "started_at": time.time()}
+    logger.warning("graph/build: queued background build for %s", root)
+    background_tasks.add_task(_run_graph_build, root)
+    return {"status": "building", "message": f"Build started for {root.name}"}
+
+
+@app.get("/api/v1/graph/build/status")
+async def get_build_status(scan_path: Optional[str] = None):
+    """
+    Returns the current build status for a project path.
+    Possible status values: "idle", "building", "done", "failed"
+    """
+    import time
+    root = Path(scan_path) if scan_path else _GRAPH_DB.parent.parent
+    key  = str(root)
+    entry = _graph_build_status.get(key)
+    if not entry:
+        # Check if graph already exists (built in a previous server session)
+        db = root / ".code-review-graph" / "graph.db"
+        return {"status": "idle", "graph_exists": db.exists()}
+    elapsed = int(time.time() - entry.get("started_at", 0))
+    return {
+        "status":      entry["status"],
+        "error":       entry.get("error"),
+        "elapsed_sec": elapsed,
+        "graph_exists": (root / ".code-review-graph" / "graph.db").exists(),
+    }
 
 
 @app.get("/api/v1/graph/visualization", response_class=HTMLResponse)

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend,
@@ -6,7 +6,7 @@ import {
 import {
   ChevronDown, ChevronUp, RotateCcw, ShieldAlert, ExternalLink,
   FileCode, Wrench, BookOpen, TrendingUp, Brain, Zap, Code2, AlertTriangle,
-  CheckCircle2, Loader2, PlayCircle, Key, Package, CheckCheck,
+  CheckCircle2, Loader2, PlayCircle, Key, Package, CheckCheck, Network,
 } from "lucide-react";
 import {
   getFindings, getScanStatus, triggerCodeReview, getCodeReview,
@@ -85,6 +85,13 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   const [depExpanded,  setDepExpanded]  = useState<Set<string>>(new Set());
   const [depScanning,  setDepScanning]  = useState(true);
 
+  // Code Knowledge Graph build state (fires at scan start in parallel)
+  const [graphBuildStatus,  setGraphBuildStatus]  = useState<"idle" | "building" | "done" | "failed">("idle");
+  const [graphBuildError,   setGraphBuildError]   = useState<string | null>(null);
+  const [graphBuildElapsed, setGraphBuildElapsed] = useState(0);
+  const graphPollRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const graphElapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // ---------------------------------------------------------------------------
   // Data loading — initial fetch + polling for parallel agents
   // ---------------------------------------------------------------------------
@@ -96,6 +103,9 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     setDepFindings([]);
     setCrFindings([]);
     setFindings([]);
+    setGraphBuildStatus("idle");
+    setGraphBuildError(null);
+    setGraphBuildElapsed(0);
 
     async function load() {
       const [f, s] = await Promise.all([getFindings(runId), getScanStatus(runId)]);
@@ -124,6 +134,52 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       } catch { /* not yet */ }
       loadSecrets();
       loadDeps();
+      startGraphBuildPolling();
+    }
+
+    // -------------------------------------------------------------------------
+    // Graph build polling — tracks the background build fired at scan start
+    // -------------------------------------------------------------------------
+    function startGraphBuildPolling() {
+      if (!scanPath) return;
+
+      // Optimistically show "building" immediately — the server starts the build
+      // in the same request that started this scan, so it's already in progress.
+      setGraphBuildStatus("building");
+
+      // Tick elapsed seconds
+      graphElapsedRef.current = setInterval(
+        () => setGraphBuildElapsed(s => s + 1), 1000
+      );
+
+      // Poll build status every 4s
+      graphPollRef.current = setInterval(async () => {
+        try {
+          const r = await fetch(
+            `/api/v1/graph/build/status?scan_path=${encodeURIComponent(scanPath)}`
+          );
+          if (!r.ok) return;
+          const d = await r.json();
+
+          if (d.status === "building") {
+            setGraphBuildStatus("building");
+          } else if (d.status === "done" || (d.status === "idle" && d.graph_exists)) {
+            stopGraphPolling();
+            setGraphBuildStatus("done");
+          } else if (d.status === "failed") {
+            stopGraphPolling();
+            setGraphBuildStatus("failed");
+            setGraphBuildError(d.error ?? "Graph build failed — check server logs.");
+          }
+          // "idle" + graph doesn't exist yet → build not started or server restarted
+          // keep polling
+        } catch { /* network blip — keep polling */ }
+      }, 4000);
+    }
+
+    function stopGraphPolling() {
+      if (graphPollRef.current)    { clearInterval(graphPollRef.current);    graphPollRef.current    = null; }
+      if (graphElapsedRef.current) { clearInterval(graphElapsedRef.current); graphElapsedRef.current = null; }
     }
 
     async function loadSecrets(retries = 0) {
@@ -159,17 +215,16 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     }
 
     async function loadDeps(retries = 0) {
-      const MAX_RETRIES = 30;
+      // SCA runs independently of SAST — its completion is signalled by findings
+      // appearing in the DB, NOT by workflow_runs.state. Do NOT check getScanStatus
+      // here: SAST sets state="completed" in ~15s but SCA can take ~25-60s, so
+      // checking scan state causes a premature stop with 0 findings every time.
+      const MAX_RETRIES = 30; // 30 × 5s = 150s max wait
       try {
         const dep = await getDependencyFindings(runId);
         if (dep.count > 0) {
           setDepFindings(dep.findings);
           setDepSummary(dep.summary);
-          setDepScanning(false);
-          return;
-        }
-        const scanState = await getScanStatus(runId);
-        if (scanState.status === "completed" || scanState.status === "failed") {
           setDepScanning(false);
           return;
         }
@@ -188,6 +243,11 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     }
 
     load();
+
+    return () => {
+      if (graphPollRef.current)    clearInterval(graphPollRef.current);
+      if (graphElapsedRef.current) clearInterval(graphElapsedRef.current);
+    };
   }, [runId]);
 
   // ---------------------------------------------------------------------------
@@ -308,7 +368,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   const cov = status?.scan_coverage;
 
   // Are any parallel agents still running?
-  const agentsRunning = depScanning || secretScanning;
+  const agentsRunning = depScanning || secretScanning || graphBuildStatus === "building";
 
   if (loading) {
     return (
@@ -347,7 +407,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             }
           </p>
           <p className="text-xs text-gray-600 mb-4">Click an agent to view its findings</p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
 
             {/* SAST */}
             <AgentStatusCard
@@ -398,6 +458,13 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               error={!!crError}
               active={activeTab === "review"}
               onClick={() => setActiveTab("review")}
+            />
+
+            {/* Code Knowledge Graph */}
+            <GraphBuildCard
+              status={graphBuildStatus}
+              elapsed={graphBuildElapsed}
+              error={graphBuildError}
             />
           </div>
         </div>
@@ -975,7 +1042,16 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                   Found <span className="text-purple-400 font-semibold">{crProgress.findings_count}</span> issues so far
                 </p>
               )}
-              <p className="text-xs text-gray-600">Reviewing 2 files concurrently with llama3.2:3b.</p>
+              <p className="text-xs text-gray-600">
+                Reviewing {crProgress?.total_files ?? "…"} files (2 concurrently) with llama3.2:3b.
+                {crProgress?.total_files && crProgress.total_files <= 20
+                  ? " Small project — est. ~10 min."
+                  : crProgress?.total_files && crProgress.total_files <= 25
+                  ? " Medium project — est. ~18 min."
+                  : crProgress?.total_files
+                  ? " Large project — reviewing top most-critical files only."
+                  : ""}
+              </p>
             </div>
           )}
 
@@ -1202,6 +1278,86 @@ function AgentStatusCard({
 
       <p className={`text-sm font-bold tabular-nums ${error ? "text-red-400" : done ? color : "text-gray-500"}`}>
         {error ? "failed" : done ? `${count} ${unit}` : notStarted ? "—" : "running…"}
+      </p>
+    </div>
+  );
+}
+
+const GRAPH_STAGES: Array<[number, string]> = [
+  [0,  "Starting build…"],
+  [8,  "Parsing files…"],
+  [20, "Resolving imports…"],
+  [40, "Computing hub scores…"],
+  [60, "Building communities…"],
+  [80, "Finalising graph…"],
+];
+
+function graphStageLabel(elapsed: number): string {
+  let label = GRAPH_STAGES[0][1];
+  for (const [t, msg] of GRAPH_STAGES) {
+    if (elapsed >= t) label = msg;
+  }
+  return label;
+}
+
+function GraphBuildCard({
+  status, elapsed, error,
+}: {
+  status: "idle" | "building" | "done" | "failed";
+  elapsed: number;
+  error: string | null;
+}) {
+  const isBuilding = status === "building";
+  const isDone     = status === "done";
+  const isFailed   = status === "failed";
+
+  return (
+    <div className={`rounded-lg px-4 py-3 space-y-2 transition-all
+      ${isFailed
+        ? "bg-red-950/20 border border-red-700/40"
+        : isDone
+          ? "bg-gray-800/60 border border-gray-700/40"
+          : isBuilding
+            ? "bg-brand-950/20 border border-brand-700/40"
+            : "bg-gray-800/60 border border-gray-700/40 opacity-50"
+      }`}
+    >
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-xs font-semibold text-brand-400">
+          <Network className="w-4 h-4" /> Code Graph
+        </div>
+        {isFailed ? (
+          <AlertTriangle className="w-4 h-4 text-red-400" />
+        ) : isDone ? (
+          <CheckCheck className="w-4 h-4 text-green-400" />
+        ) : isBuilding ? (
+          <Loader2 className="w-3.5 h-3.5 animate-spin text-brand-400" />
+        ) : (
+          <span className="text-xs text-gray-600">—</span>
+        )}
+      </div>
+
+      {/* Progress bar while building */}
+      {isBuilding && (
+        <div className="space-y-1">
+          <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+            <motion.div
+              className="h-full bg-brand-500 rounded-full transition-all duration-1000"
+              animate={{ width: `${Math.min(92, (elapsed / 90) * 100)}%` }}
+              transition={{ duration: 1 }}
+            />
+          </div>
+          <p className="text-xs text-gray-500">{graphStageLabel(elapsed)}</p>
+        </div>
+      )}
+
+      <p className={`text-sm font-bold tabular-nums
+        ${isFailed ? "text-red-400" : isDone ? "text-green-400" : isBuilding ? "text-brand-400" : "text-gray-600"}`}>
+        {isFailed
+          ? <span title={error ?? ""}>failed</span>
+          : isDone    ? "ready"
+          : isBuilding ? `${elapsed}s elapsed`
+          : "not started"}
       </p>
     </div>
   );

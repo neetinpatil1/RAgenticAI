@@ -52,9 +52,15 @@ _PRIORITY_KEYWORDS = [
     "repository", "util", "helper", "config", "filter", "interceptor",
 ]
 
-_MAX_FILE_BYTES = 15_360    # 15 KB
-_MAX_LINES     = 80         # 80 lines keeps total prompt well under 2048 tokens
-_MAX_FILES     = 50         # review only the top 50 most important files
+_MAX_FILE_BYTES = 15_360    # 15 KB — skip files larger than this
+
+# Adaptive limits based on project size — set in node_enumerate_files
+# Small  (<= 20 files):  review all,  80 lines each  → ~10 min
+# Medium (21-60 files):  review 25,   60 lines each  → ~18 min
+# Large  (61-150 files): review 20,   50 lines each  → ~15 min
+# XLarge (> 150 files):  review 15,   40 lines each  → ~11 min
+_DEFAULT_MAX_FILES = 50   # fallback if not set by enumerate_files
+_DEFAULT_MAX_LINES = 80   # fallback if not set by enumerate_files
 
 # Skip paths that rarely contain exploitable logic
 _SKIP_PATH_KEYWORDS = {
@@ -74,11 +80,13 @@ class CodeReviewState(TypedDict):
     # Set by enumerate_files
     files_to_review:   list[str]   # ordered list of absolute file paths
     total_files:       int
+    max_lines:         int         # lines-per-file limit (adaptive to project size)
 
     # Set/updated by review_files
     files_reviewed:    int
     findings_count:    int
     sast_findings:     dict        # file_path → list of SAST finding dicts (context)
+    graph_contexts:    dict        # file_path → GraphContext (from code-review-graph)
 
     # Error tracking
     error: Optional[str]
@@ -127,8 +135,8 @@ async def _call_llm(system_prompt: str, user_prompt: str, timeout: int = 120) ->
         "stream":  False,
         "options": {
             "temperature": 0.1,
-            "num_predict": 512,   # concise JSON response
-            "num_ctx":     2048,  # smaller context — llama3.2:3b works better with 2048
+            "num_predict": 1024,  # enough for full JSON with multiple findings
+            "num_ctx":     3072,  # input (~1200 tokens) + output (1024) = ~2224; 3072 gives headroom
             "num_gpu":     99,    # force all layers onto Metal GPU
             "num_thread":  8,     # CPU threads for prompt processing
         },
@@ -152,6 +160,8 @@ async def _review_file(
     scan_path: str,
     sast_findings: dict,
     system_prompt: str,
+    graph_ctx: Optional[GraphContext] = None,
+    max_lines: int = _DEFAULT_MAX_LINES,
 ) -> Optional[CodeReviewFileResult]:
     """
     Read a file, build the prompt, call LLM, parse response.
@@ -170,15 +180,15 @@ async def _review_file(
     if not content.strip():
         return None
 
-    # Truncate if needed
+    # Truncate if needed (adaptive max_lines from caller)
     lines = content.splitlines()
     truncated = False
-    if len(lines) > _MAX_LINES:
-        lines = lines[:_MAX_LINES]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
         truncated = True
     content_for_llm = "\n".join(lines)
     if truncated:
-        content_for_llm += f"\n\n... [file truncated at {_MAX_LINES} lines]"
+        content_for_llm += f"\n\n... [file truncated at {max_lines} lines]"
 
     # Detect language from extension
     lang_map = {
@@ -197,7 +207,12 @@ async def _review_file(
         for f in sast_for_file:
             sast_context += f"  - Line {f['line_start']}: [{f['severity']}] {f['rule_id']} — {f['message'][:120]}\n"
 
-    user_prompt = f"""Review this {language} file: {rel_path}{sast_context}
+    # Graph context section — injected between file header and code
+    graph_section = ""
+    if graph_ctx is not None:
+        graph_section = "\n\n" + graph_ctx.to_prompt_section()
+
+    user_prompt = f"""Review this {language} file: {rel_path}{graph_section}{sast_context}
 
 ```{path.suffix.lstrip('.')}
 {content_for_llm}
@@ -213,15 +228,57 @@ async def _review_file(
     elapsed_ms = int((time.time() - start) * 1000)
     logger.warning("LLM DONE | file=%s elapsed=%dms raw_len=%d", rel_path, elapsed_ms, len(raw))
 
-    # Parse JSON from LLM response
+    # Parse JSON from LLM response — with truncation repair
+    def _try_parse(text: str) -> Optional[dict]:
+        """Try to parse JSON; if truncated, rescue complete findings objects."""
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Try to extract complete finding objects from a truncated array
+        # Strategy: find all complete {...} objects inside "findings": [...]
+        import re
+        findings_match = re.search(r'"findings"\s*:\s*\[(.+)', text, re.DOTALL)
+        if not findings_match:
+            return None
+        array_text = findings_match.group(1)
+        # Collect complete JSON objects (balanced braces)
+        rescued: list[dict] = []
+        depth = 0
+        start = None
+        for i, ch in enumerate(array_text):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start is not None:
+                    obj_str = array_text[start:i + 1]
+                    try:
+                        obj = json.loads(obj_str)
+                        rescued.append(obj)
+                    except Exception:
+                        pass
+                    start = None
+        if rescued:
+            logger.warning("LLM JSON TRUNCATED | file=%s rescued=%d findings", rel_path, len(rescued))
+            return {"findings": rescued, "overall_score": 60, "summary": "Response was truncated; partial findings rescued."}
+        return None
+
     try:
         # Strip markdown code fences if present
         text = raw.strip()
         if text.startswith("```"):
             lines_r = text.splitlines()
-            text = "\n".join(lines_r[1:-1] if lines_r[-1].strip() == "```" else lines_r[1:])
-        data = json.loads(text)
-    except (json.JSONDecodeError, ValueError) as exc:
+            inner = lines_r[1:-1] if lines_r and lines_r[-1].strip() == "```" else lines_r[1:]
+            text = "\n".join(inner)
+        data = _try_parse(text)
+        if data is None:
+            logger.warning("LLM JSON PARSE ERROR | file=%s | raw_first_300=%r", rel_path, raw[:300])
+            return None
+    except Exception as exc:
         logger.warning("LLM JSON PARSE ERROR | file=%s err=%s | raw_first_300=%r", rel_path, exc, raw[:300])
         return None
 
@@ -524,6 +581,40 @@ def _load_graph_data(root: Path) -> tuple[dict[str, float], dict[str, int], dict
     return hub_scores, community_ids, graph_contexts
 
 
+async def _ensure_graph_built(root: Path) -> bool:
+    """
+    Build the code-review-graph for `root` if it doesn't exist yet.
+    Called at the start of code review — awaited so graph context is always
+    available even on the very first scan of a new project.
+
+    Returns True if graph is available after this call, False on failure.
+    """
+    db_path = root / ".code-review-graph" / "graph.db"
+    if db_path.exists():
+        return True  # already built
+
+    logger.warning("code-review-graph: graph not found for %s — building now (first-time scan)", root)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3.11", "-m", "code_review_graph", "build", "--repo", str(root),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace")[-300:] if stderr else ""
+            logger.warning("code-review-graph: build failed (rc=%d): %s", proc.returncode, err)
+            return False
+        logger.warning("code-review-graph: build complete for %s", root)
+        return db_path.exists()
+    except asyncio.TimeoutError:
+        logger.warning("code-review-graph: build timed out after 180s for %s", root)
+        return False
+    except Exception as exc:
+        logger.warning("code-review-graph: build error: %s", exc)
+        return False
+
+
 async def node_enumerate_files(state: CodeReviewState, deps: dict) -> CodeReviewState:
     """
     Walk the project and build a priority-ordered list of files to review.
@@ -540,8 +631,12 @@ async def node_enumerate_files(state: CodeReviewState, deps: dict) -> CodeReview
     sast_findings = state["sast_findings"]
     root = Path(scan_path)
 
-    # Load graph data (Features 1 + 4) — fast, synchronous SQLite read
-    hub_scores, community_ids = _load_graph_data(root)
+    # Ensure graph is built — waits synchronously so context is available for first-time scans.
+    # For subsequent scans the graph already exists and this returns instantly.
+    await _ensure_graph_built(root)
+
+    # Load graph data (Features 1 + 4 + enriched context) — fast, synchronous SQLite read
+    hub_scores, community_ids, graph_contexts = _load_graph_data(root)
 
     # Collect reviewable files, skipping test/generated/build paths
     _HARD_SKIP = {".git", "node_modules", ".venv", "venv", "__pycache__", "target", "build", "dist"}
@@ -595,15 +690,28 @@ async def node_enumerate_files(state: CodeReviewState, deps: dict) -> CodeReview
         # Legacy sort: priority tier then largest-first
         all_files.sort(key=lambda p: (priority(p), -p.stat().st_size))
 
-    # Cap at _MAX_FILES — review only the most important files
-    all_files = all_files[:_MAX_FILES]
+    # Adaptive limits based on total reviewable file count
+    total_discoverable = len(all_files)
+    if total_discoverable <= 20:
+        max_files, max_lines = total_discoverable, 80   # small: review all
+    elif total_discoverable <= 60:
+        max_files, max_lines = 25, 60                   # medium: top 25, 60 lines each
+    elif total_discoverable <= 150:
+        max_files, max_lines = 20, 50                   # large: top 20, 50 lines each
+    else:
+        max_files, max_lines = 15, 40                   # xlarge: top 15, 40 lines each
+
+    all_files = all_files[:max_files]
 
     file_list = [str(p) for p in all_files]
-    logger.warning("CODE REVIEW FILES | run=%s selected=%d (cap=%d)", state["run_id"], len(file_list), _MAX_FILES)
+    logger.warning(
+        "CODE REVIEW FILES | run=%s discoverable=%d selected=%d max_lines=%d graph_ctx=%d",
+        state["run_id"], total_discoverable, len(file_list), max_lines, len(graph_contexts),
+    )
     # Write initial progress entry
     pool: asyncpg.Pool = deps["pool"]
     await _upsert_progress(pool, state["run_id"], 0, len(file_list), "", 0, "running")
-    return {**state, "files_to_review": file_list, "total_files": len(file_list)}
+    return {**state, "files_to_review": file_list, "total_files": len(file_list), "max_lines": max_lines, "graph_contexts": graph_contexts}
 
 
 async def node_review_files(state: CodeReviewState, deps: dict) -> CodeReviewState:
@@ -616,6 +724,8 @@ async def node_review_files(state: CodeReviewState, deps: dict) -> CodeReviewSta
     scan_path = state["scan_path"]
     sast_findings = state["sast_findings"]
     files = state["files_to_review"]
+    graph_contexts: dict[str, GraphContext] = state.get("graph_contexts", {})
+    max_lines: int = state.get("max_lines", _DEFAULT_MAX_LINES)
 
     # Load system prompt
     system_prompt_path = Path(settings.prompts_dir) / "code_review_agent" / "v1.0" / "system.md"
@@ -648,7 +758,8 @@ async def node_review_files(state: CodeReviewState, deps: dict) -> CodeReviewSta
                 processed += 1
             await _upsert_progress(pool, run_id, proc_now, total, rel, total_findings, "running")
 
-            result = await _review_file(abs_path, scan_path, sast_findings, system_prompt)
+            graph_ctx = graph_contexts.get(abs_path)
+            result = await _review_file(abs_path, scan_path, sast_findings, system_prompt, graph_ctx, max_lines)
             if result is None:
                 return
 
@@ -766,9 +877,11 @@ async def run_code_review_workflow(run_id: str, scan_path: str, deps: dict) -> d
         "scan_path":       scan_path,
         "files_to_review": [],
         "total_files":     0,
+        "max_lines":       _DEFAULT_MAX_LINES,
         "files_reviewed":  0,
         "findings_count":  0,
         "sast_findings":   {},
+        "graph_contexts":  {},
         "error":           None,
     }
 
