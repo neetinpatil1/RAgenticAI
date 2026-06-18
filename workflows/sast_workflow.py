@@ -465,6 +465,15 @@ async def node_enqueue_next(state: SastWorkflowState, deps: dict) -> SastWorkflo
             priority=2,  # high priority — human review queue
         )
 
+    # Phase 1: enqueue FP Challenger for a second-pass re-evaluation
+    # The challenger runs AFTER all findings are in DB so pgvector has richer context
+    await job_queue.enqueue(
+        job_type=JobType.FP_CHALLENGE_PENDING,
+        run_id=run_id,
+        payload={"fp_summary": fp_summary},
+        priority=3,
+    )
+
     # Phase 0: mark scan complete
     await job_queue.enqueue(
         job_type=JobType.SCAN_COMPLETED,

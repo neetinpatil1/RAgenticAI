@@ -174,10 +174,10 @@
 | 1.7.2 | Fixed YAML parse error: quoted dangerouslySetInnerHTML patterns | `agents/security/sast/rules/custom/javascript_security.yml` | ✅ |
 | 1.7.3 | Semgrep exit code 2 treated as warn-and-continue (not fatal) if stdout non-empty | `tools/semgrep_tool.py` | ✅ |
 
-### 1.8 — Not Started
+### 1.8 — In Progress
 | # | Task | File(s) | Status |
 |---|---|---|---|
-| 1.8.1 | FP Challenger Agent | `agents/development/fp_challenger/`, `workflows/fp_challenger_workflow.py` | ⬜ |
+| 1.8.1 | FP Challenger Agent — LangGraph workflow (L1→L3 second pass), fp_challenge_status table, 3 API endpoints, auto-enqueue from SAST | `workflows/fp_challenger_workflow.py`, `db/migrations.py`, `workflows/sast_workflow.py`, `api/agent_gateway.py` | ✅ |
 | 1.8.2 | Layer 2 CodeBERT classifier | `core/fp_pipeline/layer2_classifier.py` | ⬜ |
 | 1.8.3 | Online agreement monitoring (Grafana) | `core/drift_monitor.py` | ⬜ |
 | 1.8.4 | Living golden dataset | `prompts/golden_datasets/` | ⬜ |

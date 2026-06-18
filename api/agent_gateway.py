@@ -55,6 +55,7 @@ from workflows.sast_workflow import run_sast_workflow
 from workflows.code_review_workflow import run_code_review_workflow
 from workflows.secret_scan_workflow import run_secret_scan_workflow
 from workflows.sca_workflow import run_sca_workflow
+from workflows.fp_challenger_workflow import run_fp_challenger_workflow
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -241,38 +242,32 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     else:
         logger.warning("graph/build: already done, skipping rebuild for %s", root)
 
-    # ── Step 2: SAST + Secrets + SCA in parallel ──────────────────────────────
-    logger.info("Phase 1 agents starting in parallel | run=%s", run_id)
-    results = await asyncio.gather(
-        run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
-        run_secret_scan_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
-        run_sca_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
-        return_exceptions=True,
-    )
-    for i, r in enumerate(results):
-        if isinstance(r, Exception):
-            agent = ["sast", "secret_scanner", "sca"][i]
-            logger.error("Agent failed | agent=%s run=%s error=%s", agent, run_id, r)
-    logger.info("Phase 1 agents complete | run=%s", run_id)
+    # ── Step 2: SAST only (awaited — writes findings to DB before code review) ──
+    logger.info("SAST starting | run=%s", run_id)
+    try:
+        await run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
+    except Exception as exc:
+        logger.error("SAST failed | run=%s error=%s", run_id, exc)
+    logger.info("SAST complete | run=%s", run_id)
 
-    # ── Step 3: Code Review after SAST/SCA complete ──────────────────────────
-    logger.info("Code review starting automatically | run=%s", run_id)
+    # ── Step 3: Secrets + SCA + Code Review in parallel ───────────────────────
+    # Pre-insert code_review_status='running' BEFORE the gather so the UI
+    # immediately sees "running" when it polls — eliminates the race where
+    # node_enumerate_files hasn't written its first row yet and the UI gives up.
     try:
         async with _pool.acquire() as conn:
-            await conn.execute(
-                """
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS code_review_status (
-                    run_id TEXT PRIMARY KEY,
-                    status TEXT NOT NULL DEFAULT 'running',
-                    files_done INT NOT NULL DEFAULT 0,
-                    total_files INT NOT NULL DEFAULT 0,
-                    pct INT NOT NULL DEFAULT 0,
-                    current_file TEXT,
+                    run_id        TEXT PRIMARY KEY,
+                    status        TEXT NOT NULL DEFAULT 'running',
+                    files_done    INT  NOT NULL DEFAULT 0,
+                    total_files   INT  NOT NULL DEFAULT 0,
+                    pct           INT  NOT NULL DEFAULT 0,
+                    current_file  TEXT,
                     findings_count INT NOT NULL DEFAULT 0,
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                    updated_at    TIMESTAMPTZ DEFAULT NOW()
                 )
-                """
-            )
+            """)
             await conn.execute(
                 """
                 INSERT INTO code_review_status
@@ -285,10 +280,43 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
                 run_id,
             )
     except Exception as exc:
-        logger.warning("Could not pre-set code_review_status: %s", exc)
+        logger.warning("Could not pre-insert code_review_status: %s", exc)
 
-    await run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
-    logger.info("Code review complete | run=%s", run_id)
+    logger.info("Secrets + SCA + Code Review starting in parallel | run=%s", run_id)
+    results = await asyncio.gather(
+        run_secret_scan_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_sca_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        return_exceptions=True,
+    )
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            agent = ["secret_scanner", "sca", "code_review"][i]
+            logger.error("Agent failed | agent=%s run=%s error=%s", agent, run_id, r)
+    logger.info("Secrets + SCA + Code Review complete | run=%s", run_id)
+
+    # ── Step 4: FP Challenger ─────────────────────────────────────────────────
+    # Pre-insert fp_challenge_status='running' so the UI detects it immediately
+    # instead of waiting for node_load_findings to write the first row.
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO fp_challenge_status
+                    (run_id, status, findings_total, findings_done, pct, fp_found, current_finding, updated_at)
+                VALUES ($1, 'running', 0, 0, 0, 0, NULL, NOW())
+                ON CONFLICT (run_id) DO UPDATE SET
+                    status='running', findings_total=0, findings_done=0, pct=0,
+                    fp_found=0, current_finding=NULL, updated_at=NOW()
+                """,
+                run_id,
+            )
+    except Exception as exc:
+        logger.warning("Could not pre-insert fp_challenge_status: %s", exc)
+
+    logger.info("FP Challenger starting | run=%s", run_id)
+    await run_fp_challenger_workflow(run_id=run_id, deps=deps)
+    logger.info("FP Challenger complete | run=%s", run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1167,6 +1195,187 @@ async def get_code_review_findings(
 
 # ---------------------------------------------------------------------------
 # Code Graph API — serves code-review-graph visualization + stats
+# ---------------------------------------------------------------------------
+# FP Challenger endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/fp-challenge/{run_id}", status_code=202)
+async def trigger_fp_challenge(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    pool: asyncpg.Pool = Depends(get_pool),
+):
+    """
+    Trigger the FP Challenger Agent for a completed SAST scan.
+
+    The challenger re-runs Layer 1 + Layer 3 on all REAL/ESCALATED findings
+    with the full pgvector context now available.  Results are written to
+    fp_decisions and retrievable via GET /api/v1/fp-challenge/{run_id}.
+    """
+    wf_state = get_workflow_state()
+    run = await wf_state.get_run(run_id)
+    if not run:
+        raise HTTPException(404, f"Run not found: {run_id}")
+
+    async with pool.acquire() as conn:
+        # Idempotent: skip if already running
+        current_status = None
+        try:
+            current_status = await conn.fetchval(
+                "SELECT status FROM fp_challenge_status WHERE run_id = $1", run_id
+            )
+        except Exception:
+            pass
+
+        if current_status == "running":
+            return {"message": "FP challenge already running", "run_id": run_id, "status": "running"}
+
+        # Pre-write status row so progress polls see "running" immediately
+        try:
+            await conn.execute(
+                """
+                INSERT INTO fp_challenge_status
+                    (run_id, status, findings_total, findings_done, pct, fp_found, current_finding, updated_at)
+                VALUES ($1, 'running', 0, 0, 0, 0, NULL, NOW())
+                ON CONFLICT (run_id) DO UPDATE SET
+                    status='running', findings_total=0, findings_done=0, pct=0,
+                    fp_found=0, current_finding=NULL, updated_at=NOW()
+                """,
+                run_id,
+            )
+        except Exception as exc:
+            logger.warning("Could not pre-set fp_challenge_status: %s", exc)
+
+    deps = _build_workflow_deps()
+    background_tasks.add_task(run_fp_challenger_workflow, run_id=run_id, deps=deps)
+
+    logger.info("FP challenge triggered | run=%s", run_id)
+    return {
+        "run_id":  run_id,
+        "status":  "accepted",
+        "message": f"FP challenge started. Poll GET /api/v1/fp-challenge/{run_id}/progress for progress.",
+    }
+
+
+@app.get("/api/v1/fp-challenge/{run_id}/progress")
+async def get_fp_challenge_progress(
+    run_id: str,
+    pool: asyncpg.Pool = Depends(get_pool),
+):
+    """Live progress for the FP Challenger (findings_done, pct, fp_found)."""
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                "SELECT * FROM fp_challenge_status WHERE run_id = $1", run_id
+            )
+        except Exception:
+            row = None
+
+    if not row:
+        return {"run_id": run_id, "status": "not_started", "pct": 0, "findings_done": 0,
+                "findings_total": 0, "fp_found": 0, "current_finding": None}
+
+    return {
+        "run_id":          run_id,
+        "status":          row["status"],
+        "findings_done":   row["findings_done"],
+        "findings_total":  row["findings_total"],
+        "pct":             row["pct"],
+        "fp_found":        row["fp_found"],
+        "current_finding": row["current_finding"],
+        "updated_at":      row["updated_at"].isoformat() if row["updated_at"] else None,
+    }
+
+
+@app.get("/api/v1/fp-challenge/{run_id}")
+async def get_fp_challenge_results(
+    run_id: str,
+    verdict: Optional[str] = Query(None, description="REAL|FP|ESCALATED|DEADLOCK"),
+    pool: asyncpg.Pool = Depends(get_pool),
+):
+    """
+    Return FP decisions written by the challenger for this run.
+
+    Optionally filter by verdict (REAL, FP, ESCALATED, DEADLOCK).
+    Includes the finding details joined from findings_reports.
+    """
+    async with pool.acquire() as conn:
+        # Progress summary
+        try:
+            status_row = await conn.fetchrow(
+                "SELECT * FROM fp_challenge_status WHERE run_id = $1", run_id
+            )
+        except Exception:
+            status_row = None
+
+        # Decisions — join with findings for context
+        where = "fpd.run_id = $1"
+        params: list = [run_id]
+        if verdict:
+            where += " AND fpd.verdict = $2"
+            params.append(verdict.upper())
+
+        rows = await conn.fetch(
+            f"""
+            SELECT
+                fpd.id           AS decision_id,
+                fpd.finding_id,
+                fpd.verdict,
+                fpd.source,
+                fpd.confidence,
+                fpd.fp_category,
+                fpd.reasoning,
+                fpd.label_status,
+                fpd.created_at,
+                fr.rule_id,
+                fr.cwe_id,
+                fr.severity,
+                fr.file_path,
+                fr.line_start,
+                fr.message
+            FROM fp_decisions fpd
+            JOIN findings_reports fr ON fr.id = fpd.finding_id
+            WHERE {where}
+            ORDER BY fpd.created_at DESC
+            """,
+            *params,
+        )
+
+    decisions = [
+        {
+            "decision_id":  str(r["decision_id"]),
+            "finding_id":   str(r["finding_id"]),
+            "verdict":      r["verdict"],
+            "source":       r["source"],
+            "confidence":   r["confidence"],
+            "fp_category":  r["fp_category"],
+            "reasoning":    r["reasoning"],
+            "label_status": r["label_status"],
+            "created_at":   r["created_at"].isoformat() if r["created_at"] else None,
+            "rule_id":      r["rule_id"],
+            "cwe_id":       r["cwe_id"],
+            "severity":     r["severity"],
+            "file_path":    r["file_path"],
+            "line_start":   r["line_start"],
+            "message":      r["message"],
+        }
+        for r in rows
+    ]
+
+    fp_count   = sum(1 for d in decisions if d["verdict"] == "FP")
+    real_count = sum(1 for d in decisions if d["verdict"] == "REAL")
+
+    return {
+        "run_id":    run_id,
+        "count":     len(decisions),
+        "fp_count":  fp_count,
+        "real_count": real_count,
+        "status":    status_row["status"] if status_row else "not_started",
+        "fp_found":  status_row["fp_found"] if status_row else 0,
+        "decisions": decisions,
+    }
+
+
 # ---------------------------------------------------------------------------
 
 _GRAPH_DB   = Path(__file__).parent.parent / ".code-review-graph" / "graph.db"

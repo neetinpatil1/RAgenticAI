@@ -36,48 +36,63 @@ logger = logging.getLogger(__name__)
 _encoder = None
 
 
+_torch_available: Optional[bool] = None  # None = not checked yet
+
+
 def _get_encoder():
     """
     Lazy-load UniXcoder embedding model.
     Loaded once on first embed() call to avoid startup overhead.
 
     Air-gap: set MODELS_PATH and HF_DATASETS_OFFLINE=1 in .env.
+    Returns None if torch/transformers are not installed (graceful degradation).
     """
-    global _encoder
+    global _encoder, _torch_available
     if _encoder is None:
-        import os
-        from transformers import AutoTokenizer, AutoModel
-        import torch
+        try:
+            import os
+            from transformers import AutoTokenizer, AutoModel
+            import torch  # noqa: F401 — checked here, used in embed()
 
-        model_name = os.getenv("UNIXCODER_MODEL", "microsoft/unixcoder-base")
-        models_path = os.getenv("MODELS_PATH", None)
+            model_name = os.getenv("UNIXCODER_MODEL", "microsoft/unixcoder-base")
+            models_path = os.getenv("MODELS_PATH", None)
 
-        # Air-gap: use local files only if MODELS_PATH is set
-        kwargs = {"local_files_only": bool(models_path)}
-        if models_path:
-            model_name = f"{models_path}/unixcoder-base"
+            kwargs = {"local_files_only": bool(models_path)}
+            if models_path:
+                model_name = f"{models_path}/unixcoder-base"
 
-        logger.info("Loading UniXcoder embedding model from %s ...", model_name)
-        tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
-        model = AutoModel.from_pretrained(model_name, **kwargs)
-        model.eval()
-        _encoder = (tokenizer, model)
-        logger.info("UniXcoder loaded.")
+            logger.info("Loading UniXcoder embedding model from %s ...", model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+            model = AutoModel.from_pretrained(model_name, **kwargs)
+            model.eval()
+            _encoder = (tokenizer, model)
+            _torch_available = True
+            logger.info("UniXcoder loaded.")
+        except (ImportError, Exception) as exc:
+            _torch_available = False
+            logger.warning(
+                "UniXcoder not available (%s) — pgvector precedent retrieval disabled. "
+                "Layer 3 will run without similar-finding context.", exc
+            )
     return _encoder
 
 
-def embed(text: str) -> list[float]:
+def embed(text: str) -> Optional[list[float]]:
     """
     Encode text to a 768-dim embedding vector using UniXcoder.
 
+    Returns None if torch/transformers are not installed.
     Input: concatenated finding message + code snippet (max 512 tokens).
     Output: L2-normalised float list for pgvector cosine similarity.
     """
+    enc = _get_encoder()
+    if enc is None:
+        return None
+
     import torch
 
-    tokenizer, model = _get_encoder()
+    tokenizer, model = enc
 
-    # Truncate to 512 tokens (UniXcoder max)
     inputs = tokenizer(
         text,
         return_tensors="pt",
@@ -87,10 +102,8 @@ def embed(text: str) -> list[float]:
     )
     with torch.no_grad():
         outputs = model(**inputs)
-        # Mean pool over token embeddings → sentence vector
         embedding = outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
 
-    # L2-normalise for cosine similarity in pgvector
     norm = np.linalg.norm(embedding)
     if norm > 0:
         embedding = embedding / norm
@@ -124,22 +137,28 @@ class VectorMemory:
         The embedding is used by future similar-finding retrievals.
         """
         vector = embed(text)
+        if vector is None:
+            return  # torch not available — skip embedding storage
         vector_str = "[" + ",".join(str(v) for v in vector) + "]"
 
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO finding_embeddings
-                    (finding_id, fp_decision_id, embedding, label_status, confidence_weight)
-                VALUES ($1, $2, $3::vector, $4, $5)
-                ON CONFLICT DO NOTHING
-                """,
-                finding_id,
-                fp_decision_id,
-                vector_str,
-                label_status,
-                confidence_weight,
-            )
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO finding_embeddings
+                        (finding_id, fp_decision_id, embedding, label_status, confidence_weight)
+                    VALUES ($1, $2, $3::vector, $4, $5)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    finding_id,
+                    fp_decision_id,
+                    vector_str,
+                    label_status,
+                    confidence_weight,
+                )
+        except Exception as exc:
+            # pgvector not installed or table missing — skip silently
+            logger.warning("store_finding_embedding: skipped (%s)", exc)
 
     async def retrieve_similar(
         self,
@@ -160,6 +179,9 @@ class VectorMemory:
         Quarantined records are always excluded (label_status != 'QUARANTINED').
         """
         query_vector = embed(query_text)
+        if query_vector is None:
+            # torch not installed — skip vector search, return no precedents
+            return []
         vector_str = "[" + ",".join(str(v) for v in query_vector) + "]"
 
         # Build dynamic WHERE clause for optional CWE and framework filters
@@ -198,8 +220,13 @@ class VectorMemory:
             LIMIT ${len(params)}
         """
 
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(sql, *params)
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(sql, *params)
+        except Exception as exc:
+            # Table doesn't exist (pgvector not installed) or query failed — degrade gracefully
+            logger.warning("retrieve_similar: DB query failed (%s) — returning no precedents", exc)
+            return []
 
         results = [dict(r) for r in rows]
 
