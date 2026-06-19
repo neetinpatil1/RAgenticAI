@@ -241,16 +241,27 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     else:
         logger.warning("graph/build: already done, skipping rebuild for %s", root)
 
-    # ── Step 2: SAST only (awaited — writes findings to DB before code review) ──
-    logger.info("SAST starting | run=%s", run_id)
-    try:
-        await run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
-    except Exception as exc:
-        logger.error("SAST failed | run=%s error=%s", run_id, exc)
-    logger.info("SAST complete | run=%s", run_id)
+    # ── Step 2: SAST + Secrets + SCA in parallel ─────────────────────────────
+    # Secrets and SCA scan the codebase independently — they don't need SAST
+    # findings. Running them in parallel with SAST means they finish quickly
+    # regardless of how long SAST's inline FP pipeline takes (can be 10-20 min
+    # on large projects with many LLM calls per finding).
+    # Code Review is NOT included here — it needs SAST findings in the DB first.
+    logger.info("SAST + Secrets + SCA starting in parallel | run=%s", run_id)
+    sast_secret_sca = await asyncio.gather(
+        run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_secret_scan_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_sca_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        return_exceptions=True,
+    )
+    for i, r in enumerate(sast_secret_sca):
+        if isinstance(r, Exception):
+            agent = ["sast", "secret_scanner", "sca"][i]
+            logger.error("Agent failed | agent=%s run=%s error=%s", agent, run_id, r)
+    logger.info("SAST + Secrets + SCA complete | run=%s", run_id)
 
-    # ── Step 3: Secrets + SCA + Code Review in parallel ───────────────────────
-    # Pre-insert code_review_status='running' BEFORE the gather so the UI
+    # ── Step 3: Code Review (needs SAST findings in DB from step 2) ──────────
+    # Pre-insert code_review_status='running' BEFORE starting so the UI
     # immediately sees "running" when it polls — eliminates the race where
     # node_enumerate_files hasn't written its first row yet and the UI gives up.
     try:
@@ -281,18 +292,12 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     except Exception as exc:
         logger.warning("Could not pre-insert code_review_status: %s", exc)
 
-    logger.info("Secrets + SCA + Code Review starting in parallel | run=%s", run_id)
-    results = await asyncio.gather(
-        run_secret_scan_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
-        run_sca_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
-        run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
-        return_exceptions=True,
-    )
-    for i, r in enumerate(results):
-        if isinstance(r, Exception):
-            agent = ["secret_scanner", "sca", "code_review"][i]
-            logger.error("Agent failed | agent=%s run=%s error=%s", agent, run_id, r)
-    logger.info("Secrets + SCA + Code Review complete | run=%s", run_id)
+    logger.info("Code Review starting | run=%s", run_id)
+    try:
+        await run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
+    except Exception as exc:
+        logger.error("Code Review failed | run=%s error=%s", run_id, exc)
+    logger.info("Code Review complete | run=%s", run_id)
 
     # ── Step 4: FP Challenger ─────────────────────────────────────────────────
     # Pre-insert fp_challenge_status='running' so the UI detects it immediately

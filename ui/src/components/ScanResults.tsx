@@ -207,8 +207,8 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
         }
       } catch { /* not started yet */ }
 
-      loadSecrets();
-      loadDeps();
+      loadSecrets(0, s);
+      loadDeps(0, s);
       startGraphBuildPolling(s.scan_path);
 
       // Start code review polling immediately — same as secrets/SCA
@@ -267,12 +267,11 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       if (graphElapsedRef.current) { clearInterval(graphElapsedRef.current); graphElapsedRef.current = null; }
     }
 
-    async function loadSecrets(retries = 0) {
-      // Poll for up to 150s (30 × 5s). Do NOT check getScanStatus — scan status
-      // "completed" means SAST is done, not Secrets. Secrets runs in parallel with
-      // SCA and Code Review AFTER SAST, so scan status is always "completed" before
-      // Secrets has a chance to write findings.
-      const MAX_RETRIES = 30;
+    async function loadSecrets(retries = 0, scanState?: ScanStatus) {
+      // Secrets runs in parallel with SCA/Code Review AFTER SAST completes.
+      // For historical scans (completed_at > 5 min ago) all agents are long done —
+      // stop immediately if there are no findings instead of spinning for 150s.
+      const MAX_RETRIES = 30; // 30 × 5s = 150s absolute max for live scans
       try {
         const sec = await getSecretFindings(runId);
         if (sec.count > 0) {
@@ -281,27 +280,33 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setSecretScanning(false);
           return;
         }
+        // On first check: if this is a historical scan, stop immediately
+        if (retries === 0 && scanState?.completed_at) {
+          const ageMs = Date.now() - new Date(scanState.completed_at).getTime();
+          if (ageMs > 5 * 60 * 1000) { // > 5 min old → historical scan, agents done
+            setSecretScanning(false);
+            return;
+          }
+        }
         if (retries < MAX_RETRIES) {
-          setTimeout(() => loadSecrets(retries + 1), 5000);
+          setTimeout(() => loadSecrets(retries + 1, scanState), 5000);
         } else {
           setSecretScanning(false);  // give up — no secrets found
         }
       } catch {
         if (retries < MAX_RETRIES) {
-          setTimeout(() => loadSecrets(retries + 1), 5000);
+          setTimeout(() => loadSecrets(retries + 1, scanState), 5000);
         } else {
           setSecretScanning(false);
         }
       }
     }
 
-    async function loadDeps(retries = 0) {
-      // SCA runs after SAST. "completed" scan status only means SAST is done.
-      // Wait at least 10 retries (50s) before checking scan status, to give SCA
-      // time to finish. After that, if scan is completed AND SCA still has no
-      // findings, it genuinely found nothing — stop the spinner.
-      const MAX_RETRIES = 30; // 30 × 5s = 150s absolute max
-      const SCAN_STATUS_CHECK_AFTER = 10; // wait 50s before trusting scan status
+    async function loadDeps(retries = 0, scanState?: ScanStatus) {
+      // SCA runs in parallel with Secrets/Code Review AFTER SAST completes.
+      // For historical scans (completed_at > 5 min ago) all agents are long done —
+      // stop immediately if there are no findings instead of spinning for 150s.
+      const MAX_RETRIES = 30; // 30 × 5s = 150s absolute max for live scans
       try {
         const dep = await getDependencyFindings(runId);
         if (dep.count > 0) {
@@ -310,24 +315,22 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setDepScanning(false);
           return;
         }
-        // After 50s, check if scan is fully done — if so SCA found nothing
-        if (retries >= SCAN_STATUS_CHECK_AFTER) {
-          try {
-            const scanState = await getScanStatus(runId);
-            if (scanState.status === "completed" || scanState.status === "failed") {
-              setDepScanning(false);
-              return;
-            }
-          } catch { /* ignore */ }
+        // On first check: if this is a historical scan, stop immediately
+        if (retries === 0 && scanState?.completed_at) {
+          const ageMs = Date.now() - new Date(scanState.completed_at).getTime();
+          if (ageMs > 5 * 60 * 1000) { // > 5 min old → historical scan, agents done
+            setDepScanning(false);
+            return;
+          }
         }
         if (retries < MAX_RETRIES) {
-          setTimeout(() => loadDeps(retries + 1), 5000);
+          setTimeout(() => loadDeps(retries + 1, scanState), 5000);
         } else {
           setDepScanning(false);
         }
       } catch {
         if (retries < MAX_RETRIES) {
-          setTimeout(() => loadDeps(retries + 1), 5000);
+          setTimeout(() => loadDeps(retries + 1, scanState), 5000);
         } else {
           setDepScanning(false);
         }
