@@ -261,7 +261,9 @@ class SteadyTool:
             ns = {"m": "http://maven.apache.org/POM/4.0.0"}
 
             def _text(tag: str) -> str:
-                el = root_el.find(f"m:{tag}", ns) or root_el.find(tag)
+                el = root_el.find(f"m:{tag}", ns)
+                if el is None:
+                    el = root_el.find(tag)
                 return (el.text or "").strip() if el is not None else ""
 
             group_id    = _text("groupId")

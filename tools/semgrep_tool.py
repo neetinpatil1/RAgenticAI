@@ -161,7 +161,7 @@ class SemgrepTool:
             "-v", f"{rules_path}:/rules:ro", # mount rules read-only
             self.docker_image,
             "semgrep",
-            "--config", "file:///rules",     # air-gap: use local rules only
+            "--config", "/rules",              # air-gap: use local rules only
             "--json",                         # structured output
             "--no-git-ignore",               # scan all files
             "--timeout", str(self.timeout),
