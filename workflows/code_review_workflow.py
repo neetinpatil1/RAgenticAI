@@ -137,8 +137,8 @@ async def _call_llm(system_prompt: str, user_prompt: str, timeout: int | None = 
         "stream":  False,
         "options": {
             "temperature": 0.1,
-            "num_predict": 1024,  # enough for full JSON with multiple findings
-            "num_ctx":     3072,  # input (~1200 tokens) + output (1024) = ~2224; 3072 gives headroom
+            "num_predict": 2048,  # increased: 1024 was too small for files with 5+ findings
+            "num_ctx":     4096,  # input (~1200 tokens) + output (2048) = ~3248; 4096 gives headroom
             "num_gpu":     99,    # force all layers onto Metal GPU
             "num_thread":  8,     # CPU threads for prompt processing
         },

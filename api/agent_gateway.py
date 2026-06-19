@@ -546,6 +546,11 @@ async def get_scan_status(run_id: str, pool: asyncpg.Pool = Depends(get_pool)):
         "findings": {k: v for k, v in findings_dict.items() if k != "files_with_findings"},
         # Per-agent completion flags — set by each workflow's node_complete, independent of SAST
         "agents": {
+            # sast_done: the full SAST workflow is done — Semgrep AND the inline FP pipeline
+            # (L1 rules + L3 LLM verdicts on every finding) have both completed.
+            # node_finalize writes fp_summary to metadata as its very last action,
+            # so this is the correct completion signal for the SAST card.
+            "sast_done":         bool(meta.get("fp_summary")),
             "secrets_done":      bool((meta.get("secret_scan") or {}).get("completed_at")),
             "sca_done":          bool((meta.get("sca") or {}).get("completed_at")),
             "reachability_done": bool((meta.get("reachability") or {}).get("completed_at")),

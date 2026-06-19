@@ -45,6 +45,22 @@ class CodeReviewFinding(BaseModel):
     recommendation: str             = Field(..., description="Specific fix or mitigation")
     confidence:     float           = Field(0.5, ge=0.0, le=1.0, description="LLM confidence 0–1")
 
+    @field_validator("category", mode="before")
+    @classmethod
+    def coerce_category(cls, v: object) -> object:
+        # LLM sometimes returns "SECURITY|CODE_QUALITY" — take the first value only.
+        if isinstance(v, str) and "|" in v:
+            v = v.split("|")[0].strip()
+        return v
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def coerce_severity(cls, v: object) -> object:
+        # Guard against the same pipe-separated pattern on severity.
+        if isinstance(v, str) and "|" in v:
+            v = v.split("|")[0].strip()
+        return v
+
     @field_validator("title")
     @classmethod
     def truncate_title(cls, v: str) -> str:

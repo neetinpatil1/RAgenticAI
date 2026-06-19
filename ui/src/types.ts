@@ -57,6 +57,7 @@ export interface ScanStatus {
     total: number;
   };
   agents?: {
+    sast_done: boolean;
     secrets_done: boolean;
     sca_done: boolean;
     reachability_done: boolean;

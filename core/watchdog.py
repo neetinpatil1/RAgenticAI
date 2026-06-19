@@ -120,7 +120,23 @@ class Watchdog:
                 )
                 logger.info("Watchdog replayed job | id=%s", job["id"])
 
-        # --- 3. Clean up expired agent sessions ---
+        # --- 3. Clean up orphaned pending jobs for terminal runs ---
+        # Jobs left in 'pending' state for runs that have already completed/failed/killed
+        # will never be consumed. Mark them done so they stop firing SLA alerts.
+        async with self._pool.acquire() as conn:
+            cleaned = await conn.execute("""
+                UPDATE pg_jobs SET state='done', done_at=NOW()
+                WHERE state = 'pending'
+                  AND run_id IN (
+                      SELECT run_id FROM workflow_runs
+                      WHERE status IN ('completed', 'failed', 'killed')
+                  )
+            """)
+        count_cleaned = cleaned.split()[-1] if cleaned else "0"
+        if count_cleaned != "0":
+            logger.info("Watchdog: marked %s orphaned pending jobs as done", count_cleaned)
+
+        # --- 4. Clean up expired agent sessions ---
         async with self._pool.acquire() as conn:
             deleted = await conn.execute(
                 "DELETE FROM agent_sessions WHERE expires_at < NOW()"

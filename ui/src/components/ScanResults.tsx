@@ -199,12 +199,15 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       setStatus(s);
       setLoading(false);
 
-      // Mark SAST done immediately if the workflow_run is already completed
-      // (workflow_runs.state = 'completed' is set AFTER Semgrep + FP pipeline both finish)
+      // Mark SAST done immediately if:
+      //   a) workflow_runs.state is already "completed"/"failed" (full pipeline done), OR
+      //   b) agents.sast_done is already true (Semgrep wrote findings, pipeline still running)
+      // In case (b) findings are already loaded above; poll continues for other agents.
       if (s.status === "completed" || s.status === "failed") {
         setSastDone(true);
       } else {
-        // Poll until SAST workflow completes — updates findings count and files_scanned too
+        if (s.agents?.sast_done) setSastDone(true);
+        // Poll for remaining agents (Code Review, Reachability, FP, etc.)
         pollSastStatus();
       }
 
@@ -233,10 +236,10 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       pollCr();
     }
 
-    // Poll workflow_runs.state every 10s until SAST (including FP pipeline) is done.
-    // The response also carries per-agent completion flags (agents.secrets_done / sca_done)
-    // written by each workflow independently — so we can stop those spinners without
-    // waiting for the full SAST pipeline to finish.
+    // Poll workflow_runs.state every 10s.
+    // agents.sast_done  → Semgrep finished + findings in DB → mark SAST card done, load findings.
+    // agents.secrets_done / sca_done / reachability_done → stop those spinners independently.
+    // status === "completed" → full pipeline done, do one final refresh of all agents.
     async function pollSastStatus(retries = 0) {
       const MAX_RETRIES = 360; // 360 × 10s = 60 min
       if (retries >= MAX_RETRIES) {
@@ -249,9 +252,19 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
         const s = await getScanStatus(runId);
         setStatus(s);
 
+        // sast_done: Semgrep finished and wrote findings to DB (set by node_write_findings
+        // via scan_duration_ms in metadata). Mark the SAST card done and load findings
+        // immediately — don't wait for the full FP/Code Review/Reachability pipeline.
+        if (s.agents?.sast_done) {
+          setSastDone(true);
+          try {
+            const refreshed = await getFindings(runId);
+            setFindings(refreshed);
+          } catch { /* ignore */ }
+        }
+
         // Stop individual agent spinners as soon as their workflow writes completed_at
-        // to workflow_runs.metadata — happens within seconds of each agent finishing,
-        // independent of the SAST FP pipeline which can run for 30+ minutes.
+        // to workflow_runs.metadata — independent of SAST pipeline timing.
         if (s.agents?.secrets_done) setSecretScanning(false);
         if (s.agents?.sca_done)     setDepScanning(false);
         if (s.agents?.reachability_done) {
@@ -263,11 +276,13 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
         }
 
         if (s.status === "completed" || s.status === "failed") {
+          // Full pipeline done — do a final refresh of all agents to capture
+          // FP verdicts, late-arriving secrets/deps, and reachability verdicts.
           setSastDone(true);
-          // Refresh SAST findings — the final count is now accurate
-          const refreshed = await getFindings(runId);
-          setFindings(refreshed);
-          // Final check for any late-arriving secrets/deps findings
+          try {
+            const refreshed = await getFindings(runId);
+            setFindings(refreshed);
+          } catch { /* ignore */ }
           try {
             const sec = await getSecretFindings(runId);
             if (sec.count > 0) { setSecretFindings(sec.findings); setSecretSummary(sec.summary); }
@@ -279,8 +294,25 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           } catch { /* ignore */ }
           setDepScanning(false);
 
-          // Reachability runs in parallel and may still be in progress when SAST
-          // completes. Keep polling until reachability_done is also true.
+          // FP Challenger runs as step 4 (after Code Review + Reachability both finish).
+          // waitForFpToStart() may have timed out if Reachability ran longer than its
+          // wait window. Catch up here now that the full pipeline is confirmed done.
+          try {
+            const fp = await getFpChallengeProgress(runId);
+            if (fp.status === "completed") {
+              setFpTriggered(true);
+              setFpCompleted(true);
+              setFpLoading(false);
+              setFpProgress(fp);
+            } else if (fp.status === "failed") {
+              setFpTriggered(true);
+              setFpError("FP challenge failed. Check server logs.");
+              setFpLoading(false);
+            }
+          } catch { /* ignore */ }
+
+          // If reachability is still running after full pipeline reports completed,
+          // keep polling until reachability_done is also set.
           if (!s.agents?.reachability_done) {
             setTimeout(() => pollSastStatus(retries + 1), 10_000);
           }
@@ -457,7 +489,10 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   // FP Challenger progress polling
   // ---------------------------------------------------------------------------
   async function waitForFpToStart(retries = 0) {
-    const MAX_FP_WAIT = 18; // 18 × 10s = 3 minutes
+    // FP starts only after BOTH Code Review AND Reachability complete (gateway step 4).
+    // Reachability can run 5-30 min after Code Review finishes, so we must wait long enough.
+    // pollSastStatus also catches FP at scan completion as a safety net.
+    const MAX_FP_WAIT = 360; // 360 × 10s = 60 min
     if (retries >= MAX_FP_WAIT) return;
     try {
       const fp = await getFpChallengeProgress(runId);
@@ -473,7 +508,9 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     setFpTriggered(true);
     let stalePct = -1;
     let staleCount = 0;
-    const MAX_STALE_POLLS = 20;
+    // 40 × 6s = 4 min; gives enough runway for the initialization phase (findings_total=0)
+    // and the actual processing before declaring "stuck".
+    const MAX_STALE_POLLS = 40;
 
     const poll = async () => {
       try {
@@ -494,6 +531,9 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setFpLoading(false);
           return;
         }
+        // Skip stale counting while the job is still in the initialization phase
+        // (findings_total=0 means the row was pre-inserted but processing hasn't begun yet).
+        if (prog.findings_total === 0) { setTimeout(poll, 6000); return; }
         if (prog.pct === stalePct) { staleCount++; } else { stalePct = prog.pct; staleCount = 0; }
         if (staleCount >= MAX_STALE_POLLS) {
           setFpError(`FP challenge appears stuck at ${prog.pct}%. Check /tmp/app.log.`);
@@ -645,7 +685,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               count={depFindings.filter(f => f.reachability && f.reachability !== 'UNKNOWN').length}
               unit="analysed"
               skills={["Import Scan", "JAR Bytecode", "Transitive Chain", "LLM Verdict"]}
-              notStarted={!status?.agents?.sca_done}
+              notStarted={!crCompleted}
               active={activeTab === "deps"}
               onClick={() => setActiveTab("deps")}
             />

@@ -155,6 +155,8 @@ class SemgrepTool:
             "docker", "run",
             "--rm",
             "--read-only",
+            "--tmpfs", "/tmp",               # semgrep 1.166+ writes MCP cache to /tmp at startup
+            "--tmpfs", "/.semgrep",          # semgrep settings dir also needs to be writable
             "--network", "none",             # no network access during scan
             "--user", f"{uid}:{uid}",
             "-v", f"{scan_path}:/src:ro",   # mount code read-only
