@@ -89,10 +89,15 @@ async def run_reachability_workflow(
         # Eclipse Steady — call-graph override (Java only, optional)
         # Runs after heuristic pass. Overrides UNKNOWN/LIKELY verdicts where
         # Steady can provide a definitive call-chain-based result.
+        # Pass known CVE findings so Steady's bug database can be seeded on-the-fly
+        # (replaces the CIA/patch-lib-analyzer service requirement for basic matching).
         steady = SteadyTool()
         if await steady.is_available():
             logger.info("Reachability | Steady available — running call-graph analysis | run=%s", run_id)
-            steady_verdicts = await steady.analyze(scan_path=scan_path, run_id=run_id)
+            known_vulns = [dict(r) for r in rows]
+            steady_verdicts = await steady.analyze(
+                scan_path=scan_path, run_id=run_id, known_vulns=known_vulns
+            )
             if steady_verdicts:
                 await _apply_steady_verdicts(pool, run_id, steady_verdicts)
                 logger.info("Reachability | Steady applied %d verdicts | run=%s",

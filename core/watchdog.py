@@ -129,7 +129,7 @@ class Watchdog:
                 WHERE state = 'pending'
                   AND run_id IN (
                       SELECT run_id FROM workflow_runs
-                      WHERE status IN ('completed', 'failed', 'killed')
+                      WHERE state IN ('completed', 'failed', 'killed')
                   )
             """)
         count_cleaned = cleaned.split()[-1] if cleaned else "0"

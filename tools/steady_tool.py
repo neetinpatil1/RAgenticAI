@@ -116,9 +116,15 @@ class SteadyTool:
 
     async def analyze(
         self,
-        scan_path: str,
-        run_id: str,
+        scan_path:   str,
+        run_id:      str,
+        known_vulns: list[dict] | None = None,
     ) -> dict[str, SteadyVerdict]:
+        """
+        known_vulns: list of dicts from dependency_findings, each with keys:
+          vulnerability_id, package_name, installed_version, description
+          (used to seed Steady's bug database so vulndeps can return results)
+        """
         """
         Register the app (constructs + deps), then return per-CVE vulndep verdicts.
         Returns {} if Steady is unavailable or the bug database is empty.
@@ -160,7 +166,14 @@ class SteadyTool:
                 if not registered:
                     return {}
 
-                # Step 4: fetch per-CVE vulndep verdicts
+                # Step 4: seed Steady bug database with known CVEs so vulndeps can match
+                if known_vulns:
+                    await self._seed_vulnerabilities(client, known_vulns)
+                    # Small delay to allow Steady to commit seeded data before vulndeps query
+                    import asyncio as _aio
+                    await _aio.sleep(1)
+
+                # Step 5: fetch per-CVE vulndep verdicts
                 verdicts = await self._fetch_verdicts(client, group_id, artifact_id, version)
                 if verdicts:
                     logger.info("Steady | COMPLETE | app=%s verdicts=%d", app_key, len(verdicts))
@@ -176,6 +189,100 @@ class SteadyTool:
         except Exception as exc:
             logger.warning("Steady | analysis error: %s", exc)
             return {}
+
+    # -------------------------------------------------------------------------
+    # CVE / bug database seeding
+    # -------------------------------------------------------------------------
+
+    async def _seed_vulnerabilities(
+        self,
+        client:      httpx.AsyncClient,
+        known_vulns: list[dict],
+    ) -> None:
+        """
+        Seed Steady's bug database with CVEs from our dependency_findings table.
+
+        Without the CIA (Code Impact Analyzer) service, Steady's bug database is empty
+        and /vulndeps always returns []. This method populates it directly using:
+          1. POST /backend/bugs — create the bug entry (maturity=READY, origin=PUBLIC)
+          2. PUT  /backend/bugs/{id}/affectedLibIds?source=MANUAL — mark which library
+             version is affected (so vulndeps cross-referencing works)
+
+        The seeder is idempotent: 409 on bug creation = already exists, skip.
+        Only seeds bugs that aren't already in the database.
+        """
+        # Deduplicate: one bug entry per vulnerability_id × package coordinates
+        seen_bugs:    set[str] = set()
+        seen_affects: set[str] = set()
+
+        for row in known_vulns:
+            vuln_id  = row.get("vulnerability_id") or ""
+            pkg_name = row.get("package_name") or ""   # e.g. "dom4j:dom4j"
+            version  = row.get("installed_version") or ""
+            desc     = row.get("description") or f"Vulnerability in {pkg_name}"
+
+            if not vuln_id or not pkg_name:
+                continue
+
+            # Parse group:artifact from package_name
+            parts = pkg_name.split(":", 1)
+            if len(parts) != 2:
+                continue
+            group, artifact = parts[0], parts[1]
+
+            # --- Step 1: create bug entry ---
+            if vuln_id not in seen_bugs:
+                seen_bugs.add(vuln_id)
+                try:
+                    r = await client.post(
+                        "/backend/bugs",
+                        json={
+                            "bugId":       vuln_id,
+                            "maturity":    "READY",
+                            "origin":      "PUBLIC",
+                            "description": desc[:512],
+                            "constructChanges": [],
+                        },
+                        headers=self._auth_headers(),
+                    )
+                    if r.status_code == 201:
+                        logger.debug("Steady | seeded bug %s", vuln_id)
+                    elif r.status_code == 409:
+                        logger.debug("Steady | bug %s already exists", vuln_id)
+                    else:
+                        logger.warning("Steady | seed bug %s failed: %d", vuln_id, r.status_code)
+                        continue   # skip affectedLibIds if bug creation failed
+                except Exception as exc:
+                    logger.warning("Steady | seed bug error %s: %s", vuln_id, exc)
+                    continue
+
+            # --- Step 2: mark affected library version ---
+            affect_key = f"{vuln_id}|{group}:{artifact}:{version}"
+            if affect_key in seen_affects or not version:
+                continue
+            seen_affects.add(affect_key)
+            try:
+                r = await client.put(
+                    f"/backend/bugs/{vuln_id}/affectedLibIds",
+                    params={"source": "MANUAL"},
+                    json=[{
+                        "libraryId": {"group": group, "artifact": artifact, "version": version},
+                        "affected":  True,
+                        "source":    "MANUAL",
+                    }],
+                    headers=self._auth_headers(),
+                )
+                if r.status_code in (200, 201):
+                    logger.debug("Steady | seeded affectedLib %s → %s:%s:%s",
+                                 vuln_id, group, artifact, version)
+                else:
+                    logger.warning("Steady | affectedLib failed %s: %d %s",
+                                   vuln_id, r.status_code, r.text[:100])
+            except Exception as exc:
+                logger.warning("Steady | affectedLib error: %s", exc)
+
+        logger.info("Steady | seeded %d bugs / %d affected-lib entries",
+                    len(seen_bugs), len(seen_affects))
 
     # -------------------------------------------------------------------------
     # Library pre-creation
@@ -260,7 +367,8 @@ class SteadyTool:
           - Body field "dependencies" (NOT "libs") — from Application.java bytecode
           - "constructIds" must have ≥1 entry — else updateLibraries() NPEs on null.iterator()
           - LibraryId uses "group" (NOT "mvnGroup") — @JsonProperty("group") on mvnGroup field
-          - 201 = created, 409 = already exists (both are success)
+          - 409 = already exists. If an existing app has 0 deps (e.g. from a previous
+            broken registration), we DELETE and re-register so that deps are populated.
         """
         payload = {
             "group":        group_id,
@@ -274,12 +382,43 @@ class SteadyTool:
             json=payload,
             headers=self._auth_headers(),
         )
-        if r.status_code in (200, 201, 409):
+
+        if r.status_code in (200, 201):
             logger.info(
                 "Steady | app registered | status=%d constructs=%d deps=%d",
                 r.status_code, len(construct_ids), len(deps),
             )
             return True
+
+        if r.status_code == 409:
+            # App already exists — use PUT to update constructs and deps in place.
+            # DELETE /apps/{g}/{a}/{v} is not supported (405) in Steady 3.2.5;
+            # PUT /apps/{g}/{a}/{v} with the full body is the correct update path.
+            logger.info(
+                "Steady | app already exists (409) — updating via PUT | deps=%d",
+                len(deps),
+            )
+            try:
+                put_r = await client.put(
+                    f"/backend/apps/{group_id}/{artifact_id}/{version}",
+                    json=payload,
+                    headers=self._auth_headers(),
+                )
+                if put_r.status_code in (200, 201):
+                    logger.info(
+                        "Steady | app updated via PUT | status=%d constructs=%d deps=%d",
+                        put_r.status_code, len(construct_ids), len(deps),
+                    )
+                    return True
+                logger.warning(
+                    "Steady | PUT update failed: %d %s",
+                    put_r.status_code, put_r.text[:200],
+                )
+                # Fall back: assume existing app is usable as-is
+                return True
+            except Exception as exc:
+                logger.warning("Steady | PUT update error: %s", exc)
+                return True   # Best-effort: assume existing app is usable
 
         logger.warning(
             "Steady | register app failed: %d %s | constructs=%d deps=%d",
@@ -304,22 +443,52 @@ class SteadyTool:
         try:
             r = await client.get(url, timeout=60, headers=self._auth_headers())
             if r.status_code != 200:
+                logger.debug("Steady | vulndeps status=%d for %s/%s/%s",
+                             r.status_code, group_id, artifact_id, version)
                 return verdicts
             data = r.json()
+            logger.debug("Steady | vulndeps raw response (first 500 chars): %s",
+                         str(data)[:500])
             for item in (data if isinstance(data, list) else data.get("vulnDeps", [])):
-                vuln_id   = item.get("bugId") or item.get("cve") or ""
+                # Steady 3.2.5 nests the bug under item["bug"]["bugId"] (not flat).
+                bug_obj   = item.get("bug") or {}
+                vuln_id   = (
+                    bug_obj.get("bugId") or bug_obj.get("cveId")
+                    or item.get("bugId") or item.get("cve")
+                    or ""
+                )
                 pkg       = item.get("dep", {}).get("lib", {}).get("libraryId", {})
-                # LibraryId response also uses "group" key
+                # LibraryId response uses "group" (not "mvnGroup")
                 grp       = pkg.get("group") or pkg.get("mvnGroup") or ""
                 pkg_name  = f"{grp}:{pkg.get('artifact','')}" if pkg else ""
-                reach_raw = (item.get("reachable") or "").upper()
 
-                verdict_str = {
-                    "TRUE":        "REACHABLE",
-                    "FALSE":       "NOT_REACHABLE",
-                    "UNKNOWN":     "UNKNOWN",
-                    "POTENTIALLY": "LIKELY_REACHABLE",
-                }.get(reach_raw, "UNKNOWN")
+                # Steady 3.2.5 returns reachable as an integer:
+                #   1  = confirmed reachable (call-graph traced)
+                #  -1  = confirmed NOT reachable
+                #   0  = unknown (no CIA service / call-graph analysis not run)
+                # Older API versions used string enum: "TRUE" / "FALSE" / "POTENTIALLY"
+                reach_raw = item.get("reachable")
+                reach_str = item.get("reachability") or ""
+
+                if reach_raw == 1 or str(reach_raw).upper() in ("TRUE", "POTENTIALLY"):
+                    verdict_str = "REACHABLE"
+                    confidence  = 0.95
+                elif reach_raw == -1 or str(reach_raw).upper() == "FALSE":
+                    verdict_str = "NOT_REACHABLE"
+                    confidence  = 0.95
+                elif str(reach_str).upper() == "POTENTIALLY":
+                    verdict_str = "LIKELY_REACHABLE"
+                    confidence  = 0.70
+                else:
+                    # reachable == 0: unknown (no CIA), but affected_version is confirmed.
+                    # Use LIKELY_REACHABLE when affected_version is confirmed (=1).
+                    affected = item.get("affected_version") or item.get("affectedVersion") or 0
+                    if affected == 1:
+                        verdict_str = "LIKELY_REACHABLE"
+                        confidence  = 0.60
+                    else:
+                        verdict_str = "UNKNOWN"
+                        confidence  = 0.0
 
                 call_chain = None
                 path = item.get("constructPath") or item.get("callPath")
@@ -327,8 +496,6 @@ class SteadyTool:
                     call_chain = " → ".join(c.get("fqn", str(c)) for c in path)
                 elif path and isinstance(path, str):
                     call_chain = path
-
-                confidence = 0.95 if verdict_str in ("REACHABLE", "NOT_REACHABLE") else 0.6
 
                 if vuln_id:
                     verdicts[vuln_id] = SteadyVerdict(
@@ -426,12 +593,16 @@ class SteadyTool:
         if not pom.exists():
             return None
         try:
-            tree   = ET.parse(pom)
+            tree    = ET.parse(pom)
             root_el = tree.getroot()
-            ns     = {"m": "http://maven.apache.org/POM/4.0.0"}
+            ns      = {"m": "http://maven.apache.org/POM/4.0.0"}
 
             def _text(tag: str) -> str:
-                el = root_el.find(f"m:{tag}", ns) or root_el.find(tag)
+                # NOTE: use `is not None` not boolean truthiness — an Element with
+                # only text content (no child elements) is falsy in Python 3.9 ET.
+                el = root_el.find(f"m:{tag}", ns)
+                if el is None:
+                    el = root_el.find(tag)
                 return (el.text or "").strip() if el is not None else ""
 
             group_id    = _text("groupId")
@@ -439,9 +610,13 @@ class SteadyTool:
             version     = _text("version")
 
             if not group_id:
-                parent = root_el.find("m:parent", ns) or root_el.find("parent")
+                parent = root_el.find("m:parent", ns)
+                if parent is None:
+                    parent = root_el.find("parent")
                 if parent is not None:
-                    g = parent.find("m:groupId", ns) or parent.find("groupId")
+                    g = parent.find("m:groupId", ns)
+                    if g is None:
+                        g = parent.find("groupId")
                     if g is not None and g.text:
                         group_id = g.text.strip()
 
@@ -467,31 +642,36 @@ class SteadyTool:
         if not pom.exists():
             return []
         try:
-            tree   = ET.parse(pom)
+            tree    = ET.parse(pom)
             root_el = tree.getroot()
-            ns     = {"m": "http://maven.apache.org/POM/4.0.0"}
+            ns      = {"m": "http://maven.apache.org/POM/4.0.0"}
             deps: list[dict] = []
 
-            dep_els = root_el.findall(".//m:dependency", ns) or root_el.findall(".//dependency")
+            dep_els = root_el.findall(".//m:dependency", ns)
+            if not dep_els:
+                dep_els = root_el.findall(".//dependency")
+
             for dep in dep_els:
-                def _t(tag: str, _dep=dep) -> str:
-                    el = _dep.find(f"m:{tag}", ns) or _dep.find(tag)
+                def _t(tag: str, _dep=dep, _ns=ns) -> str:
+                    # Use `is not None` — ET elements with only text are falsy in Py 3.9
+                    el = _dep.find(f"m:{tag}", _ns)
+                    if el is None:
+                        el = _dep.find(tag)
                     return (el.text or "").strip() if el is not None else ""
 
                 g, a, v = _t("groupId"), _t("artifactId"), _t("version")
-                scope    = (_t("scope") or "COMPILE").upper()
+                scope    = _t("scope") or "COMPILE"
                 optional = _t("optional").lower() == "true"
 
                 if not (g and a and v) or v.startswith("${"):
                     continue
 
-                # Try real SHA1 from local Maven cache; fall back to synthetic
                 digest = self._get_jar_digest(g, a, v)
 
                 deps.append({
                     "libraryId": {"group": g, "artifact": a, "version": v},
                     "digest":    digest,
-                    "scope":     scope,
+                    "scope":     scope.upper(),
                     "transitive": False,
                     "optional":  optional,
                 })
