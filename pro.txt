@@ -1,0 +1,5 @@
+ - /Users/nitinpatil/sampleProjects/WebGoat
+  - /Users/nitinpatil/sampleProjects/JavaVulnerableLab
+  - /Users/nitinpatil/sampleProjects/AltoroJ
+  - /Users/nitinpatil/sampleProjects/SecurityShepherd
+  - /Users/nitinpatil/sampleProjects/spring-petclinic

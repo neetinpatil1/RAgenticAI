@@ -55,6 +55,7 @@ from workflows.code_review_workflow import run_code_review_workflow
 from workflows.secret_scan_workflow import run_secret_scan_workflow
 from workflows.sca_workflow import run_sca_workflow
 from workflows.fp_challenger_workflow import run_fp_challenger_workflow
+from workflows.reachability_workflow import run_reachability_workflow
 
 logging.basicConfig(
     level=logging.INFO,
@@ -305,14 +306,16 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     except Exception as exc:
         logger.warning("Could not pre-insert code_review_status: %s", exc)
 
-    logger.info("[STEP 3/4] Code Review: STARTING | run=%s", run_id)
-    try:
-        await run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
-    except Exception as exc:
-        logger.error("[STEP 3/4] Code Review: FAILED | run=%s error=%s", run_id, exc)
-    logger.info("[STEP 3/4] Code Review: COMPLETE | run=%s elapsed=%.1fs", run_id, _t.time() - _t3)
+    logger.info("[STEP 3/5] Code Review + Reachability: STARTING in parallel | run=%s", run_id)
+    await asyncio.gather(
+        _run_code_review_step(run_id, scan_path, deps),
+        _run_reachability_step(run_id, scan_path, deps["pool"]),
+        return_exceptions=True,
+    )
+    logger.info("[STEP 3/5] Code Review + Reachability: COMPLETE | run=%s elapsed=%.1fs",
+                run_id, _t.time() - _t3)
 
-    # ── Step 4: FP Challenger ─────────────────────────────────────────────────
+    # ── Step 4/5: FP Challenger ───────────────────────────────────────────────
     # Runs ONLY after Code Review completes.
     # Pre-insert fp_challenge_status='running' so the UI detects it immediately.
     _t4 = _t.time()
@@ -332,14 +335,37 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     except Exception as exc:
         logger.warning("Could not pre-insert fp_challenge_status: %s", exc)
 
-    logger.info("[STEP 4/4] FP Challenger: STARTING | run=%s", run_id)
+    logger.info("[STEP 4/5] FP Challenger: STARTING | run=%s", run_id)
     await run_fp_challenger_workflow(run_id=run_id, deps=deps)
-    logger.info("[STEP 4/4] FP Challenger: COMPLETE | run=%s elapsed=%.1fs", run_id, _t.time() - _t4)
+    logger.info("[STEP 4/5] FP Challenger: COMPLETE | run=%s elapsed=%.1fs", run_id, _t.time() - _t4)
 
     logger.info("=" * 70)
     logger.info("SCAN ORCHESTRATION COMPLETE | run=%s total_elapsed=%.1fs",
                 run_id, _t.time() - _wall_start)
     logger.info("=" * 70)
+
+
+async def _run_code_review_step(run_id: str, scan_path: str, deps: dict) -> None:
+    try:
+        await run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
+    except Exception as exc:
+        logger.error("Code Review: FAILED | run=%s error=%s", run_id, exc)
+
+
+async def _run_reachability_step(run_id: str, scan_path: str, pool: asyncpg.Pool) -> None:
+    try:
+        # Only run if there are CVE findings
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM dependency_findings WHERE run_id = $1", run_id
+            )
+        if count and count > 0:
+            logger.info("Reachability step: %d CVEs found — starting analysis | run=%s", count, run_id)
+            await run_reachability_workflow(run_id=run_id, scan_path=scan_path, pool=pool)
+        else:
+            logger.info("Reachability step: no CVEs — skipping | run=%s", run_id)
+    except Exception as exc:
+        logger.error("Reachability step: FAILED | run=%s error=%s", run_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -480,8 +506,9 @@ async def get_scan_status(run_id: str, pool: asyncpg.Pool = Depends(get_pool)):
         "findings": {k: v for k, v in findings_dict.items() if k != "files_with_findings"},
         # Per-agent completion flags — set by each workflow's node_complete, independent of SAST
         "agents": {
-            "secrets_done": bool((meta.get("secret_scan") or {}).get("completed_at")),
-            "sca_done":     bool((meta.get("sca") or {}).get("completed_at")),
+            "secrets_done":      bool((meta.get("secret_scan") or {}).get("completed_at")),
+            "sca_done":          bool((meta.get("sca") or {}).get("completed_at")),
+            "reachability_done": bool((meta.get("reachability") or {}).get("completed_at")),
         },
     }
 
@@ -996,7 +1023,9 @@ async def get_dependency_findings(
         rows = await conn.fetch(
             f"""
             SELECT id, run_id, package_name, installed_version, fixed_version,
-                   vulnerability_id, severity, description, ecosystem, file_path, created_at
+                   vulnerability_id, severity, description, ecosystem, file_path,
+                   reachability, reach_evidence, reach_confidence, reach_source,
+                   affected_classes, created_at
             FROM dependency_findings
             {where}
             ORDER BY

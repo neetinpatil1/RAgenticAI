@@ -100,9 +100,11 @@ Connected via Thunderbolt 4 bridge (40 Gbps) or 2.5GbE switch.
 | Phase | Agent | Purpose |
 |---|---|---|
 | 0 | SAST Agent | Semgrep scan + LLM triage |
-| 1 | SCA Agent | Grype/Trivy CVE scan |
-| 1 | Code Review Agent | Correlates SAST + SCA, enriches with ADR context |
-| 1 | FP Challenger Agent | 3-layer FP pipeline |
+| 1 | SCA Agent | pip-audit + npm audit + OSV API CVE scan |
+| 1 | Secret Scanner Agent | Regex + Shannon entropy secret detection |
+| 1 | Code Review Agent | Correlates SAST + SCA, enriches with graph context |
+| 1 | FP Challenger Agent | 3-layer FP pipeline (L1 YAML → L3 LLM) |
+| 1 | CVE Reachability Analyzer | Proves whether a CVE is reachable from app code — direct import, transitive (parent→child lib), call chain evidence. Multi-ecosystem: Maven, npm, Python, Gradle. |
 | 2 | DAST Agent | ZAP API/OpenAPI scanning |
 | 2 | K8s Security Agent | Kubescape + Checkov |
 | 2 | Arch Review Agent | Threat modelling, structured threat list |
@@ -255,10 +257,17 @@ WATCHDOG (5-min scheduled job):
 - [x] Graph API endpoints: `POST /api/v1/graph/build`, `GET /api/v1/graph/build/status`, `GET /api/v1/graph/status`, `GET /api/v1/graph/visualization`
 - [x] Graph visualization — 3 modes: **file** (default, shows file names), **full** (classes & methods), **community** (aggregated clusters); mode selectable from UI buttons
 - [x] LLM tuning — `num_ctx=3072`, `num_predict=1024`, timeout 120s, confidence threshold 0.3
-- [ ] FP Challenger Agent (full 3-layer pipeline)
+- [x] FP Challenger Agent (full 3-layer pipeline — L1 YAML → L3 LLM, auto-enqueued from SAST)
+- [x] Secret Scanner Agent (custom regex + Shannon entropy, 22 patterns, LangGraph workflow)
+- [ ] CVE Reachability Analyzer — proves/disproves exploitability of SCA findings
+  - Phase A: CVE enrichment (OSV `affected_functions` + LLM extraction + known-CVE map)
+  - Phase B: Multi-ecosystem dep tree (pom.xml, package-lock.json, requirements.txt, build.gradle)
+  - Phase C: Library internal call analysis (javatools for Java bytecode, ast for Python, regex for JS)
+  - Phase D: Chain assembler (App → Parent lib → Child vulnerable method, max 5 hops)
+  - Phase E: LLM verdict for UNKNOWN (reflection, AOP, dynamic imports)
+  - Phase F: Storage (new DB columns), API (reachability fields in deps endpoint), UI (badge + evidence panel)
 - [ ] PG job queue SKIP LOCKED (Kafka deferred)
 - [ ] Layer 2 CodeBERT classifier (segment-gated)
-- [ ] Secrets Agent (Trufflehog/Gitleaks — status card exists in UI, backend TBD)
 - [ ] Gitea for prompts/rules versioning
 - [ ] HashiCorp Vault for secrets
 - [ ] Git repo input support
@@ -440,6 +449,20 @@ WATCHDOG (5-min scheduled job):
 
 ---
 
+## 13b. Design Decisions Log
+
+| Date | Decision | Reason |
+|---|---|---|
+| Jun 2026 | CVE Reachability Analyzer uses `javatools` (pip) for Java bytecode, not `javap` subprocess | `javap` requires JDK on scanner machine — not guaranteed in CI/Docker. `javatools` is pure Python, works anywhere. Only 1 new pip dependency for the entire feature. |
+| Jun 2026 | Reachability triggered after SCA completes, not during | Needs CVE list + package versions first. Runs as background task — does not block code review or UI showing partial results. |
+| Jun 2026 | Reachability chain traversal capped at 5 hops | Beyond 5 hops: circular dep risk, diminishing accuracy. Mark UNKNOWN and hand off to LLM verdict instead. |
+| Jun 2026 | LLM used only for UNKNOWN reachability cases (reflection, AOP, dynamic imports) | Static analysis (import scan + bytecode) handles ~80% of cases deterministically. LLM reserved for ambiguous cases only — avoids hallucination risk on clear-cut paths. |
+| Jun 2026 | FP pipeline + Code Review switched to llama3.2:3b for testing | qwen2.5-coder:14b and llama3.2:3b evict each other from VRAM. Switching both to llama3.2:3b eliminates model-swap overhead during testing. Switch back to qwen14B for production accuracy. |
+| Jun 2026 | SCA uses pip-audit + npm audit + OSV API, not Grype/Trivy | Avoids Docker for SCA; pip-audit and OSV API give same CVE coverage for Python/Node/Maven without container overhead. |
+| Jun 2026 | Secret scanner is custom Python (regex + Shannon entropy) — not a third-party tool | No third-party scanner had the right balance of zero-FP on placeholder values and high entropy detection. |
+
+---
+
 ## 14. Trade-off Register
 
 | # | Decision | What You Give Up | What You Get |
@@ -526,13 +549,28 @@ RAgenticAI/                        # Actual repo root (as of Phase 1, June 2026)
 
 ---
 
-## Current Focus (as of 18 June 2026)
+## Current Focus (as of 19 June 2026)
 
-Working on branch `phase1`. Core parallel-agent scan pipeline is complete and stable. Next up:
+Working on branch `phase1`. Core parallel-agent scan pipeline is complete and stable.
 
-1. **Secrets Agent** — wire backend (Trufflehog/Gitleaks) to existing UI status card
-2. **FP Challenger Agent** — 3-layer FP pipeline (Layer 1 YAML → Layer 3 LLM arbitration)
-3. **`/console/findings`** review queue UI page
-4. **Labeling flywheel** — accumulate 200 labeled findings to hit Phase 0 gate (≥75% agreement)
+### Completed Since Last Update
+- ✅ Secret Scanner Agent (custom Python — regex + Shannon entropy, 22 patterns)
+- ✅ FP Challenger Agent (L1 YAML → L3 LLM, auto-enqueued from SAST workflow)
+- ✅ FP pipeline switched to `llama3.2:3b` (format:json fix, Semaphore(2) concurrency)
+- ✅ Code Review switched to `llama3.2:3b` + timeout from config (was hardcoded 120s → ReadTimeout)
+- ✅ Secrets/SCA spinner fix — `agents.secrets_done`/`sca_done` flags in scan status API
+- ✅ `files_scanned` now shows immediately after Semgrep (early metadata write in `node_write_findings`)
+- ✅ SAST card only shows "done" after full FP pipeline completes (`pollSastStatus` polls `workflow_runs.state`)
 
-*Last updated: 18 June 2026 | Branch: phase1 | Source: SSDLC_Design_v3.2.docx*
+### Next Up
+1. **CVE Reachability Analyzer** (1.9.1 → 1.9.25) — prove/disprove exploitability of SCA CVE findings
+   - Phase A: CVE enrichment (OSV + LLM extraction)
+   - Phase B: Multi-ecosystem dep tree
+   - Phase C: Library internal call analysis (javatools for Java, ast for Python, regex for JS)
+   - Phase D: App → Parent → Child chain assembly
+   - Phase E: LLM verdict for UNKNOWN cases
+   - Phase F: DB + API + UI (reachability badge + evidence panel)
+2. **`/console/findings`** review queue UI page
+3. **Labeling flywheel** — accumulate 200 labeled findings for Phase 0 gate (≥75% agreement)
+
+*Last updated: 19 June 2026 | Branch: phase1 | Source: SSDLC_Design_v3.2.docx*

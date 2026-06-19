@@ -241,4 +241,13 @@ async def _create_dependency_findings_table(pool: asyncpg.Pool) -> None:
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_dep_findings_run ON dependency_findings(run_id)"
         )
+        # Reachability columns — added in Phase 1.9 (idempotent)
+        for col_sql in [
+            "ALTER TABLE dependency_findings ADD COLUMN IF NOT EXISTS affected_classes TEXT",
+            "ALTER TABLE dependency_findings ADD COLUMN IF NOT EXISTS reachability TEXT",
+            "ALTER TABLE dependency_findings ADD COLUMN IF NOT EXISTS reach_evidence TEXT",
+            "ALTER TABLE dependency_findings ADD COLUMN IF NOT EXISTS reach_confidence FLOAT",
+            "ALTER TABLE dependency_findings ADD COLUMN IF NOT EXISTS reach_source TEXT",
+        ]:
+            await conn.execute(col_sql)
     logger.info("dependency_findings table ready")

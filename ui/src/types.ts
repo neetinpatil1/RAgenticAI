@@ -59,6 +59,7 @@ export interface ScanStatus {
   agents?: {
     secrets_done: boolean;
     sca_done: boolean;
+    reachability_done: boolean;
   };
 }
 
@@ -148,6 +149,11 @@ export interface DependencyFinding {
   ecosystem: string;
   file_path: string | null;
   created_at: string;
+  reachability?:      string | null;   // REACHABLE | NOT_REACHABLE | UNKNOWN | LIKELY_REACHABLE | LIKELY_NOT_REACHABLE
+  reach_evidence?:    string | null;
+  reach_confidence?:  number | null;
+  reach_source?:      string | null;
+  affected_classes?:  string | null;   // JSON string of string[]
 }
 
 export interface DependencySummary {

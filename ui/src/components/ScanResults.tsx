@@ -254,6 +254,13 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
         // independent of the SAST FP pipeline which can run for 30+ minutes.
         if (s.agents?.secrets_done) setSecretScanning(false);
         if (s.agents?.sca_done)     setDepScanning(false);
+        if (s.agents?.reachability_done) {
+          // Refresh deps to pick up reachability verdicts
+          try {
+            const dep = await getDependencyFindings(runId);
+            if (dep.count > 0) { setDepFindings(dep.findings); setDepSummary(dep.summary); }
+          } catch { /* ignore */ }
+        }
 
         if (s.status === "completed" || s.status === "failed") {
           setSastDone(true);
@@ -582,7 +589,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             }
           </p>
           <p className="text-xs text-gray-600 mb-4">Click an agent to view its findings</p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
 
             {/* SAST */}
             <AgentStatusCard
@@ -619,6 +626,20 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               count={depFindings.length}
               unit="CVEs"
               skills={["Known CVEs", "Outdated Packages", "License Risks", "Supply Chain"]}
+              active={activeTab === "deps"}
+              onClick={() => setActiveTab("deps")}
+            />
+
+            {/* Reachability */}
+            <AgentStatusCard
+              label="Reachability"
+              icon={<Network className="w-4 h-4" />}
+              color="text-cyan-400"
+              done={!!status?.agents?.reachability_done}
+              count={depFindings.filter(f => f.reachability && f.reachability !== 'UNKNOWN').length}
+              unit="analysed"
+              skills={["Import Scan", "JAR Bytecode", "Transitive Chain", "LLM Verdict"]}
+              notStarted={!status?.agents?.sca_done}
               active={activeTab === "deps"}
               onClick={() => setActiveTab("deps")}
             />
@@ -1161,6 +1182,20 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                             <span className="text-sm font-medium text-white font-mono">{f.package_name}</span>
                             <span className="text-xs text-gray-500 bg-gray-800 border border-gray-700 px-1.5 py-0.5 rounded">{f.ecosystem}</span>
                             <span className="text-xs text-red-400 bg-red-900/20 border border-red-700/40 px-1.5 py-0.5 rounded">{f.vulnerability_id}</span>
+                            {f.reachability && (
+                              <span className={`text-xs font-medium px-1.5 py-0.5 rounded border flex items-center gap-1 ${
+                                f.reachability === 'REACHABLE' || f.reachability === 'LIKELY_REACHABLE'
+                                  ? 'text-red-300 bg-red-500/10 border-red-500/30'
+                                  : f.reachability === 'NOT_REACHABLE' || f.reachability === 'LIKELY_NOT_REACHABLE'
+                                  ? 'text-green-300 bg-green-500/10 border-green-500/30'
+                                  : 'text-gray-400 bg-gray-500/10 border-gray-500/30'
+                              }`}>
+                                {f.reachability === 'REACHABLE' ? '⚡ Reachable' :
+                                 f.reachability === 'NOT_REACHABLE' ? '✓ Not Reachable' :
+                                 f.reachability === 'LIKELY_REACHABLE' ? '~ Likely Reachable' :
+                                 f.reachability === 'LIKELY_NOT_REACHABLE' ? '~ Likely Safe' : '? Unknown'}
+                              </span>
+                            )}
                           </div>
                           <p className="text-xs text-gray-400 mt-1 line-clamp-2">{f.description || "No description available."}</p>
                           <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-600">
@@ -1193,6 +1228,17 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                               {f.fixed_version && (
                                 <div className="rounded-lg bg-green-950/30 border border-green-800/40 px-4 py-3 text-xs text-green-300">
                                   Update {f.package_name} to version {f.fixed_version} or later to remediate this vulnerability.
+                                </div>
+                              )}
+                              {f.reach_evidence && (
+                                <div>
+                                  <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Reachability Evidence</p>
+                                  <pre className="text-xs text-gray-300 bg-gray-800 rounded p-3 whitespace-pre-wrap leading-relaxed font-mono">
+                                    {f.reach_evidence}
+                                  </pre>
+                                  {f.reach_source && (
+                                    <p className="text-xs text-gray-600 mt-1">Source: {f.reach_source} · confidence {Math.round((f.reach_confidence ?? 0) * 100)}%</p>
+                                  )}
                                 </div>
                               )}
                             </div>

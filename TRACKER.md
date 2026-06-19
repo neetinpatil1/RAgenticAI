@@ -185,6 +185,57 @@
 | 1.8.6 | HashiCorp Vault secrets | config | ⬜ |
 | 1.8.7 | Git repo input support | `main.py` | ⬜ |
 
+### 1.9 CVE Reachability Analyzer — Not Started
+> Determines whether a CVE found in a dependency is actually reachable from application code.
+> Handles direct imports, transitive deps (parent lib calls child lib), and multi-hop call chains.
+> Triggered automatically after SCA completes when CVE count > 0. Results written back to dependency_findings.
+> Tech: pure Python — javatools (1 new pip dep), zipfile stdlib, mvn/npm subprocess, existing Tree-sitter call graph, Ollama llama3.2:3b.
+
+#### Phase A — CVE Enrichment
+| # | Task | File(s) | Status |
+|---|---|---|---|
+| 1.9.1 | CVE Enricher — fetch full OSV.dev record per CVE; extract `affected_functions` (class/method) when present; fall back to LLM extraction from CVE description for the ~70% of CVEs with no structured class data | `tools/cve_enricher.py` | ⬜ |
+| 1.9.2 | Hardcoded known-CVE map for famous CVEs (Log4Shell → `JndiLookup.lookup`, SpringShell → `SerializationUtils.deserialize`, etc.) | `tools/cve_enricher.py` | ⬜ |
+
+#### Phase B — Dependency Tree (Multi-Ecosystem)
+| # | Task | File(s) | Status |
+|---|---|---|---|
+| 1.9.3 | Maven dep tree — parse `pom.xml` with `xml.etree` (stdlib); no Maven required; extracts direct + declared transitive deps | `tools/reachability/dep_tree.py` | ⬜ |
+| 1.9.4 | Maven transitive tree — subprocess `mvn dependency:tree -DoutputType=json` when Maven available; fall back to pom.xml parse only | `tools/reachability/dep_tree.py` | ⬜ |
+| 1.9.5 | npm dep tree — parse `package-lock.json` with stdlib `json`; full transitive tree without requiring npm | `tools/reachability/dep_tree.py` | ⬜ |
+| 1.9.6 | Python dep tree — parse `requirements.txt`, `Pipfile.lock`, `pyproject.toml` with stdlib | `tools/reachability/dep_tree.py` | ⬜ |
+| 1.9.7 | Gradle dep tree — best-effort parse of `build.gradle`; mark UNKNOWN if can't resolve | `tools/reachability/dep_tree.py` | ⬜ |
+
+#### Phase C — Library Internal Call Analysis
+| # | Task | File(s) | Status |
+|---|---|---|---|
+| 1.9.8 | JAR unpacker — stdlib `zipfile` to extract `.class` files from JARs/WARs into temp dir | `tools/reachability/jar_analyzer.py` | ⬜ |
+| 1.9.9 | Java bytecode analyzer — `javatools` (1 new pip dep) to parse `.class` constant pool; extract `invokevirtual`/`invokestatic`/`invokeinterface` call refs; builds internal call map: Parent method → Child class/method | `tools/reachability/jar_analyzer.py` | ⬜ |
+| 1.9.10 | JS/npm source analyzer — read `node_modules/<parent>/` JS source; regex + grep for calls to child package's vulnerable export; handles `require()` and ES6 `import` | `tools/reachability/js_analyzer.py` | ⬜ |
+| 1.9.11 | Python source analyzer — stdlib `ast.parse()` on `site-packages/<parent>/` source; walk AST for calls to child package's vulnerable function | `tools/reachability/py_analyzer.py` | ⬜ |
+| 1.9.12 | Spring/AOP/reflection detector — flag when `.class` bytecode contains `java.lang.reflect` or Spring AOP patterns; mark affected chain segments as UNKNOWN | `tools/reachability/jar_analyzer.py` | ⬜ |
+
+#### Phase D — App Call Graph → Reachability Chain
+| # | Task | File(s) | Status |
+|---|---|---|---|
+| 1.9.13 | Import scanner — scan app source for direct imports of vulnerable class (fastest path); handles direct import, wildcard import, aliased import | `tools/reachability/import_scanner.py` | ⬜ |
+| 1.9.14 | Call chain assembler — join: app call graph (existing Tree-sitter) + parent lib internal calls (Phase C) + CVE vulnerable method (Phase A) → full evidence chain `App.method() → Parent.x() → Child.vulnerable()` | `tools/reachability/chain_assembler.py` | ⬜ |
+| 1.9.15 | Transitive depth limit — cap chain traversal at 5 hops; beyond that mark UNKNOWN (avoid infinite loops in circular dep graphs) | `tools/reachability/chain_assembler.py` | ⬜ |
+| 1.9.16 | LLM verdict for UNKNOWN cases — send CVE description + app usage snippets to `llama3.2:3b`; ask if vulnerable functionality is triggered; return `LIKELY_REACHABLE`/`LIKELY_NOT_REACHABLE` with confidence | `tools/reachability/llm_verdict.py` | ⬜ |
+
+#### Phase E — Storage, API, Workflow, UI
+| # | Task | File(s) | Status |
+|---|---|---|---|
+| 1.9.17 | DB migration — add columns to `dependency_findings`: `affected_classes TEXT[]`, `reachability TEXT`, `reach_evidence TEXT`, `reach_confidence FLOAT`, `reach_source TEXT` | `db/migrations.py` | ⬜ |
+| 1.9.18 | Reachability LangGraph workflow — orchestrates Phase A→D; triggered after SCA; writes verdict per CVE as each completes (progressive results) | `workflows/reachability_workflow.py` | ⬜ |
+| 1.9.19 | Workflow trigger — in `_run_all_agents()`: after SCA gather, if `sca_result.findings_count > 0` launch `reachability_workflow` as background task | `api/agent_gateway.py` | ⬜ |
+| 1.9.20 | `GET /api/v1/dependencies/{run_id}` — extend response to include `reachability`, `reach_evidence`, `reach_source`, `affected_classes` per finding | `api/agent_gateway.py` | ⬜ |
+| 1.9.21 | `GET /api/v1/scan/{run_id}` — add `agents.reachability_done` flag (written to `workflow_runs.metadata` when workflow completes) | `api/agent_gateway.py`, `workflows/reachability_workflow.py` | ⬜ |
+| 1.9.22 | UI — Reachability agent card in pipeline status grid (6th card); shows `not started → running → done` | `ui/src/components/ScanResults.tsx` | ⬜ |
+| 1.9.23 | UI — Reachability badge on each CVE row: `⚡ REACHABLE`, `✓ NOT_REACHABLE`, `? UNKNOWN`, `~ LIKELY_NOT_REACHABLE (LLM)` | `ui/src/components/ScanResults.tsx` | ⬜ |
+| 1.9.24 | UI — Expandable evidence panel per CVE: full call chain `App.method() → Parent.x() [spring-web.jar] → Child.vuln() [CVE class]`, source file + line | `ui/src/components/ScanResults.tsx` | ⬜ |
+| 1.9.25 | Add `javatools` to `requirements.txt` — only new pip dependency for the entire feature | `requirements.txt` | ⬜ |
+
 ---
 
 ## Phase 2 — Security Guild (Months 6–9)
