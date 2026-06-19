@@ -176,8 +176,11 @@ Respond with valid JSON matching the schema:
                 {"role": "user",   "content": user_prompt},
             ],
             "stream": False,
-            "format": "json",       # Ollama JSON mode — enforces JSON output
         }
+        # "format": "json" forces strict JSON output — safe for llama3.2:3b but causes
+        # qwen2.5-coder to hang indefinitely, so only enable it for Tier 2 (small model).
+        if model == settings.ollama.tier2_model:
+            payload["format"] = "json"
 
         async with httpx.AsyncClient(timeout=settings.ollama.request_timeout) as client:
             response = await client.post(
@@ -202,7 +205,16 @@ Respond with valid JSON matching the schema:
         This prevents hallucinated or truncated output from being treated as REAL.
         """
         try:
-            data = json.loads(raw)
+            # Strip markdown code fences that some models wrap around JSON output
+            # e.g. ```json\n{...}\n``` → {...}
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```", 2)[1]          # strip opening fence
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]                      # strip "json" tag
+                if "```" in cleaned:
+                    cleaned = cleaned[:cleaned.rindex("```")] # strip closing fence
+            data = json.loads(cleaned.strip())
             verdict_str = data.get("verdict", "ESCALATED").upper()
             verdict = FPVerdict(verdict_str)
 

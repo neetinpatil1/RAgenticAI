@@ -124,10 +124,12 @@ async def _load_sast_findings(pool: asyncpg.Pool, run_id: str) -> dict[str, list
 # Helper: call Ollama LLM
 # ---------------------------------------------------------------------------
 
-async def _call_llm(system_prompt: str, user_prompt: str, timeout: int = 120) -> str:
+async def _call_llm(system_prompt: str, user_prompt: str, timeout: int | None = None) -> str:
     """Call Ollama chat API."""
+    if timeout is None:
+        timeout = settings.ollama.request_timeout
     payload = {
-        "model": settings.ollama.tier1_model,
+        "model": settings.ollama.tier2_model,  # llama3.2:3b — fast; switch to tier1_model for production
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
@@ -367,7 +369,7 @@ async def node_start(state: CodeReviewState, deps: dict) -> CodeReviewState:
         """)
 
     sast_findings = await _load_sast_findings(pool, run_id)
-    logger.warning("CODE REVIEW STARTED | run=%s sast_context_files=%d model=%s", run_id, len(sast_findings), settings.ollama.tier1_model)
+    logger.warning("CODE REVIEW STARTED | run=%s sast_context_files=%d model=%s", run_id, len(sast_findings), settings.ollama.tier2_model)
     return {**state, "sast_findings": sast_findings}
 
 

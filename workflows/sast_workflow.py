@@ -250,14 +250,34 @@ async def node_write_findings(state: SastWorkflowState, deps: dict) -> SastWorkf
             )
 
     # Feature 2: Blast radius enrichment from code-review-graph
-    # For each finding, look up how many other files call into the finding's file.
-    # This surfaces high-impact vulnerable files in the UI ("called by N files").
     _enrich_blast_radius(state["scan_path"], finding_db_ids, findings, pool)
 
-    logger.info(
-        "Findings written | run=%s count=%d baseline=%s",
-        run_id, len(findings), is_first_scan
-    )
+    # Write scan coverage stats to DB NOW so the UI shows files_scanned immediately
+    # (not waiting until node_enqueue_next after the FP pipeline finishes).
+    early_stats = {
+        "files_scanned":       state.get("files_scanned", 0),
+        "files_skipped":       state.get("files_skipped", 0),
+        "files_with_findings": state.get("files_with_findings", 0),
+        "files_clean":         max(0, state.get("files_scanned", 0) - state.get("files_with_findings", 0)),
+        "skip_reasons":        state.get("skip_reasons", {}),
+        "packages_total":      state.get("packages_total", 0),
+        "packages_by_file":    state.get("packages_by_file", []),
+        "scan_duration_ms":    state.get("scan_duration_ms", 0),
+    }
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE workflow_runs SET metadata = $1::jsonb WHERE run_id = $2",
+                json.dumps(early_stats),
+                run_id,
+            )
+        logger.info(
+            "Findings written | run=%s count=%d files_scanned=%d baseline=%s",
+            run_id, len(findings), early_stats["files_scanned"], is_first_scan
+        )
+    except Exception as exc:
+        logger.warning("Could not write early scan stats | run=%s error=%s", run_id, exc)
+
     return {**state, "finding_db_ids": finding_db_ids}
 
 
@@ -333,11 +353,12 @@ async def node_run_fp_pipeline(state: SastWorkflowState, deps: dict) -> SastWork
     Node 4: Run 3-layer FP pipeline on all findings.
 
     Layer 1 → fast YAML rules (<5ms each)
-    Layer 3 → LLM analysis for unresolved findings (2–8s each)
+    Layer 3 → LLM analysis for unresolved findings (2–8s each, max 5 concurrent)
 
     Layer 2 (CodeBERT) is disabled in Phase 0 — activates in Phase 1
     once ≥150 human-confirmed labels exist per segment.
     """
+    import time as _t
     layer1: Layer1Rules = deps["layer1_rules"]
     layer3: Layer3LLM = deps["layer3_llm"]
     pool: asyncpg.Pool = deps["pool"]
@@ -349,13 +370,16 @@ async def node_run_fp_pipeline(state: SastWorkflowState, deps: dict) -> SastWork
     decisions: list[FPDecision] = []
     counters = {"real": 0, "fp": 0, "escalated": 0, "deadlock": 0}
 
+    _fp_start = _t.time()
+    logger.info("FP pipeline START | run=%s total_findings=%d", run_id, len(findings))
+
+    # --- Layer 1: fast YAML rules — run synchronously for all findings ---
+    _l1_start = _t.time()
+    l3_queue: list[tuple[SASTFinding, str]] = []  # findings that need Layer 3
     for finding in findings:
         db_id = finding_db_ids.get(finding.fingerprint, finding.fingerprint)
-
-        # --- Layer 1: YAML rule-based filter ---
         l1_decision = layer1.evaluate(finding, run_id)
         if l1_decision:
-            # Layer 1 resolved — update finding_id to actual DB ID
             l1_decision = l1_decision.model_copy(update={"finding_id": db_id})
             decisions.append(l1_decision)
             counters["fp"] += 1
@@ -367,52 +391,91 @@ async def node_run_fp_pipeline(state: SastWorkflowState, deps: dict) -> SastWork
                 entity_id=db_id,
                 payload={"fp_category": l1_decision.fp_category},
             )
-            continue
+        else:
+            l3_queue.append((finding, db_id))
 
-        # --- Layer 3: LLM + pgvector (no Layer 2 in Phase 0) ---
-        try:
-            l3_decision = await layer3.evaluate(
-                finding=finding,
-                run_id=run_id,
-                finding_db_id=db_id,
-                use_tier1=True,
+    logger.info(
+        "FP pipeline Layer1 DONE | run=%s l1_resolved=%d l3_queue=%d elapsed=%.2fs",
+        run_id, len(findings) - len(l3_queue), len(l3_queue), _t.time() - _l1_start,
+    )
+
+    # --- Layer 3: LLM calls — max 2 concurrent (matches OLLAMA_NUM_PARALLEL=2).
+    # Higher concurrency causes queue buildup inside Ollama: queuing time + inference
+    # time exceeds the 120s httpx timeout for calls 3-5 waiting in line.
+    sem = asyncio.Semaphore(2)
+    _l3_done_count = 0
+
+    async def _run_layer3(finding: SASTFinding, db_id: str) -> FPDecision:
+        nonlocal _l3_done_count
+        async with sem:
+            _call_start = _t.time()
+            logger.info(
+                "FP/L3 calling LLM | run=%s finding=%s rule=%s",
+                run_id, db_id[:8], finding.rule_id,
             )
-            decisions.append(l3_decision)
+            try:
+                decision = await layer3.evaluate(
+                    finding=finding,
+                    run_id=run_id,
+                    finding_db_id=db_id,
+                    use_tier1=False,  # Tier 2 (llama3.2:3b) — fast pass; auto-escalates high-stakes to Tier 1
+                )
+                _l3_done_count += 1
+                logger.info(
+                    "FP/L3 LLM done | run=%s finding=%s verdict=%s confidence=%.2f elapsed=%.1fs [%d/%d]",
+                    run_id, db_id[:8], decision.verdict.value, decision.confidence,
+                    _t.time() - _call_start, _l3_done_count, len(l3_queue),
+                )
+                await audit.log(
+                    event_type=AuditEvent.FP_LAYER3_DECIDED,
+                    actor="sast_agent",
+                    run_id=run_id,
+                    entity_type="finding",
+                    entity_id=db_id,
+                    payload={
+                        "verdict": decision.verdict.value,
+                        "confidence": decision.confidence,
+                    },
+                )
+                return decision
+            except Exception as exc:
+                _l3_done_count += 1
+                logger.error(
+                    "FP/L3 error | run=%s finding=%s error=%s elapsed=%.1fs [%d/%d]",
+                    run_id, db_id[:8], exc, _t.time() - _call_start,
+                    _l3_done_count, len(l3_queue),
+                )
+                return FPDecision(
+                    finding_id=db_id,
+                    run_id=run_id,
+                    verdict=FPVerdict.ESCALATED,
+                    source="layer3_llm",   # type: ignore
+                    confidence=0.0,
+                    reasoning=f"Pipeline error: {exc}",
+                    fp_category=None,
+                )
 
-            if l3_decision.verdict == FPVerdict.REAL:
+    if l3_queue:
+        logger.info(
+            "FP pipeline Layer3 START | run=%s findings_to_llm=%d concurrency=5",
+            run_id, len(l3_queue),
+        )
+        _l3_start = _t.time()
+        l3_results = await asyncio.gather(*[_run_layer3(f, d) for f, d in l3_queue])
+        logger.info(
+            "FP pipeline Layer3 DONE | run=%s elapsed=%.1fs",
+            run_id, _t.time() - _l3_start,
+        )
+        for decision in l3_results:
+            decisions.append(decision)
+            if decision.verdict == FPVerdict.REAL:
                 counters["real"] += 1
-            elif l3_decision.verdict == FPVerdict.FP:
+            elif decision.verdict == FPVerdict.FP:
                 counters["fp"] += 1
-            elif l3_decision.verdict == FPVerdict.ESCALATED:
+            elif decision.verdict == FPVerdict.ESCALATED:
                 counters["escalated"] += 1
-            elif l3_decision.verdict == FPVerdict.DEADLOCK:
+            elif decision.verdict == FPVerdict.DEADLOCK:
                 counters["deadlock"] += 1
-
-            await audit.log(
-                event_type=AuditEvent.FP_LAYER3_DECIDED,
-                actor="sast_agent",
-                run_id=run_id,
-                entity_type="finding",
-                entity_id=db_id,
-                payload={
-                    "verdict": l3_decision.verdict.value,
-                    "confidence": l3_decision.confidence,
-                },
-            )
-
-        except Exception as exc:
-            # FP pipeline failure → treat as ESCALATED, don't crash
-            logger.error("FP pipeline error | finding=%s error=%s", db_id, exc)
-            decisions.append(FPDecision(
-                finding_id=db_id,
-                run_id=run_id,
-                verdict=FPVerdict.ESCALATED,
-                source="layer3_llm",   # type: ignore
-                confidence=0.0,
-                reasoning=f"Pipeline error: {exc}",
-                fp_category=None,
-            ))
-            counters["escalated"] += 1
 
     # Persist FP decisions to DB
     async with pool.acquire() as conn:
@@ -429,6 +492,13 @@ async def node_run_fp_pipeline(state: SastWorkflowState, deps: dict) -> SastWork
                 decision.confidence, decision.fp_category,
                 decision.reasoning, decision.label_status.value,
             )
+
+    logger.info(
+        "FP pipeline COMPLETE | run=%s total=%d real=%d fp=%d escalated=%d deadlock=%d total_elapsed=%.1fs",
+        run_id, len(decisions),
+        counters["real"], counters["fp"], counters["escalated"], counters["deadlock"],
+        _t.time() - _fp_start,
+    )
 
     return {
         **state,

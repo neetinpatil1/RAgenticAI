@@ -56,6 +56,10 @@ export interface ScanStatus {
     baseline: number;
     total: number;
   };
+  agents?: {
+    secrets_done: boolean;
+    sca_done: boolean;
+  };
 }
 
 export type ReviewCategory = "SECURITY" | "PERFORMANCE" | "CODE_QUALITY" | "ERROR_HANDLING" | "BEST_PRACTICES";

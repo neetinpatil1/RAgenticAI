@@ -57,7 +57,7 @@ from workflows.sca_workflow import run_sca_workflow
 from workflows.fp_challenger_workflow import run_fp_challenger_workflow
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -65,6 +65,8 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
 logging.getLogger("asyncpg").setLevel(logging.ERROR)
+logging.getLogger("langgraph").setLevel(logging.WARNING)
+logging.getLogger("httpcore.http11").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -224,46 +226,57 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
                Graph must be ready before code review so it can enrich LLM prompts.
       Step 2 — SAST + Secret Scanner + SCA run in parallel (graph already built)
       Step 3 — Code Review runs after SAST/SCA complete with full graph context
+      Step 4 — FP Challenger runs after Code Review completes
 
     return_exceptions=True ensures one agent crashing does not cancel the others.
     """
     import time as _t
     root = Path(scan_path)
     key  = str(root)
+    _wall_start = _t.time()
+
+    logger.info("=" * 70)
+    logger.info("SCAN ORCHESTRATION START | run=%s path=%s", run_id, scan_path)
+    logger.info("=" * 70)
 
     # ── Step 1: Build code knowledge graph first ──────────────────────────────
-    # Skip if already done (e.g. repeat scan of same project)
+    _t1 = _t.time()
     if _graph_build_status.get(key, {}).get("status") not in ("done",):
-        _graph_build_status[key] = {"status": "building", "error": None, "started_at": _t.time()}
-        logger.warning("graph/build: starting BEFORE SAST for %s", root)
+        _graph_build_status[key] = {"status": "building", "error": None, "started_at": _t1}
+        logger.info("[STEP 1/4] Graph build: STARTING | run=%s path=%s", run_id, root.name)
         await _run_graph_build(root)   # ← awaited: SAST waits for this
-        logger.warning("graph/build: finished, SAST starting now for %s", root)
+        _graph_state = _graph_build_status.get(key, {}).get("status", "unknown")
+        logger.info("[STEP 1/4] Graph build: DONE | run=%s status=%s elapsed=%.1fs",
+                    run_id, _graph_state, _t.time() - _t1)
     else:
-        logger.warning("graph/build: already done, skipping rebuild for %s", root)
+        logger.info("[STEP 1/4] Graph build: SKIPPED (already built) | run=%s", run_id)
 
     # ── Step 2: SAST + Secrets + SCA in parallel ─────────────────────────────
-    # Secrets and SCA scan the codebase independently — they don't need SAST
-    # findings. Running them in parallel with SAST means they finish quickly
-    # regardless of how long SAST's inline FP pipeline takes (can be 10-20 min
-    # on large projects with many LLM calls per finding).
-    # Code Review is NOT included here — it needs SAST findings in the DB first.
-    logger.info("SAST + Secrets + SCA starting in parallel | run=%s", run_id)
+    # All three run concurrently. SAST includes its inline FP pipeline (Layer 1 + Layer 3 LLM).
+    # Code Review is NOT here — it needs SAST findings in the DB first.
+    _t2 = _t.time()
+    logger.info("[STEP 2/4] SAST + Secrets + SCA: STARTING in parallel | run=%s", run_id)
     sast_secret_sca = await asyncio.gather(
         run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
         run_secret_scan_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
         run_sca_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
         return_exceptions=True,
     )
+    _elapsed2 = _t.time() - _t2
     for i, r in enumerate(sast_secret_sca):
+        agent = ["sast", "secret_scanner", "sca"][i]
         if isinstance(r, Exception):
-            agent = ["sast", "secret_scanner", "sca"][i]
-            logger.error("Agent failed | agent=%s run=%s error=%s", agent, run_id, r)
-    logger.info("SAST + Secrets + SCA complete | run=%s", run_id)
+            logger.error("[STEP 2/4] Agent FAILED | agent=%s run=%s error=%s", agent, run_id, r)
+        else:
+            logger.info("[STEP 2/4] Agent done | agent=%s run=%s", agent, run_id)
+    logger.info("[STEP 2/4] SAST + Secrets + SCA: ALL COMPLETE | run=%s elapsed=%.1fs",
+                run_id, _elapsed2)
 
     # ── Step 3: Code Review (needs SAST findings in DB from step 2) ──────────
     # Pre-insert code_review_status='running' BEFORE starting so the UI
     # immediately sees "running" when it polls — eliminates the race where
     # node_enumerate_files hasn't written its first row yet and the UI gives up.
+    _t3 = _t.time()
     try:
         async with _pool.acquire() as conn:
             await conn.execute("""
@@ -292,16 +305,17 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     except Exception as exc:
         logger.warning("Could not pre-insert code_review_status: %s", exc)
 
-    logger.info("Code Review starting | run=%s", run_id)
+    logger.info("[STEP 3/4] Code Review: STARTING | run=%s", run_id)
     try:
         await run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
     except Exception as exc:
-        logger.error("Code Review failed | run=%s error=%s", run_id, exc)
-    logger.info("Code Review complete | run=%s", run_id)
+        logger.error("[STEP 3/4] Code Review: FAILED | run=%s error=%s", run_id, exc)
+    logger.info("[STEP 3/4] Code Review: COMPLETE | run=%s elapsed=%.1fs", run_id, _t.time() - _t3)
 
     # ── Step 4: FP Challenger ─────────────────────────────────────────────────
-    # Pre-insert fp_challenge_status='running' so the UI detects it immediately
-    # instead of waiting for node_load_findings to write the first row.
+    # Runs ONLY after Code Review completes.
+    # Pre-insert fp_challenge_status='running' so the UI detects it immediately.
+    _t4 = _t.time()
     try:
         async with _pool.acquire() as conn:
             await conn.execute(
@@ -318,9 +332,14 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     except Exception as exc:
         logger.warning("Could not pre-insert fp_challenge_status: %s", exc)
 
-    logger.info("FP Challenger starting | run=%s", run_id)
+    logger.info("[STEP 4/4] FP Challenger: STARTING | run=%s", run_id)
     await run_fp_challenger_workflow(run_id=run_id, deps=deps)
-    logger.info("FP Challenger complete | run=%s", run_id)
+    logger.info("[STEP 4/4] FP Challenger: COMPLETE | run=%s elapsed=%.1fs", run_id, _t.time() - _t4)
+
+    logger.info("=" * 70)
+    logger.info("SCAN ORCHESTRATION COMPLETE | run=%s total_elapsed=%.1fs",
+                run_id, _t.time() - _wall_start)
+    logger.info("=" * 70)
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +478,11 @@ async def get_scan_status(run_id: str, pool: asyncpg.Pool = Depends(get_pool)):
             "scan_duration_ms":    meta.get("scan_duration_ms", 0),
         },
         "findings": {k: v for k, v in findings_dict.items() if k != "files_with_findings"},
+        # Per-agent completion flags — set by each workflow's node_complete, independent of SAST
+        "agents": {
+            "secrets_done": bool((meta.get("secret_scan") or {}).get("completed_at")),
+            "sca_done":     bool((meta.get("sca") or {}).get("completed_at")),
+        },
     }
 
 

@@ -48,7 +48,7 @@ class OllamaConfig:
     tier2_model: str = field(default_factory=lambda: os.getenv("OLLAMA_TIER2_MODEL", "llama3.2:3b"))
     # Escalation threshold: re-run on Tier 1 if LLM confidence below this
     escalation_confidence_threshold: float = 0.6
-    request_timeout: int = 120  # seconds
+    request_timeout: int = 240  # seconds — 14B model needs up to 4 min on cold GPU
 
 
 @dataclass

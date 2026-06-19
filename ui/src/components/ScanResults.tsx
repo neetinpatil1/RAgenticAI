@@ -58,6 +58,8 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   const [loading,   setLoading]   = useState(true);
   const [sevFilter, setSevFilter] = useState<string>("ALL");
   const [activeTab, setActiveTab] = useState<"sast" | "review" | "secrets" | "deps">("sast");
+  // True only after workflow_runs.state = "completed" — i.e. Semgrep + FP pipeline both done
+  const [sastDone,  setSastDone]  = useState(false);
 
   // Code review state — starts as "loading" like secrets/SCA, no separate detection needed
   const [crFindings,   setCrFindings]   = useState<CodeReviewFinding[]>([]);
@@ -72,6 +74,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     pct: number; files_done: number; total_files: number;
     current_file: string | null; findings_count: number;
   } | null>(null);
+  const [crQueued,     setCrQueued]     = useState(true);  // true = waiting for SAST/Secrets/SCA
   const crPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // FP Challenger state
@@ -109,6 +112,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   // ---------------------------------------------------------------------------
   useEffect(() => {
     // Reset ALL agent state for the new runId
+    setSastDone(false);
     setSecretScanning(true);
     setDepScanning(true);
     setSecretFindings([]);
@@ -120,6 +124,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     setCrCompleted(false);
     setCrError(null);
     setCrProgress(null);
+    setCrQueued(true);
     setFindings([]);
     setGraphBuildStatus("idle");
     setGraphBuildError(null);
@@ -146,6 +151,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
 
         if (prog.status === "running") {
           crStalled = 0;
+          setCrQueued(false);
           setCrProgress({
             pct: prog.pct, files_done: prog.files_done,
             total_files: prog.total_files, current_file: prog.current_file,
@@ -158,6 +164,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
         if (prog.status === "completed") {
           const cr = await getCodeReview(runId);
           if (cr.count > 0) { setCrFindings(cr.findings); setCrSummary(cr.summary); }
+          setCrQueued(false);
           setCrCompleted(true);
           setCrLoading(false);
           waitForFpToStart();
@@ -165,12 +172,14 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
         }
 
         if (prog.status === "failed") {
+          setCrQueued(false);
           setCrError("Code review failed on the server. Check /tmp/app.log.");
           setCrLoading(false);
           return;
         }
 
-        // "not_started" — SAST still running, keep waiting
+        // "not_started" — SAST/Secrets/SCA still running, keep waiting
+        setCrQueued(true);
         crStalled++;
         if (crStalled >= MAX_CR_STALLED) {
           // Something is genuinely wrong — let user trigger manually
@@ -189,6 +198,15 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       setFindings(f);
       setStatus(s);
       setLoading(false);
+
+      // Mark SAST done immediately if the workflow_run is already completed
+      // (workflow_runs.state = 'completed' is set AFTER Semgrep + FP pipeline both finish)
+      if (s.status === "completed" || s.status === "failed") {
+        setSastDone(true);
+      } else {
+        // Poll until SAST workflow completes — updates findings count and files_scanned too
+        pollSastStatus();
+      }
 
       // Check FP Challenger status
       try {
@@ -213,6 +231,50 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
 
       // Start code review polling immediately — same as secrets/SCA
       pollCr();
+    }
+
+    // Poll workflow_runs.state every 10s until SAST (including FP pipeline) is done.
+    // The response also carries per-agent completion flags (agents.secrets_done / sca_done)
+    // written by each workflow independently — so we can stop those spinners without
+    // waiting for the full SAST pipeline to finish.
+    async function pollSastStatus(retries = 0) {
+      const MAX_RETRIES = 120; // 120 × 10s = 20 min
+      if (retries >= MAX_RETRIES) {
+        setSastDone(true);
+        setSecretScanning(false);
+        setDepScanning(false);
+        return;
+      }
+      try {
+        const s = await getScanStatus(runId);
+        setStatus(s);
+
+        // Stop individual agent spinners as soon as their workflow writes completed_at
+        // to workflow_runs.metadata — happens within seconds of each agent finishing,
+        // independent of the SAST FP pipeline which can run for 30+ minutes.
+        if (s.agents?.secrets_done) setSecretScanning(false);
+        if (s.agents?.sca_done)     setDepScanning(false);
+
+        if (s.status === "completed" || s.status === "failed") {
+          setSastDone(true);
+          // Refresh SAST findings — the final count is now accurate
+          const refreshed = await getFindings(runId);
+          setFindings(refreshed);
+          // Final check for any late-arriving secrets/deps findings
+          try {
+            const sec = await getSecretFindings(runId);
+            if (sec.count > 0) { setSecretFindings(sec.findings); setSecretSummary(sec.summary); }
+          } catch { /* ignore */ }
+          setSecretScanning(false);
+          try {
+            const dep = await getDependencyFindings(runId);
+            if (dep.count > 0) { setDepFindings(dep.findings); setDepSummary(dep.summary); }
+          } catch { /* ignore */ }
+          setDepScanning(false);
+          return;
+        }
+      } catch { /* ignore transient errors */ }
+      setTimeout(() => pollSastStatus(retries + 1), 10_000);
     }
 
     // -------------------------------------------------------------------------
@@ -527,7 +589,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               label="SAST Scanner"
               icon={<ShieldAlert className="w-4 h-4" />}
               color="text-orange-400"
-              done={true}
+              done={sastDone}
               count={findings.length}
               unit="findings"
               skills={["SQL Injection", "XSS", "Path Traversal", "CSRF", "Deserialization", "Weak Crypto"]}
@@ -570,8 +632,8 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               count={crFindings.length}
               unit="issues"
               skills={["Logic Flaws", "Auth Gaps", "N+1 Queries", "Resource Leaks", "Error Handling"]}
-              notStarted={false}
-              progress={crLoading && crProgress ? crProgress.pct : undefined}
+              notStarted={crQueued}
+              progress={crLoading && !crQueued && crProgress ? crProgress.pct : undefined}
               error={!!crError}
               active={activeTab === "review"}
               onClick={() => setActiveTab("review")}
@@ -1157,7 +1219,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               <div className="text-center">
                 <h3 className="text-base font-semibold text-white">LLM Code Review</h3>
                 <p className="text-sm text-gray-500 mt-1 max-w-md">
-                  qwen2.5-coder:14b reviews every source file for security issues, performance problems,
+                  llama3.2:3b reviews every source file for security issues, performance problems,
                   code quality, error handling, and best practices beyond what Semgrep detects.
                 </p>
               </div>
@@ -1194,11 +1256,23 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             </div>
           )}
 
-          {crTriggered && crLoading && (
+          {crTriggered && crLoading && crQueued && (
+            <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-8 space-y-3">
+              <div className="flex items-center gap-3">
+                <div className="w-2.5 h-2.5 rounded-full bg-purple-400/50 animate-pulse" />
+                <p className="text-sm font-medium text-gray-400">Code Review queued</p>
+              </div>
+              <p className="text-xs text-gray-500">
+                Waiting for SAST, Secrets and SCA agents to complete before starting file review…
+              </p>
+            </div>
+          )}
+
+          {crTriggered && crLoading && !crQueued && (
             <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-8 space-y-5">
               <div className="flex items-center gap-3">
                 <div className="w-2.5 h-2.5 rounded-full bg-purple-400 animate-pulse" />
-                <p className="text-sm font-medium text-white">qwen2.5-coder:14b — reviewing files</p>
+                <p className="text-sm font-medium text-white">llama3.2:3b — reviewing files</p>
               </div>
               <div className="space-y-2">
                 <div className="flex justify-between text-xs text-gray-500">
@@ -1226,7 +1300,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                 </p>
               )}
               <p className="text-xs text-gray-600">
-                Reviewing {crProgress?.total_files ?? "…"} files (2 concurrently) with qwen2.5-coder:14b.
+                Reviewing {crProgress?.total_files ?? "…"} files (2 concurrently) with llama3.2:3b.
                 {crProgress?.total_files && crProgress.total_files <= 20
                   ? " Small project — est. ~10 min."
                   : crProgress?.total_files && crProgress.total_files <= 25
@@ -1244,7 +1318,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               <CheckCircle2 className="w-8 h-8 text-green-400 mx-auto mb-3" />
               <p className="text-gray-300 text-sm font-medium">No issues found by Code Review</p>
               <p className="text-gray-600 text-xs mt-1">
-                qwen2.5-coder:14b reviewed the source files and found no security, performance, or quality issues.
+                llama3.2:3b reviewed the source files and found no security, performance, or quality issues.
               </p>
               <button
                 onClick={handleRunCodeReview}
