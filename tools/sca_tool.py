@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _SKIP_DIRS    = {".git", "node_modules", ".venv", "venv", "__pycache__", "target", "build", "dist"}
 _OSV_BATCH    = "https://api.osv.dev/v1/querybatch"
+_OSV_VULN     = "https://api.osv.dev/v1/vulns"   # GET /{id} for full details
 
 
 @dataclass
@@ -294,9 +295,18 @@ class SCATool:
         packages: list[tuple[str, str, str, str]],
         ecosystem: str,
     ) -> list[DependencyFinding]:
+        """
+        Two-step OSV lookup:
+          Step 1 — POST /v1/querybatch  finds which packages are affected.
+                   The batch response only returns {id, modified} — no summary/details/ranges.
+          Step 2 — GET  /v1/vulns/{id}  fetches full details for each unique vuln ID.
+        """
         findings: list[DependencyFinding] = []
         eco_lower = ecosystem.lower()
         batch_size = 50
+
+        # Step 1: collect unique vuln IDs and which package they affect
+        vuln_to_pkg: dict[str, tuple[str, str, str, str]] = {}
 
         async with httpx.AsyncClient(timeout=30) as client:
             for i in range(0, len(packages), batch_size):
@@ -317,26 +327,46 @@ class SCATool:
                         continue
                     for idx, result in enumerate(resp.json().get("results", [])):
                         for vuln in result.get("vulns", []):
-                            group, artifact, version, rel = batch[idx]
-                            fixed = None
-                            for affected in vuln.get("affected", []):
-                                for rng in affected.get("ranges", []):
-                                    for evt in rng.get("events", []):
-                                        if "fixed" in evt:
-                                            fixed = evt["fixed"]
-                                            break
-                            findings.append(DependencyFinding(
-                                package_name=f"{group}:{artifact}",
-                                installed_version=version,
-                                fixed_version=fixed,
-                                vulnerability_id=vuln.get("id", "OSV-UNKNOWN"),
-                                severity=self._osv_severity(vuln),
-                                description=(vuln.get("summary") or "")[:500],
-                                ecosystem=eco_lower,
-                                file_path=rel,
-                            ))
+                            vid = vuln.get("id", "")
+                            if vid and vid not in vuln_to_pkg:
+                                vuln_to_pkg[vid] = batch[idx]
                 except Exception as exc:
-                    logger.warning("OSV batch error: %s", exc)
+                    logger.warning("OSV batch query error: %s", exc)
+
+            # Step 2: fetch full details (summary, details, fixed version) per vuln ID
+            for vid, (group, artifact, version, rel) in vuln_to_pkg.items():
+                try:
+                    r = await client.get(f"{_OSV_VULN}/{vid}", timeout=10)
+                    if r.status_code != 200:
+                        continue
+                    vuln = r.json()
+
+                    # Extract earliest fixed version across all affected ranges
+                    fixed = None
+                    for affected in vuln.get("affected", []):
+                        for rng in affected.get("ranges", []):
+                            for evt in rng.get("events", []):
+                                if "fixed" in evt:
+                                    fixed = evt["fixed"]
+                                    break
+
+                    # Prefer summary; fall back to first 400 chars of details
+                    desc = (vuln.get("summary") or "").strip()
+                    if not desc:
+                        desc = (vuln.get("details") or "").strip()[:400]
+
+                    findings.append(DependencyFinding(
+                        package_name=f"{group}:{artifact}" if eco_lower == "maven" else artifact,
+                        installed_version=version,
+                        fixed_version=fixed,
+                        vulnerability_id=vid,
+                        severity=self._osv_severity(vuln),
+                        description=desc[:500],
+                        ecosystem=eco_lower,
+                        file_path=rel,
+                    ))
+                except Exception as exc:
+                    logger.warning("OSV vuln detail fetch error %s: %s", vid, exc)
 
         return findings
 

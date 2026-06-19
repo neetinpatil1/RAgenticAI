@@ -60,6 +60,8 @@ export interface ScanStatus {
     secrets_done: boolean;
     sca_done: boolean;
     reachability_done: boolean;
+    spotbugs_done?: boolean;
+    codeql_done?: boolean;
   };
 }
 

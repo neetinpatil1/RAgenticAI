@@ -266,8 +266,11 @@ async def node_write_findings(state: SastWorkflowState, deps: dict) -> SastWorkf
     }
     try:
         async with pool.acquire() as conn:
+            # Use jsonb merge (||) so concurrent SCA/Secrets completion flags are preserved.
             await conn.execute(
-                "UPDATE workflow_runs SET metadata = $1::jsonb WHERE run_id = $2",
+                """UPDATE workflow_runs
+                   SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+                   WHERE run_id = $2""",
                 json.dumps(early_stats),
                 run_id,
             )
@@ -552,22 +555,30 @@ async def node_enqueue_next(state: SastWorkflowState, deps: dict) -> SastWorkflo
         priority=5,
     )
 
-    # Persist scan stats into workflow_runs.metadata so the status endpoint can return them
-    scan_stats = {
-        "files_scanned":       state.get("files_scanned", 0),
-        "files_skipped":       state.get("files_skipped", 0),
-        "files_with_findings": state.get("files_with_findings", 0),
-        "files_clean":         max(0, state.get("files_scanned", 0) - state.get("files_with_findings", 0)),
-        "skip_reasons":        state.get("skip_reasons", {}),
-        "packages_total":      state.get("packages_total", 0),
-        "packages_by_file":    state.get("packages_by_file", []),
-        "scan_duration_ms":    state.get("scan_duration_ms", 0),
-        "fp_summary":          fp_summary,
-    }
+    # Persist fp_summary into workflow_runs.metadata.
+    # Coverage stats (files_scanned, etc.) were already written by node_write_findings
+    # (the early write). Only update fp_summary here to avoid overwriting coverage
+    # stats with zeroes if LangGraph state loses them after the FP pipeline.
+    scan_stats: dict = {"fp_summary": fp_summary}
+    # Only include coverage fields if they're non-zero (guards against state loss).
+    if state.get("files_scanned", 0):
+        scan_stats.update({
+            "files_scanned":       state["files_scanned"],
+            "files_skipped":       state.get("files_skipped", 0),
+            "files_with_findings": state.get("files_with_findings", 0),
+            "files_clean":         max(0, state["files_scanned"] - state.get("files_with_findings", 0)),
+            "skip_reasons":        state.get("skip_reasons", {}),
+            "packages_total":      state.get("packages_total", 0),
+            "packages_by_file":    state.get("packages_by_file", []),
+            "scan_duration_ms":    state.get("scan_duration_ms", 0),
+        })
     pool: asyncpg.Pool = deps["pool"]
     async with pool.acquire() as conn:
+        # Use jsonb merge (||) to preserve SCA/Secrets/Reachability completion flags.
         await conn.execute(
-            "UPDATE workflow_runs SET metadata = $1::jsonb WHERE run_id = $2",
+            """UPDATE workflow_runs
+               SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+               WHERE run_id = $2""",
             json.dumps(scan_stats),
             run_id,
         )

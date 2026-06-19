@@ -13,6 +13,7 @@ Workflow nodes:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -116,26 +117,18 @@ async def node_scan_files(state: SecretScanState, deps: dict) -> SecretScanState
 async def node_complete(state: SecretScanState, deps: dict) -> SecretScanState:
     pool: asyncpg.Pool = deps["pool"]
     run_id = state["run_id"]
-    import json
     async with pool.acquire() as conn:
-        existing = await conn.fetchval(
-            "SELECT metadata FROM workflow_runs WHERE run_id = $1", run_id
-        )
-        meta: dict = {}
-        if existing:
-            try:
-                meta = json.loads(existing) if isinstance(existing, str) else (existing or {})
-            except Exception:
-                meta = {}
-        meta["secret_scan"] = {
+        patch = json.dumps({"secret_scan": {
             "findings_count":     state.get("findings_count", 0),
             "files_scanned":      state.get("files_scanned", 0),
             "files_with_secrets": state.get("files_with_secrets", 0),
             "completed_at":       datetime.now(timezone.utc).isoformat(),
-        }
+        }})
         await conn.execute(
-            "UPDATE workflow_runs SET metadata = $1::jsonb WHERE run_id = $2",
-            json.dumps(meta), run_id,
+            """UPDATE workflow_runs
+               SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+               WHERE run_id = $2""",
+            patch, run_id,
         )
     logger.info("Secret scan workflow complete | run=%s", run_id)
     return state

@@ -1,0 +1,82 @@
+version: '3.8'
+
+# Eclipse Steady — minimal core services for call-graph reachability
+# Services: haproxy (port 8033) → rest-backend → postgresql
+#
+# Start:  docker compose -f docker/steady/docker-compose.yml up -d
+# Stop:   docker compose -f docker/steady/docker-compose.yml down
+# Logs:   docker compose -f docker/steady/docker-compose.yml logs -f rest-backend
+#
+# After startup (takes ~60s for Spring Boot):
+#   GET http://localhost:8033/backend/spaces  → should return []
+#   GET http://localhost:8033/health          → 200 OK
+
+services:
+
+  haproxy:
+    container_name: steady-haproxy
+    image: haproxy:2.3-alpine
+    platform: linux/amd64
+    ports:
+      - "8033:8080"
+    volumes:
+      - ./haproxy/conf/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    environment:
+      - HAPROXY_STATS_USER=admin
+      - HAPROXY_STATS_PASSWORD=admin
+      - FRONTEND_BUGS_USER=admin
+      - FRONTEND_BUGS_PASSWORD=admin
+      - BACKEND_BUGS_TOKEN=token
+    depends_on:
+      rest-backend:
+        condition: service_started
+    restart: unless-stopped
+
+  rest-backend:
+    container_name: steady-rest-backend
+    image: eclipse/steady-rest-backend:3.2.5
+    platform: linux/amd64
+    expose:
+      - "8091"
+    env_file:
+      - ./rest-backend/conf/restbackend.properties
+    environment:
+      - DELAY_STARTUP=5
+      - spring.datasource.username=steady
+      - spring.datasource.password=steadypass
+      - spring.datasource.url=jdbc:postgresql://postgresql:5432/vulas
+      - vulas.shared.cia.serviceUrl=http://localhost:8092/cia
+      - vulas.shared.cve.serviceUrl=https://services.nvd.nist.gov/rest/json/cve/1.0/<ID>
+      - vulas.backend.cveCache.refetchAllMs=86400000
+      - vulas.backend.cveCache.refetchSingleMs=60000
+      - JAVA_OPTIONS=-Xmx1g
+    volumes:
+      - ./rest-backend/data:/flyway-callbacks
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgresql:
+    container_name: steady-postgresql
+    image: postgres:11-alpine
+    platform: linux/amd64
+    environment:
+      - POSTGRES_DB=vulas
+      - POSTGRES_USER=steady
+      - POSTGRES_PASSWORD=steadypass
+      - PGDATA=/var/lib/postgresql/data
+    ports:
+      - "8032:5432"
+    volumes:
+      - steady-postgres-data:/var/lib/postgresql/data
+      - ./postgresql/conf:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U steady -d vulas"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  steady-postgres-data:

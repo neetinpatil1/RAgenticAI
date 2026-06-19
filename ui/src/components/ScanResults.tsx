@@ -278,6 +278,12 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             if (dep.count > 0) { setDepFindings(dep.findings); setDepSummary(dep.summary); }
           } catch { /* ignore */ }
           setDepScanning(false);
+
+          // Reachability runs in parallel and may still be in progress when SAST
+          // completes. Keep polling until reachability_done is also true.
+          if (!s.agents?.reachability_done) {
+            setTimeout(() => pollSastStatus(retries + 1), 10_000);
+          }
           return;
         }
       } catch { /* ignore transient errors */ }
@@ -1219,15 +1225,48 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                                 {f.installed_version && <div><p className="text-gray-500 mb-1">Installed Version</p><p className="text-red-300">{f.installed_version}</p></div>}
                                 {f.fixed_version     && <div><p className="text-gray-500 mb-1">Fixed In</p><p className="text-green-400">{f.fixed_version}</p></div>}
                               </div>
-                              {f.description && (
-                                <div>
-                                  <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Description</p>
-                                  <p className="text-gray-300 text-sm leading-relaxed">{f.description}</p>
-                                </div>
-                              )}
+                              <div>
+                                <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Description</p>
+                                <p className="text-gray-300 text-sm leading-relaxed">
+                                  {f.description || <span className="text-gray-600 italic">No description stored — see advisory link below.</span>}
+                                </p>
+                              </div>
+                              {/* Advisory link — always show so user can get full CVE details */}
+                              <div className="flex items-center gap-3 flex-wrap">
+                                <a
+                                  href={`https://osv.dev/vulnerability/${f.vulnerability_id}`}
+                                  target="_blank" rel="noopener noreferrer"
+                                  className="text-xs text-brand-400 hover:text-brand-300 underline flex items-center gap-1"
+                                >
+                                  View on OSV.dev ↗
+                                </a>
+                                {f.vulnerability_id.startsWith("CVE-") && (
+                                  <a
+                                    href={`https://nvd.nist.gov/vuln/detail/${f.vulnerability_id}`}
+                                    target="_blank" rel="noopener noreferrer"
+                                    className="text-xs text-brand-400 hover:text-brand-300 underline flex items-center gap-1"
+                                  >
+                                    View on NVD ↗
+                                  </a>
+                                )}
+                                {f.vulnerability_id.startsWith("GHSA-") && (
+                                  <a
+                                    href={`https://github.com/advisories/${f.vulnerability_id}`}
+                                    target="_blank" rel="noopener noreferrer"
+                                    className="text-xs text-brand-400 hover:text-brand-300 underline flex items-center gap-1"
+                                  >
+                                    View on GitHub Advisory ↗
+                                  </a>
+                                )}
+                              </div>
                               {f.fixed_version && (
                                 <div className="rounded-lg bg-green-950/30 border border-green-800/40 px-4 py-3 text-xs text-green-300">
-                                  Update {f.package_name} to version {f.fixed_version} or later to remediate this vulnerability.
+                                  <span className="font-semibold">Remediation:</span> Update <span className="font-mono">{f.package_name}</span> to version <span className="font-mono font-semibold">{f.fixed_version}</span> or later to fix this vulnerability.
+                                </div>
+                              )}
+                              {!f.fixed_version && (
+                                <div className="rounded-lg bg-yellow-950/20 border border-yellow-800/30 px-4 py-3 text-xs text-yellow-400">
+                                  No fixed version available. Check the advisory for workarounds or consider replacing this dependency.
                                 </div>
                               )}
                               {f.reach_evidence && (

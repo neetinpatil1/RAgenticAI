@@ -28,6 +28,7 @@ from tools.cve_enricher                   import enrich_cve
 from tools.reachability.dep_tree          import build_dep_tree, DepTree
 from tools.reachability.chain_assembler   import assemble_chain
 from tools.reachability.llm_verdict       import get_llm_verdict
+from tools.steady_tool                    import SteadyTool
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +79,26 @@ async def run_reachability_workflow(
         except Exception as exc:
             logger.warning("Reachability | dep_tree failed: %s", exc)
 
-        # Analyse each CVE (bounded concurrency)
+        # Analyse each CVE with heuristic chain assembler (bounded concurrency)
         tasks = [
             _analyse_one(run_id, scan_path, dict(row), dep_tree, pool)
             for row in rows
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Eclipse Steady — call-graph override (Java only, optional)
+        # Runs after heuristic pass. Overrides UNKNOWN/LIKELY verdicts where
+        # Steady can provide a definitive call-chain-based result.
+        steady = SteadyTool()
+        if await steady.is_available():
+            logger.info("Reachability | Steady available — running call-graph analysis | run=%s", run_id)
+            steady_verdicts = await steady.analyze(scan_path=scan_path, run_id=run_id)
+            if steady_verdicts:
+                await _apply_steady_verdicts(pool, run_id, steady_verdicts)
+                logger.info("Reachability | Steady applied %d verdicts | run=%s",
+                            len(steady_verdicts), run_id)
+        else:
+            logger.info("Reachability | Steady not available — using heuristic results | run=%s", run_id)
 
         elapsed = _t.time() - _start
         logger.info("Reachability | COMPLETE | run=%s cves=%d elapsed=%.1fs",
@@ -126,17 +141,50 @@ async def _analyse_one(
                     break  # Found — no need to check other classes
 
             if result is None:
-                # No class mapping at all
-                result_dict = {
-                    "verdict": "UNKNOWN",
-                    "evidence": (
-                        f"No vulnerable class mapping found for {vuln_id}. "
-                        "OSV.dev does not specify which class is affected. Manual review required."
-                    ),
-                    "confidence": 0.0,
-                    "source": "unknown",
-                    "affected_classes": [],
-                }
+                # No class mapping — still try LLM so we get LIKELY verdict instead of UNKNOWN
+                if description:
+                    try:
+                        llm = await get_llm_verdict(
+                            package_name=pkg_name,
+                            vuln_id=vuln_id,
+                            cve_description=description,
+                            target_class="",  # no specific class known
+                            scan_path=scan_path,
+                        )
+                        result_dict = {
+                            "verdict":   llm["verdict"],
+                            "evidence":  (
+                                f"No specific vulnerable class identified for {vuln_id}. "
+                                f"LLM assessed package usage in codebase.\n\n"
+                                + llm.get("reasoning", "")
+                            ),
+                            "confidence": llm["confidence"],
+                            "source":    "llm",
+                            "affected_classes": [],
+                        }
+                    except Exception as exc:
+                        logger.warning("Reachability | LLM fallback failed for %s: %s", vuln_id, exc)
+                        result_dict = {
+                            "verdict": "UNKNOWN",
+                            "evidence": (
+                                f"No vulnerable class mapping found for {vuln_id}. "
+                                "OSV.dev does not specify which class is affected. Manual review required."
+                            ),
+                            "confidence": 0.0,
+                            "source": "unknown",
+                            "affected_classes": [],
+                        }
+                else:
+                    result_dict = {
+                        "verdict": "UNKNOWN",
+                        "evidence": (
+                            f"No vulnerable class mapping found for {vuln_id}. "
+                            "OSV.dev does not specify which class is affected. Manual review required."
+                        ),
+                        "confidence": 0.0,
+                        "source": "unknown",
+                        "affected_classes": [],
+                    }
             else:
                 # Step 4: LLM fallback for UNKNOWN cases
                 if result.verdict == "UNKNOWN" and description:
@@ -186,6 +234,55 @@ async def _analyse_one(
             })
 
 
+async def _apply_steady_verdicts(
+    pool:            asyncpg.Pool,
+    run_id:          str,
+    steady_verdicts: dict,
+) -> None:
+    """
+    Override heuristic reachability results with Steady's call-graph verdicts.
+    Only overrides when Steady confidence > existing confidence, or existing is UNKNOWN.
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id, vulnerability_id, reachability, reach_confidence
+                   FROM dependency_findings
+                   WHERE run_id = $1""",
+                run_id,
+            )
+            for row in rows:
+                vuln_id   = row["vulnerability_id"]
+                sv = steady_verdicts.get(vuln_id)
+                if not sv:
+                    continue
+                existing_conf = float(row["reach_confidence"] or 0.0)
+                existing_ver  = (row["reachability"] or "UNKNOWN").upper()
+                # Override if Steady is more confident OR existing is UNKNOWN/LIKELY
+                if sv.confidence > existing_conf or existing_ver in ("UNKNOWN", "LIKELY_REACHABLE", "LIKELY_NOT_REACHABLE"):
+                    evidence = f"Eclipse Steady call-graph analysis."
+                    if sv.call_chain:
+                        evidence += f"\nCall chain: {sv.call_chain}"
+                    await conn.execute(
+                        """UPDATE dependency_findings
+                           SET reachability      = $1,
+                               reach_evidence    = $2,
+                               reach_confidence  = $3,
+                               reach_source      = 'steady'
+                           WHERE id = $4""",
+                        sv.verdict,
+                        evidence,
+                        sv.confidence,
+                        row["id"],
+                    )
+                    logger.info(
+                        "Reachability | Steady override | vuln=%s %s→%s conf=%.2f",
+                        vuln_id, existing_ver, sv.verdict, sv.confidence,
+                    )
+    except Exception as exc:
+        logger.warning("Reachability | _apply_steady_verdicts error: %s", exc)
+
+
 async def _write_result(pool: asyncpg.Pool, finding_id: str, result: dict) -> None:
     """Write reachability result back to dependency_findings row."""
     try:
@@ -210,25 +307,18 @@ async def _write_result(pool: asyncpg.Pool, finding_id: str, result: dict) -> No
 
 
 async def _mark_done(pool: asyncpg.Pool, run_id: str, count: int) -> None:
-    """Write reachability_done flag to workflow_runs.metadata."""
+    """Write reachability completion flag to workflow_runs.metadata (merge, not replace)."""
     try:
         async with pool.acquire() as conn:
-            existing = await conn.fetchval(
-                "SELECT metadata FROM workflow_runs WHERE run_id = $1", run_id
-            )
-            meta: dict = {}
-            if existing:
-                try:
-                    meta = json.loads(existing) if isinstance(existing, str) else (existing or {})
-                except Exception:
-                    meta = {}
-            meta["reachability"] = {
+            patch = json.dumps({"reachability": {
                 "cves_analysed": count,
                 "completed_at":  datetime.now(timezone.utc).isoformat(),
-            }
+            }})
             await conn.execute(
-                "UPDATE workflow_runs SET metadata = $1::jsonb WHERE run_id = $2",
-                json.dumps(meta), run_id,
+                """UPDATE workflow_runs
+                   SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+                   WHERE run_id = $2""",
+                patch, run_id,
             )
     except Exception as exc:
         logger.warning("Reachability | _mark_done failed: %s", exc)

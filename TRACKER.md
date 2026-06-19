@@ -252,6 +252,35 @@
 | 2.7 | Routing table learning loop | `core/model_router.py` | ⬜ |
 | 2.8 | Mac 2 split (if RAM demands) | infra | ⬜ |
 
+### 2.9 Deep Reachability Analysis — SpotBugs + FindSecBugs + Eclipse Steady
+> Replaces/augments heuristic jar-bytecode string search with call-graph-based reachability.
+> Prerequisite: project must be compilable (Maven/Gradle build succeeds locally).
+> See SSDLC_SCOPE.md §13b Decision #13 for full rationale and concerns.
+
+| # | Task | File(s) | Status |
+|---|---|---|---|
+| 2.9.1 | FindSecBugs runner — wrap `spotbugs -plugin findsecbugs.jar` as subprocess; parse XML output → `SASTFinding` list; runs on compiled `target/classes/` or WAR | `tools/spotbugs_tool.py` | ✅ |
+| 2.9.2 | FindSecBugs findings → DB — deduplicate against Semgrep findings (same file/line/rule); insert net-new findings only; tag `source=findsecbugs` | `workflows/spotbugs_workflow.py` | ✅ |
+| 2.9.3 | Build detection — before invoking SpotBugs, check if `target/classes/` or `*.war` exists; if not, attempt `mvn compile -q`; if build fails skip SpotBugs gracefully | `tools/spotbugs_tool.py` | ✅ |
+| 2.9.4 | Eclipse Steady integration — REST API client against local Steady server (Docker); extract `reachability` verdict per CVE from call-graph analysis | `tools/steady_tool.py` | ✅ |
+| 2.9.5 | Steady verdict writer — update `dependency_findings.reachability` + `reach_evidence` with Steady call-chain evidence; override heuristic verdict when Steady confidence > current | `workflows/reachability_workflow.py` | ✅ |
+| 2.9.6 | SpotBugs + Steady always-on — run in parallel with SAST/Secrets/SCA on every scan (not gated on `--deep`); skip gracefully for non-Java projects | `api/agent_gateway.py` | ✅ |
+| 2.9.7 | Steady server Docker setup — `docker/steady/docker-compose.yml` with haproxy + rest-backend + postgresql; OrbStack for macOS ARM64 | `docker/steady/docker-compose.yml` | ✅ |
+| 2.9.8 | FindSecBugs CLI bundling — auto-download `findsecbugs-cli-1.14.0.zip` to `tools/vendor/` at first scan; CRLF fix; two-pass javac fallback for Java EE projects | `tools/spotbugs_tool.py`, `tools/vendor/` | ✅ |
+
+### 2.10 Deep Code Analysis — CodeQL
+> Interprocedural SAST via full data-flow + taint analysis. Finds injection chains Semgrep misses (cross-method, cross-file).
+> Requires CodeQL CLI installed (`brew install codeql`). Triggered only via `deep=true` scan param.
+> See SSDLC_SCOPE.md §13c for rationale and licence concerns.
+
+| # | Task | File(s) | Status |
+|---|---|---|---|
+| 2.10.1 | CodeQL CLI wrapper — auto-detect CLI, create DB (with Maven build), run security query pack, parse SARIF → SASTFinding | `tools/codeql_tool.py` | ✅ |
+| 2.10.2 | CodeQL LangGraph workflow — runs after SAST; inserts net-new findings (dedup by file/line/rule); writes codeql_done flag | `workflows/codeql_workflow.py` | ✅ |
+| 2.10.3 | `deep=true` scan param — triggers CodeQL + SpotBugs + Steady; normal scans unaffected | `api/agent_gateway.py` | ✅ |
+| 2.10.4 | `codeql_done` agent flag in scan status | `api/agent_gateway.py`, `ui/src/types.ts` | ✅ |
+| 2.10.5 | CodeQL install doc — brew install steps, licence note, query pack setup | `docs/codeql_setup.md` | ✅ |
+
 ---
 
 ## Phase 3 — Dev + Quality (Months 10–13)

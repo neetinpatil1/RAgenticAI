@@ -460,6 +460,64 @@ WATCHDOG (5-min scheduled job):
 | Jun 2026 | FP pipeline + Code Review switched to llama3.2:3b for testing | qwen2.5-coder:14b and llama3.2:3b evict each other from VRAM. Switching both to llama3.2:3b eliminates model-swap overhead during testing. Switch back to qwen14B for production accuracy. |
 | Jun 2026 | SCA uses pip-audit + npm audit + OSV API, not Grype/Trivy | Avoids Docker for SCA; pip-audit and OSV API give same CVE coverage for Python/Node/Maven without container overhead. |
 | Jun 2026 | Secret scanner is custom Python (regex + Shannon entropy) — not a third-party tool | No third-party scanner had the right balance of zero-FP on placeholder values and high entropy detection. |
+| Jun 2026 | SpotBugs/FindSecBugs and Eclipse Steady deferred to Phase 2 (`--deep` mode only) | Both tools require a compiled build (`target/classes/` or WAR). Phase 1 scanner must work on source-only checkouts with no build step — enforced by air-gap constraint and CI/CD scan-before-build requirement. |
+| Jun 2026 | Eclipse Steady chosen over Dependency-Track for call-graph reachability | Dependency-Track does SCA (same as our OSV approach) but has no call-graph reachability engine. Steady's reachability is call-graph-based, not heuristic — gives definitive evidence chain `App.method() → Parent.x() → VulnerableClass.y()`. |
+| Jun 2026 | CodeQL deferred to `--deep` mode; not run on every scan | CodeQL database creation takes 5–20 min and 4–8 GB RAM — incompatible with fast CI/CD scans. Licence also needs procurement sign-off before production use. |
+
+---
+
+## 13c. Deep Reachability Analysis — SpotBugs + FindSecBugs + Eclipse Steady
+
+> Phase 2 addition. Augments the Phase 1 heuristic reachability (jar bytecode string search + import scan) with
+> call-graph-based analysis for Java projects that can be compiled locally.
+> See TRACKER.md §2.9 for implementation tasks.
+
+### Tools
+
+| Tool | Role | Homepage |
+|---|---|---|
+| **SpotBugs** | Bytecode SAST — finds bugs in compiled `.class` files via dataflow and control-flow analysis | github.com/spotbugs/spotbugs |
+| **FindSecBugs** | Security plugin for SpotBugs — adds 130+ security rules (OWASP Top 10, injection, crypto misuse, insecure random, XXE, SSRF, deserialization) | find-sec-bugs.github.io |
+| **Eclipse Steady** (SAP) | CVE reachability via call-graph — traces exact execution path from app entry point to vulnerable library method; verdict is REACHABLE/NOT_REACHABLE with full call chain as evidence | eclipse.dev/steady |
+| **CodeQL** (GitHub) | Interprocedural SAST — full data-flow + taint analysis across files; finds injection chains Semgrep misses | codeql.github.com |
+
+### What Each Adds Over Phase 1
+
+| Gap in Phase 1 | Tool that fills it |
+|---|---|
+| Semgrep runs on source — misses bytecode-only bugs (obfuscated code, generated classes, Lombok-expanded code) | SpotBugs + FindSecBugs |
+| Heuristic reachability (string search in JAR) has ~75% confidence — can FP on string matches that aren't actual calls | Eclipse Steady (call-graph is definitive) |
+| No explicit call chain evidence — only "found class reference in JAR" | Eclipse Steady provides `App.m() → Parent.foo() → Child.vuln()` full chain |
+| Reflection / AOP paths fall through to LLM verdict (UNKNOWN) | Eclipse Steady instruments bytecode and follows dynamic dispatch |
+
+### Concerns and Mitigations
+
+| # | Concern | Severity | Mitigation |
+|---|---|---|---|
+| 1 | **Build required** — SpotBugs and Steady need compiled bytecode. Projects that don't build (incomplete code, missing deps, wrong JDK) will silently skip these tools | High | Gate behind `--deep` flag. Pre-check: if `target/classes/` or `*.war` doesn't exist, attempt `mvn compile -q`; log outcome; skip gracefully if build fails. Never block the normal scan. |
+| 2 | **Steady server dependency** — Steady runs as a local server (REST API) that the scanner calls. If the server is down, reachability falls back to Phase 1 heuristics | Medium | Implement as optional: if Steady server `GET /health` fails within 2s, log warning and use heuristic result. No crash, no blocked scan. |
+| 3 | **Java-only** — SpotBugs and Steady only work for JVM languages. Python/Node SCA reachability still uses heuristic approach | Medium | Accepted for Phase 2. Python/Node reachability roadmap: PyDeps (Python call graph) + Madge (JS/TS). Deferred to Phase 3. |
+| 4 | **Steady licence and maintenance** — Eclipse Steady is maintained by SAP/Eclipse Foundation. Last major release 2023. Community activity lower than in peak years | Low–Medium | Monitor upstream. If abandoned, fallback is our Phase 1 heuristic + LLM. Steady verdict stored separately (`reach_source=steady`) so it can be disabled without losing other data. |
+| 5 | **SpotBugs finding duplication** — FindSecBugs will surface many of the same issues Semgrep already finds, creating duplicate findings in the UI | Medium | Dedup at insert time: skip any finding where `(file_path, line_start, rule_id)` already exists from a Semgrep scan. Tag `source=findsecbugs` on net-new findings. |
+| 6 | **Scan time increase** — SpotBugs + Steady add 2–5 minutes to scan time for a medium Java project | Low | Acceptable only in `--deep` mode (explicit user opt-in). Normal scans unaffected. Add `deep_scan_duration_ms` to scan coverage stats. |
+| 7 | **Air-gap compatibility** — Steady needs vulnerability database. In production (air-gapped), the CVE DB must be pre-loaded | High for prod | Steady supports offline CVE DB sync from a local mirror. Document setup in `docs/steady_setup.md`. This is a Phase 2 ops task, not a code task. |
+| 8 | **CodeQL licence** — free for open source only; commercial/regulated financial use requires GitHub Advanced Security licence. Must be confirmed with procurement before production deployment | Critical | Gate behind `--deep` flag; document licence requirement prominently in `docs/codeql_setup.md`. Do not enable by default. |
+
+### Integration Architecture (Phase 2)
+
+```
+POST /api/v1/scan  { "path": "...", "deep": true }
+         │
+         ├─ Normal pipeline (unchanged)
+         │    SAST (Semgrep) → FP pipeline → Secrets → SCA → Reachability (heuristic)
+         │
+         └─ Deep pipeline (--deep only, Java projects)
+              ├─ SpotBugs + FindSecBugs  ──→  net-new SAST findings → findings_reports
+              ├─ Eclipse Steady          ──→  override reachability verdict in dependency_findings
+              │                               (only when Steady confidence > current heuristic)
+              └─ CodeQL                  ──→  interprocedural taint findings → findings_reports
+                                              (dedup vs Semgrep by file/line/rule; fire-and-forget)
+```
 
 ---
 
@@ -479,6 +537,8 @@ WATCHDOG (5-min scheduled job):
 | 10 | pgvector replaces ChromaDB | Marginally lower recall at >1M embeddings. | One less component. Atomic transactions with PG metadata. |
 | 11 | AI-written codebase (Aider+Ollama) | Security-critical modules need mandatory human review. Integration debugging same speed. | ~2x productivity multiplier. 13-month platform vs 30-month manual. |
 | 12 | DAST API-only in Phase 2 | Angular/SPA UI DAST deferred to Phase 3. | API-mode ZAP on OpenAPI specs is achievable. Avoids auth/SPA failure mode. |
+| 13 | SpotBugs/FindSecBugs behind `--deep` flag only | Normal scans stay source-only and fast. Deep scan adds 2–5 min and requires a successful build. | Build-required tools never break source-only scans. CI/CD fast path unaffected. |
+| 14 | Eclipse Steady for reachability over Dependency-Track | DT has no call-graph engine — same OSV coverage we already have. | Steady gives definitive `App → Parent → VulnerableClass` evidence chains. Reduces heuristic UNKNOWN verdicts for Java. |
 
 ---
 

@@ -56,6 +56,8 @@ from workflows.secret_scan_workflow import run_secret_scan_workflow
 from workflows.sca_workflow import run_sca_workflow
 from workflows.fp_challenger_workflow import run_fp_challenger_workflow
 from workflows.reachability_workflow import run_reachability_workflow
+from workflows.spotbugs_workflow import run_spotbugs_workflow
+from workflows.codeql_workflow import run_codeql_workflow
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,6 +165,7 @@ class ScanRequest(BaseModel):
     """Request body for POST /api/v1/scan"""
     path: str = Field(..., description="Absolute local path to the code to scan")
     metadata: dict = Field(default_factory=dict, description="Optional scan context (project, team, etc.)")
+    deep: bool = Field(False, description="Enable deep scan: runs CodeQL + SpotBugs + Eclipse Steady in addition to normal pipeline. Requires CodeQL CLI installed. Adds 5–20 min.")
 
 
 class ScanResponse(BaseModel):
@@ -220,7 +223,7 @@ def _build_workflow_deps() -> dict:
 # Phase 1: parallel agent launcher
 # ---------------------------------------------------------------------------
 
-async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
+async def _run_all_agents(run_id: str, scan_path: str, deps: dict, deep: bool = False) -> None:
     """
     Orchestration order (guaranteed):
       Step 1 — Code Knowledge Graph build (awaited, blocks step 2)
@@ -228,6 +231,7 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
       Step 2 — SAST + Secret Scanner + SCA run in parallel (graph already built)
       Step 3 — Code Review runs after SAST/SCA complete with full graph context
       Step 4 — FP Challenger runs after Code Review completes
+      Step 5 — CodeQL deep scan (fire-and-forget, only when deep=True)
 
     return_exceptions=True ensures one agent crashing does not cancel the others.
     """
@@ -244,33 +248,36 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     _t1 = _t.time()
     if _graph_build_status.get(key, {}).get("status") not in ("done",):
         _graph_build_status[key] = {"status": "building", "error": None, "started_at": _t1}
-        logger.info("[STEP 1/4] Graph build: STARTING | run=%s path=%s", run_id, root.name)
+        logger.info("[STEP 1/5] Graph build: STARTING | run=%s path=%s", run_id, root.name)
         await _run_graph_build(root)   # ← awaited: SAST waits for this
         _graph_state = _graph_build_status.get(key, {}).get("status", "unknown")
-        logger.info("[STEP 1/4] Graph build: DONE | run=%s status=%s elapsed=%.1fs",
+        logger.info("[STEP 1/5] Graph build: DONE | run=%s status=%s elapsed=%.1fs",
                     run_id, _graph_state, _t.time() - _t1)
     else:
-        logger.info("[STEP 1/4] Graph build: SKIPPED (already built) | run=%s", run_id)
+        logger.info("[STEP 1/5] Graph build: SKIPPED (already built) | run=%s", run_id)
 
-    # ── Step 2: SAST + Secrets + SCA in parallel ─────────────────────────────
-    # All three run concurrently. SAST includes its inline FP pipeline (Layer 1 + Layer 3 LLM).
+    # ── Step 2: SAST + Secrets + SCA + SpotBugs in parallel ─────────────────
+    # All four run concurrently. SAST includes its inline FP pipeline (Layer 1 + Layer 3 LLM).
+    # SpotBugs adds Java bytecode SAST (FindSecBugs) — skipped gracefully if no .class files.
     # Code Review is NOT here — it needs SAST findings in the DB first.
     _t2 = _t.time()
-    logger.info("[STEP 2/4] SAST + Secrets + SCA: STARTING in parallel | run=%s", run_id)
-    sast_secret_sca = await asyncio.gather(
+    logger.info("[STEP 2/5] SAST + Secrets + SCA + SpotBugs: STARTING in parallel | run=%s", run_id)
+    pool_ref: asyncpg.Pool = deps["pool"]
+    step2_results = await asyncio.gather(
         run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
         run_secret_scan_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
         run_sca_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_spotbugs_workflow(run_id=run_id, scan_path=scan_path, pool=pool_ref),
         return_exceptions=True,
     )
     _elapsed2 = _t.time() - _t2
-    for i, r in enumerate(sast_secret_sca):
-        agent = ["sast", "secret_scanner", "sca"][i]
+    for i, r in enumerate(step2_results):
+        agent = ["sast", "secret_scanner", "sca", "spotbugs"][i]
         if isinstance(r, Exception):
-            logger.error("[STEP 2/4] Agent FAILED | agent=%s run=%s error=%s", agent, run_id, r)
+            logger.error("[STEP 2/5] Agent FAILED | agent=%s run=%s error=%s", agent, run_id, r)
         else:
-            logger.info("[STEP 2/4] Agent done | agent=%s run=%s", agent, run_id)
-    logger.info("[STEP 2/4] SAST + Secrets + SCA: ALL COMPLETE | run=%s elapsed=%.1fs",
+            logger.info("[STEP 2/5] Agent done | agent=%s run=%s", agent, run_id)
+    logger.info("[STEP 2/5] SAST + Secrets + SCA + SpotBugs: ALL COMPLETE | run=%s elapsed=%.1fs",
                 run_id, _elapsed2)
 
     # ── Step 3: Code Review (needs SAST findings in DB from step 2) ──────────
@@ -339,6 +346,16 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     await run_fp_challenger_workflow(run_id=run_id, deps=deps)
     logger.info("[STEP 4/5] FP Challenger: COMPLETE | run=%s elapsed=%.1fs", run_id, _t.time() - _t4)
 
+    # ── Step 5: CodeQL deep scan (fire-and-forget, only when deep=True) ──────
+    if deep:
+        logger.info("[STEP 5/5] CodeQL deep scan: STARTING (background) | run=%s", run_id)
+        pool: asyncpg.Pool = deps["pool"]
+        asyncio.create_task(
+            _run_codeql_step(run_id, scan_path, pool),
+        )
+    else:
+        logger.info("[STEP 5/5] CodeQL deep scan: SKIPPED (deep=False) | run=%s", run_id)
+
     logger.info("=" * 70)
     logger.info("SCAN ORCHESTRATION COMPLETE | run=%s total_elapsed=%.1fs",
                 run_id, _t.time() - _wall_start)
@@ -366,6 +383,15 @@ async def _run_reachability_step(run_id: str, scan_path: str, pool: asyncpg.Pool
             logger.info("Reachability step: no CVEs — skipping | run=%s", run_id)
     except Exception as exc:
         logger.error("Reachability step: FAILED | run=%s error=%s", run_id, exc)
+
+
+async def _run_codeql_step(run_id: str, scan_path: str, pool: asyncpg.Pool) -> None:
+    """Fire-and-forget wrapper for the CodeQL deep-scan workflow."""
+    try:
+        await run_codeql_workflow(run_id=run_id, scan_path=scan_path, pool=pool)
+        logger.info("CodeQL step: COMPLETE | run=%s", run_id)
+    except Exception as exc:
+        logger.error("CodeQL step: FAILED | run=%s error=%s", run_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +465,7 @@ async def submit_scan(
         run_id=run_id,
         scan_path=str(scan_path.resolve()),
         deps=deps,
+        deep=request.deep,
     )
 
     logger.info("Scan submitted | run=%s path=%s", run_id, request.path)
@@ -509,6 +536,11 @@ async def get_scan_status(run_id: str, pool: asyncpg.Pool = Depends(get_pool)):
             "secrets_done":      bool((meta.get("secret_scan") or {}).get("completed_at")),
             "sca_done":          bool((meta.get("sca") or {}).get("completed_at")),
             "reachability_done": bool((meta.get("reachability") or {}).get("completed_at")),
+            "spotbugs_done":     bool((meta.get("spotbugs") or {}).get("completed_at")),
+            "codeql_done":       bool(
+                (meta.get("codeql") or {}).get("completed_at")
+                or (meta.get("codeql") or {}).get("skipped")
+            ),
         },
     }
 

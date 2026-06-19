@@ -157,11 +157,19 @@ async def _extract_classes_with_llm(vuln_id: str, description: str) -> list[str]
             )
             r.raise_for_status()
             content = r.json()["message"]["content"]
-            # Parse JSON array from response
+            # Parse JSON from response — model may return bare array OR wrapped object
             cleaned = content.strip()
-            if cleaned.startswith("["):
-                classes = json.loads(cleaned)
-                return [c for c in classes if isinstance(c, str) and "." in c]
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, list):
+                classes = parsed
+            elif isinstance(parsed, dict):
+                # format:json wraps array — look for any list value
+                classes = next(
+                    (v for v in parsed.values() if isinstance(v, list)), []
+                )
+            else:
+                classes = []
+            return [c for c in classes if isinstance(c, str) and "." in c]
     except Exception as exc:
         logger.warning("CVE enricher LLM | vuln=%s error=%s", vuln_id, exc)
     return []

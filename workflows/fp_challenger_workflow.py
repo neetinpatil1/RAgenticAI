@@ -249,13 +249,15 @@ async def node_challenge_findings(state: FPChallengerState, deps: dict) -> FPCha
                 done += 1
                 return {**l1_decision.model_dump(), "finding_id": finding_id}
 
-            # Layer 3 — LLM re-evaluation with richer pgvector context
+            # Layer 3 — LLM re-evaluation with richer pgvector context.
+            # Start on Tier 2 (llama3.2:3b) for speed; Layer3LLM auto-escalates
+            # to Tier 1 (qwen14B) for high-stakes CWEs or low confidence (<0.6).
             try:
                 l3_decision = await layer3.evaluate(
                     finding=finding,
                     run_id=run_id,
                     finding_db_id=finding_id,
-                    use_tier1=True,   # always use Tier 1 (Qwen 14B) for challenger pass
+                    use_tier1=False,
                 )
                 prev = row.get("existing_verdict")
                 if l3_decision.verdict == FPVerdict.FP and prev in ("REAL", "ESCALATED", None):

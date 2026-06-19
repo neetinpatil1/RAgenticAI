@@ -107,24 +107,17 @@ async def node_complete(state: ScaWorkflowState, deps: dict) -> ScaWorkflowState
     pool: asyncpg.Pool = deps["pool"]
     run_id = state["run_id"]
     async with pool.acquire() as conn:
-        existing = await conn.fetchval(
-            "SELECT metadata FROM workflow_runs WHERE run_id = $1", run_id
-        )
-        meta: dict = {}
-        if existing:
-            try:
-                meta = json.loads(existing) if isinstance(existing, str) else (existing or {})
-            except Exception:
-                meta = {}
-        meta["sca"] = {
+        patch = json.dumps({"sca": {
             "findings_count": state.get("findings_count", 0),
             "packages_total": state.get("packages_total", 0),
             "ecosystems":     state.get("ecosystems", {}),
             "completed_at":   datetime.now(timezone.utc).isoformat(),
-        }
+        }})
         await conn.execute(
-            "UPDATE workflow_runs SET metadata = $1::jsonb WHERE run_id = $2",
-            json.dumps(meta), run_id,
+            """UPDATE workflow_runs
+               SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+               WHERE run_id = $2""",
+            patch, run_id,
         )
     logger.info("SCA workflow complete | run=%s", run_id)
     return state

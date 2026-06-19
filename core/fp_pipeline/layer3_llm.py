@@ -16,6 +16,7 @@ Prompt loaded from: prompts/sast_agent/v1.0/fp_analysis.yml
 
 import json
 import logging
+import re
 import httpx
 from typing import Optional
 
@@ -28,6 +29,29 @@ from core.state.vector_memory import VectorMemory
 from core.prompt_manager import PromptManager
 
 logger = logging.getLogger(__name__)
+
+
+def _try_repair_json(raw: str) -> Optional[dict]:
+    """
+    Best-effort extraction from a truncated LLM JSON response.
+
+    When num_predict cuts off mid-string the JSON is invalid, but the fields
+    we need (verdict, confidence) usually appear early in the response.
+    Returns a partial dict if verdict is recoverable, else None.
+    """
+    verdict_m = re.search(r'"verdict"\s*:\s*"([^"]+)"', raw)
+    if not verdict_m:
+        return None
+    confidence_m = re.search(r'"confidence"\s*:\s*([\d.]+)', raw)
+    fp_cat_m = re.search(r'"fp_category"\s*:\s*"?([^",\n}]+)"?', raw)
+    reasoning_m = re.search(r'"reasoning"\s*:\s*"([^"]*)', raw)
+
+    return {
+        "verdict":     verdict_m.group(1),
+        "confidence":  float(confidence_m.group(1)) if confidence_m else 0.5,
+        "fp_category": fp_cat_m.group(1).strip() if fp_cat_m and fp_cat_m.group(1).strip() not in ("null", "") else None,
+        "reasoning":   (reasoning_m.group(1).strip() + " [truncated]") if reasoning_m else None,
+    }
 
 
 class Layer3LLM:
@@ -176,6 +200,11 @@ Respond with valid JSON matching the schema:
                 {"role": "user",   "content": user_prompt},
             ],
             "stream": False,
+            # Ensure the model has enough token budget to close the JSON.
+            # Ollama default num_predict=128 truncates mid-reasoning → invalid JSON.
+            "options": {
+                "num_predict": 512,
+            },
         }
         # "format": "json" forces strict JSON output — safe for llama3.2:3b but causes
         # qwen2.5-coder to hang indefinitely, so only enable it for Tier 2 (small model).
@@ -230,6 +259,29 @@ Respond with valid JSON matching the schema:
             )
 
         except (json.JSONDecodeError, ValueError, KeyError) as exc:
+            # JSON repair: if the response is truncated mid-string, try to extract
+            # the fields we need via regex before giving up with ESCALATED.
+            repaired = _try_repair_json(raw)
+            if repaired is not None:
+                logger.info(
+                    "Layer 3 JSON repaired from truncated response | raw=%.100s", raw
+                )
+                verdict_str = repaired.get("verdict", "ESCALATED").upper()
+                try:
+                    verdict = FPVerdict(verdict_str)
+                except ValueError:
+                    verdict = FPVerdict.ESCALATED
+                return FPDecision(
+                    finding_id=finding_db_id,
+                    run_id=run_id,
+                    verdict=verdict,
+                    source=FPSource.LAYER3_LLM,
+                    confidence=float(repaired.get("confidence", 0.5)),
+                    fp_category=repaired.get("fp_category") if verdict == FPVerdict.FP else None,
+                    reasoning=repaired.get("reasoning"),
+                    label_status=LabelStatus.AGENT_ONLY,
+                )
+
             logger.warning(
                 "Layer 3 parse error — returning ESCALATED | error=%s raw=%.200s",
                 exc, raw
