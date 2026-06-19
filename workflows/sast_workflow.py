@@ -583,13 +583,10 @@ async def node_enqueue_next(state: SastWorkflowState, deps: dict) -> SastWorkflo
             run_id,
         )
 
-    await wf_state.set_completed(run_id)
-    await audit.log(
-        event_type=AuditEvent.SCAN_COMPLETED,
-        actor="sast_agent",
-        run_id=run_id,
-        payload=scan_stats,
-    )
+    # Note: wf_state.set_completed() is called by the gateway orchestration
+    # after ALL steps finish (FP Challenger, Reachability, etc.).
+    # Calling it here caused the UI to stop polling before long-running
+    # parallel steps completed.
 
     logger.info(
         "SAST workflow complete | run=%s real=%d fp=%d escalated=%d deadlock=%d",

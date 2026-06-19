@@ -363,6 +363,12 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict, deep: bool = 
     else:
         logger.info("[STEP 5/5] CodeQL deep scan: SKIPPED (deep=False) | run=%s", run_id)
 
+    # Mark the run as completed only after all steps finish.
+    # Previously this was done inside sast_workflow.py which caused the UI
+    # to start its MAX_RETRIES countdown before reachability/FP even began.
+    wf_state = get_workflow_state()
+    await wf_state.set_completed(run_id)
+
     logger.info("=" * 70)
     logger.info("SCAN ORCHESTRATION COMPLETE | run=%s total_elapsed=%.1fs",
                 run_id, _t.time() - _wall_start)

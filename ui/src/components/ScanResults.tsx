@@ -238,7 +238,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     // written by each workflow independently — so we can stop those spinners without
     // waiting for the full SAST pipeline to finish.
     async function pollSastStatus(retries = 0) {
-      const MAX_RETRIES = 120; // 120 × 10s = 20 min
+      const MAX_RETRIES = 360; // 360 × 10s = 60 min
       if (retries >= MAX_RETRIES) {
         setSastDone(true);
         setSecretScanning(false);
