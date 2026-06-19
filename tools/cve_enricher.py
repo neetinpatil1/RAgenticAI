@@ -145,7 +145,7 @@ async def _extract_classes_with_llm(vuln_id: str, description: str) -> list[str]
             "If no specific class is mentioned, return []. "
             'Example: ["com.example.VulnClass"]'
         )
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=settings.ollama.request_timeout) as client:
             r = await client.post(
                 f"{settings.ollama.base_url}/api/chat",
                 json={
@@ -171,5 +171,5 @@ async def _extract_classes_with_llm(vuln_id: str, description: str) -> list[str]
                 classes = []
             return [c for c in classes if isinstance(c, str) and "." in c]
     except Exception as exc:
-        logger.warning("CVE enricher LLM | vuln=%s error=%s", vuln_id, exc)
+        logger.warning("CVE enricher LLM | vuln=%s error=%s", vuln_id, str(exc) or type(exc).__name__)
     return []

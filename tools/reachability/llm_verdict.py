@@ -70,8 +70,9 @@ Respond with valid JSON:
                 "reasoning":  data.get("reasoning", ""),
             }
     except Exception as exc:
-        logger.warning("llm_verdict | failed: %s", exc)
-        return {"verdict": "UNKNOWN", "confidence": 0.0, "reasoning": f"LLM error: {exc}"}
+        err_msg = str(exc) or type(exc).__name__
+        logger.warning("llm_verdict | failed: %s", err_msg)
+        return {"verdict": "UNKNOWN", "confidence": 0.0, "reasoning": f"LLM error: {err_msg}"}
 
 
 def _get_usage_snippets(scan_path: str, package_name: str, max_lines: int = 20) -> str:

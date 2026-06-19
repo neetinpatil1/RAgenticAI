@@ -313,12 +313,19 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict, deep: bool = 
     except Exception as exc:
         logger.warning("Could not pre-insert code_review_status: %s", exc)
 
-    logger.info("[STEP 3/5] Code Review + Reachability: STARTING in parallel | run=%s", run_id)
-    await asyncio.gather(
-        _run_code_review_step(run_id, scan_path, deps),
-        _run_reachability_step(run_id, scan_path, deps["pool"]),
-        return_exceptions=True,
-    )
+    # Code Review then Reachability — sequential, not parallel.
+    # Ollama queues requests serially; running both concurrently causes ReadTimeout
+    # on whichever workflow has to wait behind the other's LLM calls.
+    logger.info("[STEP 3/5] Code Review: STARTING | run=%s", run_id)
+    try:
+        await _run_code_review_step(run_id, scan_path, deps)
+    except Exception as exc:
+        logger.warning("[STEP 3/5] Code Review failed (non-fatal): %s | run=%s", exc, run_id)
+    logger.info("[STEP 3/5] Reachability: STARTING | run=%s", run_id)
+    try:
+        await _run_reachability_step(run_id, scan_path, deps["pool"])
+    except Exception as exc:
+        logger.warning("[STEP 3/5] Reachability failed (non-fatal): %s | run=%s", exc, run_id)
     logger.info("[STEP 3/5] Code Review + Reachability: COMPLETE | run=%s elapsed=%.1fs",
                 run_id, _t.time() - _t3)
 

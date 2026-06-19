@@ -32,6 +32,7 @@ class Framework(str, Enum):
     FASTAPI     = "fastapi"
     REACT       = "react"
     NODEJS      = "nodejs"
+    JAVA        = "java"        # generic Java (SpotBugs/FindSecBugs findings)
     UNKNOWN     = "unknown"
 
 

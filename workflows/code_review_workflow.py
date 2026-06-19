@@ -746,8 +746,9 @@ async def node_review_files(state: CodeReviewState, deps: dict) -> CodeReviewSta
     processed = 0
     total_findings = 0
 
-    # Semaphore = 2: send 2 files to Ollama concurrently (matches OLLAMA_NUM_PARALLEL=2)
-    semaphore = asyncio.Semaphore(2)
+    # Semaphore = 1: one file at a time through Ollama — avoids ReadTimeout
+    # when other workflows (reachability, FP pipeline) compete for the same model.
+    semaphore = asyncio.Semaphore(1)
     lock = asyncio.Lock()   # protect shared counters
 
     async def review_one(abs_path: str) -> None:
