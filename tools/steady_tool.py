@@ -47,6 +47,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
 
+import asyncpg
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,14 @@ class SteadyVerdict:
     confidence:        float
 
 
+_CIA_URL         = os.getenv("CIA_URL",          "http://localhost:8033/cia")
+_STEADY_DB_HOST  = os.getenv("STEADY_DB_HOST",  "localhost")
+_STEADY_DB_PORT  = int(os.getenv("STEADY_DB_PORT",  "8032"))
+_STEADY_DB_NAME  = os.getenv("STEADY_DB_NAME",  "vulas")
+_STEADY_DB_USER  = os.getenv("STEADY_DB_USER",  "steady")
+_STEADY_DB_PASS  = os.getenv("STEADY_DB_PASS",  "steadypass")
+
+
 class SteadyTool:
     """
     Calls Eclipse Steady REST API to get call-graph-based reachability verdicts.
@@ -74,6 +83,7 @@ class SteadyTool:
 
     def __init__(self):
         self._base = _STEADY_URL.rstrip("/")
+        self._cia  = _CIA_URL.rstrip("/")
         self._space_token: Optional[str] = None
         self._tenant_token: Optional[str] = None
 
@@ -191,6 +201,153 @@ class SteadyTool:
             return {}
 
     # -------------------------------------------------------------------------
+    # CIA — construct lookup
+    # -------------------------------------------------------------------------
+
+    async def _get_cia_constructs(
+        self,
+        group:    str,
+        artifact: str,
+        version:  str,
+        filter_classes: list[str] | None = None,
+    ) -> list[dict]:
+        """
+        Ask CIA for all METH/CONS constructs of a library version, optionally
+        filtered to specific class names (the affected classes for a CVE).
+
+        CIA fetches the JAR from Maven Central on first call (cached afterwards).
+        Returns list of constructChange dicts ready for POST /backend/bugs.
+
+        filter_classes: e.g. ["org.dom4j.DocumentHelper", "org.dom4j.io.SAXReader"]
+        If provided, only methods belonging to those classes are returned.
+        If None/empty, returns the first 30 methods from the whole library
+        (last-resort fallback so Steady has *something* to trace).
+        """
+        url = f"{self._cia}/artifacts/{group}/{artifact}/{version}/jar/constructIds"
+        try:
+            async with httpx.AsyncClient(timeout=60) as cia_client:
+                r = await cia_client.get(url)
+                if r.status_code != 200:
+                    logger.warning("Steady | CIA constructs %d for %s:%s:%s",
+                                   r.status_code, group, artifact, version)
+                    return []
+                all_constructs = r.json()
+        except Exception as exc:
+            logger.warning("Steady | CIA constructs error: %s", exc)
+            return []
+
+        if not all_constructs:
+            return []
+
+        # Filter to affected classes when provided
+        if filter_classes:
+            matching = [
+                c for c in all_constructs
+                if c.get("type") in ("METH", "CONS")
+                and any(
+                    c.get("qname", "").startswith(cls + "(")   # exact class match
+                    or c.get("qname", "").startswith(cls + ".")  # inner class / nested
+                    for cls in filter_classes
+                )
+            ]
+            if matching:
+                logger.info("Steady | CIA found %d constructs for classes %s in %s:%s:%s",
+                            len(matching), filter_classes, group, artifact, version)
+                return [
+                    {"constructId": {"lang": "JAVA", "type": c["type"], "qname": c["qname"]},
+                     "constructChangeType": "MOD", "repoType": "CVS"}
+                    for c in matching[:100]   # cap at 100 methods
+                ]
+
+        # Fallback: no class filter or no match — take first 30 METH constructs
+        fallback = [c for c in all_constructs if c.get("type") == "METH"][:30]
+        logger.info("Steady | CIA fallback: %d constructs for %s:%s:%s",
+                    len(fallback), group, artifact, version)
+        return [
+            {"constructId": {"lang": "JAVA", "type": c["type"], "qname": c["qname"]},
+             "repoType": "CVS"}
+            for c in fallback
+        ]
+
+    # -------------------------------------------------------------------------
+    # Direct DB construct seeding (bypasses REST API PUT limitation)
+    # -------------------------------------------------------------------------
+
+    async def _seed_constructs_direct(
+        self,
+        bug_id:     str,
+        constructs: list[dict],
+    ) -> int:
+        """
+        Insert constructChanges directly into Steady's PostgreSQL when the
+        REST API PUT /backend/bugs/{id} returns 500.
+
+        Steady's PUT endpoint fails on existing bugs because it tries to
+        re-insert duplicate (lang, type, qname) rows in construct_id without
+        ON CONFLICT handling. Direct DB insert uses ON CONFLICT DO NOTHING.
+
+        Returns the number of construct_change rows inserted.
+        """
+        if not constructs:
+            return 0
+        try:
+            conn = await asyncpg.connect(
+                host=_STEADY_DB_HOST, port=_STEADY_DB_PORT,
+                database=_STEADY_DB_NAME, user=_STEADY_DB_USER,
+                password=_STEADY_DB_PASS,
+            )
+            inserted = 0
+            async with conn.transaction():
+                for c in constructs:
+                    cid  = c.get("constructId", {})
+                    lang = cid.get("lang", "JAVA")
+                    typ  = cid.get("type", "METH")
+                    qname = cid.get("qname", "")
+                    if not qname:
+                        continue
+
+                    # 1. Insert construct_id row.
+                    #    construct_id.id has NO DEFAULT (Hibernate manages IDs via
+                    #    hibernate_sequence), so we must supply nextval() explicitly.
+                    #    ON CONFLICT DO NOTHING is safe for existing rows.
+                    #    Then SELECT to get the actual id (inserted or pre-existing).
+                    await conn.execute(
+                        """INSERT INTO construct_id (id, lang, type, qname)
+                           VALUES (nextval('hibernate_sequence'), $1, $2, $3)
+                           ON CONFLICT (lang, type, qname) DO NOTHING""",
+                        lang, typ, qname,
+                    )
+                    cid_row = await conn.fetchrow(
+                        "SELECT id FROM construct_id WHERE lang=$1 AND type=$2 AND qname=$3",
+                        lang, typ, qname,
+                    )
+                    if not cid_row:
+                        continue
+                    construct_db_id = cid_row["id"]
+
+                    # 2. Insert bug_construct_change (idempotent via ON CONFLICT)
+                    result = await conn.execute(
+                        """INSERT INTO bug_construct_change
+                             (id, bug, construct_id, construct_change_type, repo, commit, repo_path)
+                           VALUES (
+                             nextval('hibernate_sequence'),
+                             $1, $2, 'MOD', 'manual', 'manual', '/'
+                           )
+                           ON CONFLICT (bug, repo, commit, repo_path, construct_id) DO NOTHING""",
+                        bug_id, construct_db_id,
+                    )
+                    if result and result != "INSERT 0 0":
+                        inserted += 1
+
+            await conn.close()
+            logger.info("Steady | DB seeded %d constructs for bug %s", inserted, bug_id)
+            return inserted
+
+        except Exception as exc:
+            logger.warning("Steady | DB construct seed error for %s: %s", bug_id, exc)
+            return 0
+
+    # -------------------------------------------------------------------------
     # CVE / bug database seeding
     # -------------------------------------------------------------------------
 
@@ -202,14 +359,15 @@ class SteadyTool:
         """
         Seed Steady's bug database with CVEs from our dependency_findings table.
 
-        Without the CIA (Code Impact Analyzer) service, Steady's bug database is empty
-        and /vulndeps always returns []. This method populates it directly using:
-          1. POST /backend/bugs — create the bug entry (maturity=READY, origin=PUBLIC)
-          2. PUT  /backend/bugs/{id}/affectedLibIds?source=MANUAL — mark which library
-             version is affected (so vulndeps cross-referencing works)
+        With CIA running this now does:
+          1. POST /backend/bugs — with constructChanges populated from CIA
+             (specific methods of the affected class from the vulnerable JAR).
+             This gives Steady concrete call-graph targets to trace against app code.
+          2. PUT  /backend/bugs/{id}/affectedLibIds?source=MANUAL — mark affected version.
+          3. PUT  /backend/bugs/{id} — update existing bug's constructChanges if already seeded.
 
-        The seeder is idempotent: 409 on bug creation = already exists, skip.
-        Only seeds bugs that aren't already in the database.
+        constructChanges are fetched from CIA filtered to the known affected_classes
+        (from cve_enricher). Falls back to first-N methods of the library if no class info.
         """
         # Deduplicate: one bug entry per vulnerability_id × package coordinates
         seen_bugs:    set[str] = set()
@@ -230,33 +388,60 @@ class SteadyTool:
                 continue
             group, artifact = parts[0], parts[1]
 
-            # --- Step 1: create bug entry ---
+            # --- Step 1: get CIA constructs for this library/version ---
+            # affected_classes is a JSON string e.g. '["org.dom4j.DocumentHelper"]'
+            affected_classes: list[str] = []
+            raw_classes = row.get("affected_classes")
+            if raw_classes:
+                try:
+                    import json as _json
+                    parsed = _json.loads(raw_classes) if isinstance(raw_classes, str) else raw_classes
+                    if isinstance(parsed, list):
+                        affected_classes = [c for c in parsed if c]
+                except Exception:
+                    pass
+
+            construct_changes: list[dict] = []
+            if vuln_id not in seen_bugs:
+                # Only call CIA once per (group, artifact, version) per bug
+                construct_changes = await self._get_cia_constructs(
+                    group, artifact, version, affected_classes or None
+                )
+                logger.info(
+                    "Steady | CIA constructs for %s: %d (classes=%s)",
+                    vuln_id, len(construct_changes), affected_classes or "fallback"
+                )
+
+            # --- Step 2: create or update bug entry ---
             if vuln_id not in seen_bugs:
                 seen_bugs.add(vuln_id)
                 try:
                     r = await client.post(
                         "/backend/bugs",
                         json={
-                            "bugId":       vuln_id,
-                            "maturity":    "READY",
-                            "origin":      "PUBLIC",
-                            "description": desc[:512],
-                            "constructChanges": [],
+                            "bugId":            vuln_id,
+                            "maturity":         "READY",
+                            "origin":           "PUBLIC",
+                            "description":      desc[:512],
+                            "constructChanges": construct_changes,
                         },
                         headers=self._auth_headers(),
                     )
                     if r.status_code == 201:
-                        logger.debug("Steady | seeded bug %s", vuln_id)
+                        logger.debug("Steady | seeded bug %s constructs=%d",
+                                     vuln_id, len(construct_changes))
                     elif r.status_code == 409:
-                        logger.debug("Steady | bug %s already exists", vuln_id)
+                        # Bug exists — REST PUT fails on duplicates, use direct DB insert
+                        if construct_changes:
+                            await self._seed_constructs_direct(vuln_id, construct_changes)
                     else:
                         logger.warning("Steady | seed bug %s failed: %d", vuln_id, r.status_code)
-                        continue   # skip affectedLibIds if bug creation failed
+                        continue
                 except Exception as exc:
                     logger.warning("Steady | seed bug error %s: %s", vuln_id, exc)
                     continue
 
-            # --- Step 2: mark affected library version ---
+            # --- Step 3: mark affected library version ---
             affect_key = f"{vuln_id}|{group}:{artifact}:{version}"
             if affect_key in seen_affects or not version:
                 continue
@@ -480,15 +665,12 @@ class SteadyTool:
                     verdict_str = "LIKELY_REACHABLE"
                     confidence  = 0.70
                 else:
-                    # reachable == 0: unknown (no CIA), but affected_version is confirmed.
-                    # Use LIKELY_REACHABLE when affected_version is confirmed (=1).
-                    affected = item.get("affected_version") or item.get("affectedVersion") or 0
-                    if affected == 1:
-                        verdict_str = "LIKELY_REACHABLE"
-                        confidence  = 0.60
-                    else:
-                        verdict_str = "UNKNOWN"
-                        confidence  = 0.0
+                    # reachable == 0: CIA service did not run — no call-graph analysis performed.
+                    # Steady only confirmed the library version is affected (version-match only).
+                    # This is NOT a call-graph result — we mark as UNKNOWN so the heuristic
+                    # analysis (import-scan + JAR bytecode) is preserved instead.
+                    verdict_str = "UNKNOWN"
+                    confidence  = 0.0
 
                 call_chain = None
                 path = item.get("constructPath") or item.get("callPath")

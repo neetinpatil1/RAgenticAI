@@ -1309,15 +1309,78 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                                   No fixed version available. Check the advisory for workarounds or consider replacing this dependency.
                                 </div>
                               )}
-                              {f.reach_evidence && (
-                                <div>
-                                  <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Reachability Evidence</p>
-                                  <pre className="text-xs text-gray-300 bg-gray-800 rounded p-3 whitespace-pre-wrap leading-relaxed font-mono">
-                                    {f.reach_evidence}
-                                  </pre>
-                                  {f.reach_source && (
-                                    <p className="text-xs text-gray-600 mt-1">Source: {f.reach_source} · confidence {Math.round((f.reach_confidence ?? 0) * 100)}%</p>
+                              {/* Reachability Analysis Panel */}
+                              {f.reachability && (
+                                <div className={`rounded-lg border px-4 py-3 space-y-2 ${
+                                  f.reachability === 'REACHABLE'
+                                    ? 'bg-red-950/30 border-red-700/50'
+                                    : f.reachability === 'NOT_REACHABLE'
+                                    ? 'bg-green-950/30 border-green-700/50'
+                                    : f.reachability === 'LIKELY_REACHABLE'
+                                    ? 'bg-orange-950/30 border-orange-700/50'
+                                    : 'bg-gray-800/50 border-gray-700/50'
+                                }`}>
+                                  {/* Header row */}
+                                  <div className="flex items-center justify-between">
+                                    <div className="flex items-center gap-2">
+                                      <span className={`text-xs font-bold uppercase tracking-wide ${
+                                        f.reachability === 'REACHABLE' ? 'text-red-400' :
+                                        f.reachability === 'NOT_REACHABLE' ? 'text-green-400' :
+                                        f.reachability === 'LIKELY_REACHABLE' ? 'text-orange-400' :
+                                        'text-gray-400'
+                                      }`}>
+                                        {f.reachability === 'REACHABLE'     ? '⚡ Reachable — Vulnerable path confirmed' :
+                                         f.reachability === 'NOT_REACHABLE' ? '✓ Not Reachable — Vulnerable code not called' :
+                                         f.reachability === 'LIKELY_REACHABLE' ? '~ Likely Reachable — Probable path found' :
+                                         f.reachability === 'LIKELY_NOT_REACHABLE' ? '~ Likely Safe — No obvious path found' :
+                                         '? Unknown — Analysis inconclusive'}
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center gap-3 text-xs text-gray-500">
+                                      {f.reach_source && (
+                                        <span className="bg-gray-700/60 px-2 py-0.5 rounded font-mono">
+                                          {f.reach_source === 'steady' ? 'Eclipse Steady' :
+                                           f.reach_source === 'jar-bytecode' ? 'JAR Bytecode' :
+                                           f.reach_source === 'import-scan' ? 'Import Scan' :
+                                           f.reach_source === 'llm' ? 'LLM Analysis' :
+                                           f.reach_source}
+                                        </span>
+                                      )}
+                                      {f.reach_confidence != null && (
+                                        <span className={`font-semibold ${
+                                          (f.reach_confidence ?? 0) >= 0.85 ? 'text-green-400' :
+                                          (f.reach_confidence ?? 0) >= 0.60 ? 'text-yellow-400' :
+                                          'text-gray-500'
+                                        }`}>
+                                          {Math.round((f.reach_confidence ?? 0) * 100)}% confidence
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {/* Evidence body */}
+                                  {f.reach_evidence && (
+                                    <pre className={`text-xs rounded p-3 whitespace-pre-wrap leading-relaxed font-mono ${
+                                      f.reachability === 'REACHABLE'     ? 'bg-red-950/40 text-red-200' :
+                                      f.reachability === 'NOT_REACHABLE' ? 'bg-green-950/40 text-green-200' :
+                                      f.reachability === 'LIKELY_REACHABLE' ? 'bg-orange-950/40 text-orange-200' :
+                                      'bg-gray-900 text-gray-300'
+                                    }`}>
+                                      {f.reach_evidence}
+                                    </pre>
                                   )}
+
+                                  {/* Contextual guidance */}
+                                  <p className="text-xs text-gray-500 italic">
+                                    {f.reachability === 'REACHABLE' &&
+                                      'Action required: this vulnerability is actively exploitable via your code. Prioritise patching.'}
+                                    {f.reachability === 'NOT_REACHABLE' &&
+                                      'Low priority: the vulnerable function is not called by your application. Still recommended to upgrade when convenient.'}
+                                    {f.reachability === 'LIKELY_REACHABLE' &&
+                                      'Medium priority: a probable call path exists but could not be fully confirmed via bytecode. Review manually.'}
+                                    {f.reachability === 'UNKNOWN' &&
+                                      'Run `mvn dependency:copy-dependencies` in the project and re-scan to enable JAR bytecode analysis.'}
+                                  </p>
                                 </div>
                               )}
                             </div>

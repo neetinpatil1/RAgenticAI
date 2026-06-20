@@ -30,6 +30,8 @@ services:
     depends_on:
       rest-backend:
         condition: service_started
+      rest-lib-utils:
+        condition: service_started
     restart: unless-stopped
 
   rest-backend:
@@ -45,7 +47,7 @@ services:
       - spring.datasource.username=steady
       - spring.datasource.password=steadypass
       - spring.datasource.url=jdbc:postgresql://postgresql:5432/vulas
-      - vulas.shared.cia.serviceUrl=http://localhost:8092/cia
+      - vulas.shared.cia.serviceUrl=http://rest-lib-utils:8092/cia
       - vulas.shared.cve.serviceUrl=https://services.nvd.nist.gov/rest/json/cve/1.0/<ID>
       - vulas.backend.cveCache.refetchAllMs=86400000
       - vulas.backend.cveCache.refetchSingleMs=60000
@@ -55,6 +57,19 @@ services:
     depends_on:
       postgresql:
         condition: service_healthy
+      rest-lib-utils:
+        condition: service_started
+    restart: unless-stopped
+
+  rest-lib-utils:
+    container_name: steady-cia
+    image: eclipse/steady-rest-lib-utils:3.2.5
+    platform: linux/amd64
+    expose:
+      - "8092"
+    environment:
+      - JAVA_OPTIONS=-Xmx1g
+      - NON_PROXY_HOSTS=localhost
     restart: unless-stopped
 
   postgresql:

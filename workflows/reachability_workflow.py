@@ -32,8 +32,9 @@ from tools.steady_tool                    import SteadyTool
 
 logger = logging.getLogger(__name__)
 
-# Max concurrent CVE analyses (each does file I/O + optional LLM call)
-_SEM = asyncio.Semaphore(3)
+# NOTE: _SEM is created inside run_reachability_workflow (not at module level)
+# to avoid "Future attached to a different loop" errors in Python 3.9 when the
+# module is imported before asyncio.run() starts an event loop.
 
 
 async def run_reachability_workflow(
@@ -79,9 +80,13 @@ async def run_reachability_workflow(
         except Exception as exc:
             logger.warning("Reachability | dep_tree failed: %s", exc)
 
-        # Analyse each CVE with heuristic chain assembler (bounded concurrency)
+        # Analyse each CVE with heuristic chain assembler (bounded concurrency).
+        # Semaphore created here (not module-level) to avoid Python 3.9
+        # "Future attached to a different loop" error when the module is imported
+        # before asyncio.run() starts the event loop.
+        sem = asyncio.Semaphore(3)
         tasks = [
-            _analyse_one(run_id, scan_path, dict(row), dep_tree, pool)
+            _analyse_one(run_id, scan_path, dict(row), dep_tree, pool, sem)
             for row in rows
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -89,19 +94,30 @@ async def run_reachability_workflow(
         # Eclipse Steady — call-graph override (Java only, optional)
         # Runs after heuristic pass. Overrides UNKNOWN/LIKELY verdicts where
         # Steady can provide a definitive call-chain-based result.
-        # Pass known CVE findings so Steady's bug database can be seeded on-the-fly
-        # (replaces the CIA/patch-lib-analyzer service requirement for basic matching).
+        # Re-fetch findings AFTER heuristic pass so affected_classes (written by
+        # _analyse_one → cve_enricher) are included — CIA uses them to narrow
+        # constructChanges to specific vulnerable methods, not all library constructs.
         steady = SteadyTool()
         if await steady.is_available():
             logger.info("Reachability | Steady available — running call-graph analysis | run=%s", run_id)
-            known_vulns = [dict(r) for r in rows]
+            async with pool.acquire() as conn:
+                enriched_rows = await conn.fetch(
+                    """SELECT id, package_name, installed_version, vulnerability_id,
+                              description, ecosystem, affected_classes, fixed_version
+                       FROM dependency_findings
+                       WHERE run_id = $1""",
+                    run_id,
+                )
+            known_vulns = [dict(r) for r in enriched_rows]
             steady_verdicts = await steady.analyze(
                 scan_path=scan_path, run_id=run_id, known_vulns=known_vulns
             )
             if steady_verdicts:
-                await _apply_steady_verdicts(pool, run_id, steady_verdicts)
-                logger.info("Reachability | Steady applied %d verdicts | run=%s",
-                            len(steady_verdicts), run_id)
+                applied = await _apply_steady_verdicts(pool, run_id, steady_verdicts)
+                logger.info("Reachability | Steady applied %d/%d verdicts | run=%s",
+                            applied, len(steady_verdicts), run_id)
+            else:
+                logger.info("Reachability | Steady returned 0 verdicts (CIA not configured) | run=%s", run_id)
         else:
             logger.info("Reachability | Steady not available — using heuristic results | run=%s", run_id)
 
@@ -121,6 +137,7 @@ async def _analyse_one(
     finding:   dict,
     dep_tree:  DepTree,
     pool:      asyncpg.Pool,
+    sem:       asyncio.Semaphore,
 ) -> None:
     """Analyse reachability for one CVE finding. Never raises."""
     finding_id  = str(finding["id"])
@@ -128,7 +145,7 @@ async def _analyse_one(
     pkg_name    = finding["package_name"]
     description = finding.get("description") or ""
 
-    async with _SEM:
+    async with sem:
         logger.info("Reachability | analysing vuln=%s pkg=%s", vuln_id, pkg_name)
         try:
             # Step 1: Enrich CVE → get vulnerable class
@@ -243,11 +260,20 @@ async def _apply_steady_verdicts(
     pool:            asyncpg.Pool,
     run_id:          str,
     steady_verdicts: dict,
-) -> None:
+) -> int:
     """
     Override heuristic reachability results with Steady's call-graph verdicts.
-    Only overrides when Steady confidence > existing confidence, or existing is UNKNOWN.
+
+    Override policy:
+    - ONLY override with definitive CIA-backed verdicts (REACHABLE / NOT_REACHABLE, confidence >= 0.90).
+    - LIKELY_REACHABLE from Steady means no CIA service ran — it's just version-matching,
+      no better than what SCA already told us. Never let it overwrite heuristic results.
+    - When Steady does have a definitive verdict, always prefer it — call-graph analysis
+      is more accurate than import/bytecode heuristics.
+
+    Returns the number of rows actually updated.
     """
+    applied = 0
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -257,35 +283,50 @@ async def _apply_steady_verdicts(
                 run_id,
             )
             for row in rows:
-                vuln_id   = row["vulnerability_id"]
+                vuln_id = row["vulnerability_id"]
                 sv = steady_verdicts.get(vuln_id)
                 if not sv:
                     continue
-                existing_conf = float(row["reach_confidence"] or 0.0)
-                existing_ver  = (row["reachability"] or "UNKNOWN").upper()
-                # Override if Steady is more confident OR existing is UNKNOWN/LIKELY
-                if sv.confidence > existing_conf or existing_ver in ("UNKNOWN", "LIKELY_REACHABLE", "LIKELY_NOT_REACHABLE"):
-                    evidence = f"Eclipse Steady call-graph analysis."
-                    if sv.call_chain:
-                        evidence += f"\nCall chain: {sv.call_chain}"
-                    await conn.execute(
-                        """UPDATE dependency_findings
-                           SET reachability      = $1,
-                               reach_evidence    = $2,
-                               reach_confidence  = $3,
-                               reach_source      = 'steady'
-                           WHERE id = $4""",
-                        sv.verdict,
-                        evidence,
-                        sv.confidence,
-                        row["id"],
+
+                # Only trust definitive CIA call-graph results.
+                # LIKELY_REACHABLE means reachable=0 (no CIA ran) — skip it.
+                if sv.verdict not in ("REACHABLE", "NOT_REACHABLE") or sv.confidence < 0.90:
+                    logger.debug(
+                        "Reachability | Steady skipped (no CIA) | vuln=%s verdict=%s conf=%.2f",
+                        vuln_id, sv.verdict, sv.confidence,
                     )
-                    logger.info(
-                        "Reachability | Steady override | vuln=%s %s→%s conf=%.2f",
-                        vuln_id, existing_ver, sv.verdict, sv.confidence,
-                    )
+                    continue
+
+                existing_ver = (row["reachability"] or "UNKNOWN").upper()
+
+                # Build rich evidence string
+                evidence_lines = ["Eclipse Steady call-graph analysis (CIA-confirmed)."]
+                if sv.call_chain:
+                    evidence_lines.append(f"Call chain: {sv.call_chain}")
+                else:
+                    evidence_lines.append("No call chain available (CIA service response incomplete).")
+                evidence = "\n".join(evidence_lines)
+
+                await conn.execute(
+                    """UPDATE dependency_findings
+                       SET reachability      = $1,
+                           reach_evidence    = $2,
+                           reach_confidence  = $3,
+                           reach_source      = 'steady'
+                       WHERE id = $4""",
+                    sv.verdict,
+                    evidence,
+                    sv.confidence,
+                    row["id"],
+                )
+                applied += 1
+                logger.info(
+                    "Reachability | Steady override | vuln=%s %s→%s conf=%.2f",
+                    vuln_id, existing_ver, sv.verdict, sv.confidence,
+                )
     except Exception as exc:
         logger.warning("Reachability | _apply_steady_verdicts error: %s", exc)
+    return applied
 
 
 async def _write_result(pool: asyncpg.Pool, finding_id: str, result: dict) -> None:

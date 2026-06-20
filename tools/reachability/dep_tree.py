@@ -107,6 +107,8 @@ def _parse_pom(pom_path: Path) -> list[dict]:
 
 def _build_maven_tree(root: Path) -> DepTree:
     tree = DepTree(ecosystem="maven")
+    seen_jars: set[str] = set()
+
     try:
         pom_files = list(root.rglob("pom.xml"))
         for pom in pom_files:
@@ -114,10 +116,29 @@ def _build_maven_tree(root: Path) -> DepTree:
                 tree.direct_deps.append(dep)
                 tree.all_ids.add(f"{dep['name']}:{dep['version']}")
                 jar = _resolve_jar(dep["group"], dep["name"], dep["version"])
-                if jar:
+                if jar and jar.name not in seen_jars:
+                    seen_jars.add(jar.name)
                     tree.jar_paths.append(jar)
     except Exception as exc:
         logger.warning("dep_tree | maven build error: %s", exc)
+
+    # Fallback: scan target/dependency/ (populated by mvn dependency:copy-dependencies).
+    # This is the primary JAR source when the project has been built but deps aren't
+    # in ~/.m2 (e.g. first build, CI environment, or a standalone test lab project).
+    fallback_dirs = [
+        root / "target" / "dependency",        # standard Maven copy-dependencies output
+        root / "target" / "lib",               # some project conventions
+        root / "lib",                           # bundled JARs checked into the repo
+    ]
+    for jar_dir in fallback_dirs:
+        if not jar_dir.is_dir():
+            continue
+        for jar_path in jar_dir.glob("*.jar"):
+            if jar_path.name not in seen_jars:
+                seen_jars.add(jar_path.name)
+                tree.jar_paths.append(jar_path)
+                logger.debug("dep_tree | fallback JAR: %s", jar_path.name)
+
     logger.info("dep_tree | maven deps=%d jars_resolved=%d",
                 len(tree.direct_deps), len(tree.jar_paths))
     return tree
