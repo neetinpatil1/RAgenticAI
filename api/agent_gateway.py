@@ -768,11 +768,12 @@ async def list_runs(
                 meta = json.loads(meta)
             except Exception:
                 meta = {}
-        # Compute duration from metadata or timestamps
-        duration_ms = meta.get("scan_duration_ms", 0)
-        if not duration_ms and d.get("completed_at") and d.get("created_at"):
+        # Duration = scan start → FP Challenger end (completed_at - created_at)
+        if d.get("completed_at") and d.get("created_at"):
             delta = d["completed_at"] - d["created_at"]
             duration_ms = int(delta.total_seconds() * 1000)
+        else:
+            duration_ms = 0
         result.append({
             "run_id":       d["run_id"],
             "scan_path":    d["scan_path"],

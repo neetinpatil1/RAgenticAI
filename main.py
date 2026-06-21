@@ -22,6 +22,7 @@ import asyncio
 import logging
 import sys
 import uuid
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -30,10 +31,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Always write logs to logs/server.log (rotates at 10 MB, keeps 5 backups)
+_LOG_FILE = Path(__file__).parent / "logs" / "server.log"
+_LOG_FILE.parent.mkdir(exist_ok=True)
+
+_fmt = logging.Formatter(
+    "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_file_handler = RotatingFileHandler(_LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5)
+_file_handler.setFormatter(_fmt)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(), _file_handler],
 )
 logger = logging.getLogger(__name__)
 

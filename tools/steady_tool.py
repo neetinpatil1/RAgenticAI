@@ -38,10 +38,12 @@ Steady 3.2.5 API quirks fixed in this file:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
 import re
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -176,14 +178,33 @@ class SteadyTool:
                 if not registered:
                     return {}
 
-                # Step 4: seed Steady bug database with known CVEs so vulndeps can match
+                # Step 4: seed Steady bug database with known CVEs FIRST.
+                # vulas:a2c (Step 5) needs the vulnerable methods already in the bug DB
+                # so it knows which library constructs to mark as reachable/not-reachable
+                # when tracing application→library call paths.
                 if known_vulns:
                     await self._seed_vulnerabilities(client, known_vulns)
-                    # Small delay to allow Steady to commit seeded data before vulndeps query
-                    import asyncio as _aio
-                    await _aio.sleep(1)
+                    # Small delay to let Steady commit seeded data before a2c runs
+                    await asyncio.sleep(2)
 
-                # Step 5: fetch per-CVE vulndep verdicts
+                # Step 5: run Maven plugin for real static call-graph analysis.
+                # vulas:app uploads detailed bytecode constructs (more accurate than
+                # REST-based PACK/CLAS constructs from Step 3).
+                # vulas:a2c traces application→library call paths statically against the
+                # now-populated bug DB — this produces reachable=1/-1 with constructPath
+                # instead of reachable=0 (version-match only).
+                mvn_ok = await self._run_maven_plugin(root, group_id, artifact_id, version)
+                if not mvn_ok:
+                    logger.info(
+                        "Steady | Maven plugin unavailable — verdicts will be version-match only "
+                        "(no class/method call chains); install Maven and compile the project "
+                        "for full call-graph analysis"
+                    )
+                elif known_vulns:
+                    # Give Steady time to persist call-graph results before fetching verdicts
+                    await asyncio.sleep(3)
+
+                # Step 6: fetch per-CVE vulndep verdicts
                 verdicts = await self._fetch_verdicts(client, group_id, artifact_id, version)
                 if verdicts:
                     logger.info("Steady | COMPLETE | app=%s verdicts=%d", app_key, len(verdicts))
@@ -199,6 +220,129 @@ class SteadyTool:
         except Exception as exc:
             logger.warning("Steady | analysis error: %s", exc)
             return {}
+
+    # -------------------------------------------------------------------------
+    # Maven plugin — static call-graph analysis
+    # -------------------------------------------------------------------------
+
+    async def _run_maven_plugin(
+        self,
+        root:        Path,
+        group_id:    str,
+        artifact_id: str,
+        version:     str,
+    ) -> bool:
+        """
+        Run Eclipse Steady Maven plugin to perform static call-graph analysis.
+
+        Goals executed:
+          vulas:app  — uploads application constructs (classes/methods) to Steady backend.
+                       More detailed than the REST-based PACK/CLAS registration because it
+                       walks compiled bytecode and extracts every METH/CONS/CLAS construct.
+          vulas:a2c  — Application-to-Construct static call-graph analysis.
+                       Traces which library methods are reachable from the application's
+                       classes without executing the code. After this, vulndeps returns
+                       reachable=1/-1 with a constructPath call chain instead of reachable=0.
+
+        Uses plugin version 3.1.15 from Maven Central (latest available; compatible with
+        Steady 3.2.5 backend — the REST API contract is stable across minor versions).
+
+        If target/classes/ is missing, compiles the project first via `mvn compile`.
+
+        Returns True when call-graph analysis completed successfully.
+        """
+        mvn = shutil.which("mvn")
+        if not mvn:
+            logger.warning("Steady | mvn not on PATH — skipping call-graph analysis")
+            return False
+
+        pom = root / "pom.xml"
+        if not pom.exists():
+            logger.info("Steady | no pom.xml — Maven plugin only works for Maven projects")
+            return False
+
+        # Ensure compiled bytecode exists (vulas:a2c needs .class files)
+        classes_dir = root / "target" / "classes"
+        if not classes_dir.exists():
+            logger.info("Steady | target/classes/ missing — compiling project first")
+            try:
+                cp = await asyncio.create_subprocess_exec(
+                    mvn, "-f", str(pom),
+                    "compile", "--batch-mode", "--no-transfer-progress", "-q",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(root),
+                )
+                _, stderr = await asyncio.wait_for(cp.communicate(), timeout=300)
+                if cp.returncode != 0:
+                    logger.warning("Steady | mvn compile failed (rc=%d): %s",
+                                   cp.returncode, stderr.decode()[-400:])
+                    return False
+                logger.info("Steady | mvn compile OK")
+            except asyncio.TimeoutError:
+                logger.warning("Steady | mvn compile timed out after 300s — killing process")
+                try:
+                    cp.kill()
+                except Exception:
+                    pass
+                return False
+            except Exception as exc:
+                logger.warning("Steady | mvn compile error: %s", exc)
+                return False
+
+        # Build Maven plugin command.
+        # Uses fully-qualified plugin coordinates so no pluginRepository config is needed —
+        # Maven resolves com.sap.research.security.vulas:plugin-maven:3.1.15 from Central.
+        plugin = "com.sap.research.security.vulas:plugin-maven:3.1.15"
+        cmd = [
+            mvn, "-f", str(pom),
+            "--batch-mode", "--no-transfer-progress",
+            f"-Dvulas.shared.backend.serviceUrl={self._base}/backend/",
+            f"-Dvulas.shared.space.token={self._space_token or ''}",
+            f"-Dvulas.core.appContext.group={group_id}",
+            f"-Dvulas.core.appContext.artifact={artifact_id}",
+            f"-Dvulas.core.appContext.version={version}",
+            f"{plugin}:app",
+            f"{plugin}:a2c",
+        ]
+        if self._tenant_token:
+            cmd.insert(4, f"-Dvulas.shared.tenant.token={self._tenant_token}")
+
+        logger.info(
+            "Steady | Maven plugin: vulas:app + vulas:a2c | app=%s/%s/%s",
+            group_id, artifact_id, version,
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(root),
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+
+            if proc.returncode == 0:
+                logger.info(
+                    "Steady | Maven plugin complete — static call-graph uploaded to backend"
+                )
+                return True
+
+            out_tail = (stdout.decode()[-500:] + "\n" + stderr.decode()[-500:]).strip()
+            logger.warning(
+                "Steady | Maven plugin failed (rc=%d):\n%s", proc.returncode, out_tail
+            )
+            return False
+
+        except asyncio.TimeoutError:
+            logger.warning("Steady | Maven plugin timed out after 600s — killing process")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return False
+        except Exception as exc:
+            logger.warning("Steady | Maven plugin error: %s", exc)
+            return False
 
     # -------------------------------------------------------------------------
     # CIA — construct lookup
@@ -402,14 +546,17 @@ class SteadyTool:
                     pass
 
             construct_changes: list[dict] = []
-            if vuln_id not in seen_bugs:
-                # Only call CIA once per (group, artifact, version) per bug
+            if vuln_id not in seen_bugs and affected_classes:
+                # Only seed CIA constructs when we know the ACTUAL affected class.
+                # Seeding random fallback methods (when affected_classes is empty)
+                # causes vulas:a2c to match against wrong methods and always return
+                # reachable=0 — no better than not seeding at all, and misleading.
                 construct_changes = await self._get_cia_constructs(
-                    group, artifact, version, affected_classes or None
+                    group, artifact, version, affected_classes
                 )
                 logger.info(
                     "Steady | CIA constructs for %s: %d (classes=%s)",
-                    vuln_id, len(construct_changes), affected_classes or "fallback"
+                    vuln_id, len(construct_changes), affected_classes,
                 )
 
             # --- Step 2: create or update bug entry ---

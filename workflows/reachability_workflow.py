@@ -30,6 +30,50 @@ from tools.reachability.chain_assembler   import assemble_chain
 from tools.reachability.llm_verdict       import get_llm_verdict
 from tools.steady_tool                    import SteadyTool
 
+# When CVE enricher cannot find a specific vulnerable class (no OSV affected_functions,
+# no alias in known-map, LLM extraction failed), fall back to the package's primary
+# entry-point class so assemble_chain() can still run an import/bytecode scan.
+# Key: substring of package_name (case-insensitive). Value: list of classes to try.
+_PACKAGE_DEFAULT_CLASSES: dict[str, list[str]] = {
+    "jackson-databind": [
+        "com.fasterxml.jackson.databind.ObjectMapper",
+    ],
+    "commons-collections": [
+        "org.apache.commons.collections.functors.InvokerTransformer",
+        "org.apache.commons.collections4.functors.InvokerTransformer",
+    ],
+    "commons-fileupload": [
+        "org.apache.commons.fileupload.MultipartStream",
+    ],
+    "snakeyaml": [
+        "org.yaml.snakeyaml.Yaml",
+    ],
+    "hibernate-core": [
+        "org.hibernate.engine.query.HQLQueryPlan",
+    ],
+    "mysql-connector": [
+        "com.mysql.cj.jdbc.ConnectionImpl",
+    ],
+    "guava": [
+        "com.google.common.io.Files",
+    ],
+    "spring-webmvc": [
+        "org.springframework.web.servlet.DispatcherServlet",
+    ],
+    "log4j-core": [
+        "org.apache.logging.log4j.core.lookup.JndiLookup",
+    ],
+}
+
+
+def _default_classes_for_package(pkg_name: str) -> list[str]:
+    """Return well-known entry-point class(es) for a package, or [] if unknown."""
+    lower = pkg_name.lower()
+    for key, classes in _PACKAGE_DEFAULT_CLASSES.items():
+        if key in lower:
+            return classes
+    return []
+
 logger = logging.getLogger(__name__)
 
 # NOTE: _SEM is created inside run_reachability_workflow (not at module level)
@@ -161,6 +205,24 @@ async def _analyse_one(
                     result = r
                 if result.verdict == "REACHABLE":
                     break  # Found — no need to check other classes
+
+            # Package-level fallback: if enricher found no class, try the package's
+            # well-known entry-point class so chain assembler can produce real evidence.
+            if result is None and not affected_classes:
+                fallback_classes = _default_classes_for_package(pkg_name)
+                if fallback_classes:
+                    logger.info(
+                        "Reachability | vuln=%s pkg=%s — no class from enricher, "
+                        "using package-default classes=%s",
+                        vuln_id, pkg_name, fallback_classes,
+                    )
+                    affected_classes = fallback_classes
+                    for cls in fallback_classes:
+                        r = assemble_chain(scan_path, dep_tree, cls, pkg_name)
+                        if result is None or _verdict_rank(r.verdict) > _verdict_rank(result.verdict):
+                            result = r
+                        if result.verdict == "REACHABLE":
+                            break
 
             if result is None:
                 # No class mapping — still try LLM so we get LIKELY verdict instead of UNKNOWN
@@ -299,12 +361,17 @@ async def _apply_steady_verdicts(
 
                 existing_ver = (row["reachability"] or "UNKNOWN").upper()
 
-                # Build rich evidence string
-                evidence_lines = ["Eclipse Steady call-graph analysis (CIA-confirmed)."]
+                # Build rich evidence string showing class/method call chain
+                evidence_lines = ["Eclipse Steady static call-graph analysis."]
                 if sv.call_chain:
-                    evidence_lines.append(f"Call chain: {sv.call_chain}")
+                    evidence_lines.append("")
+                    evidence_lines.append("Call chain (application → vulnerable library method):")
+                    for step in sv.call_chain.split(" → "):
+                        evidence_lines.append(f"  → {step}")
                 else:
-                    evidence_lines.append("No call chain available (CIA service response incomplete).")
+                    evidence_lines.append(
+                        "Call chain not available — CIA service did not return construct path."
+                    )
                 evidence = "\n".join(evidence_lines)
 
                 await conn.execute(

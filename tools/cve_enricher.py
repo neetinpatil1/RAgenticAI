@@ -96,6 +96,24 @@ async def enrich_cve(vuln_id: str) -> dict:
             r = await client.get(f"https://api.osv.dev/v1/vulns/{vuln_id}")
             if r.status_code == 200:
                 data = r.json()
+
+                # Check OSV aliases (e.g. GHSA → CVE) against known map before
+                # doing any further parsing — gives us the most accurate class data.
+                for alias in data.get("aliases", []):
+                    alias_key = alias.upper()
+                    if alias_key in _KNOWN_CVE_MAP:
+                        entry = _KNOWN_CVE_MAP[alias_key]
+                        logger.info(
+                            "CVE enricher | vuln=%s alias=%s source=known-map classes=%s",
+                            vuln_id, alias, entry["classes"],
+                        )
+                        return {
+                            "vuln_id": vuln_id,
+                            "affected_classes": entry["classes"],
+                            "affected_methods": entry["methods"],
+                            "source": "known-map",
+                        }
+
                 classes = []
                 for affected in data.get("affected", []):
                     es = affected.get("ecosystem_specific") or {}
