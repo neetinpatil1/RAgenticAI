@@ -110,6 +110,7 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
     await _create_secret_findings_table(pool)
     await _create_dependency_findings_table(pool)
     await _create_fp_challenge_status_table(pool)
+    await _extend_fp_challenge_columns(pool)
 
 
 async def _add_columns_if_missing(pool: asyncpg.Pool) -> None:
@@ -218,6 +219,34 @@ async def _create_fp_challenge_status_table(pool: asyncpg.Pool) -> None:
             )
         """)
     logger.info("fp_challenge_status table ready")
+
+
+async def _extend_fp_challenge_columns(pool: asyncpg.Pool) -> None:
+    """
+    Idempotent: add FP-challenge result columns to SCA and code-review tables,
+    and extend fp_challenge_status with SCA/CR counters.
+    """
+    stmts = [
+        # dependency_findings — SCA challenge results
+        "ALTER TABLE dependency_findings ADD COLUMN IF NOT EXISTS fp_challenge_verdict TEXT",
+        "ALTER TABLE dependency_findings ADD COLUMN IF NOT EXISTS fp_challenge_reasoning TEXT",
+        "ALTER TABLE dependency_findings ADD COLUMN IF NOT EXISTS fp_challenge_fix TEXT",
+        # code_review_findings — CR challenge results
+        "ALTER TABLE code_review_findings ADD COLUMN IF NOT EXISTS fp_challenge_verdict TEXT",
+        "ALTER TABLE code_review_findings ADD COLUMN IF NOT EXISTS fp_challenge_reasoning TEXT",
+        "ALTER TABLE code_review_findings ADD COLUMN IF NOT EXISTS fp_challenge_fix TEXT",
+        # fp_challenge_status — SCA + CR counters
+        "ALTER TABLE fp_challenge_status ADD COLUMN IF NOT EXISTS sca_total INT DEFAULT 0",
+        "ALTER TABLE fp_challenge_status ADD COLUMN IF NOT EXISTS sca_done INT DEFAULT 0",
+        "ALTER TABLE fp_challenge_status ADD COLUMN IF NOT EXISTS cr_total INT DEFAULT 0",
+        "ALTER TABLE fp_challenge_status ADD COLUMN IF NOT EXISTS cr_done INT DEFAULT 0",
+    ]
+    async with pool.acquire() as conn:
+        for stmt in stmts:
+            try:
+                await conn.execute(stmt)
+            except Exception as exc:
+                logger.debug("_extend_fp_challenge_columns skipped | %s", exc)
 
 
 async def _create_dependency_findings_table(pool: asyncpg.Pool) -> None:

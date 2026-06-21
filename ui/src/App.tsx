@@ -23,8 +23,9 @@ export default function App() {
     setScreen("results");
   }
 
-  function handleViewResults(id: string) {
+  function handleViewResults(id: string, path: string) {
     setRunId(id);
+    setScanPath(path);
     setScreen("results");
   }
 

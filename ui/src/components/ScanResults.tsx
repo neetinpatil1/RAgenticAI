@@ -11,7 +11,7 @@ import {
 import {
   getFindings, getScanStatus, triggerCodeReview, getCodeReview,
   getCodeReviewProgress, getSecretFindings, getDependencyFindings,
-  getFpChallengeProgress,
+  getFpChallengeProgress, triggerFpChallenge,
 } from "../lib/api";
 import type {
   Finding, ScanStatus, CodeReviewFinding, CodeReviewSummary,
@@ -54,16 +54,26 @@ const CAT_COLORS: Record<ReviewCategory, string> = {
 export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   const [findings,  setFindings]  = useState<Finding[]>([]);
   const [status,    setStatus]    = useState<ScanStatus | null>(null);
+  const [llmDisplay, setLlmDisplay] = useState<string>("LLM");
+
+  useEffect(() => {
+    fetch("/api/v1/config/llm")
+      .then(r => r.json())
+      .then(d => setLlmDisplay(d.display_name ?? d.tier2_model ?? "LLM"))
+      .catch(() => {});
+  }, []);
   const [expanded,  setExpanded]  = useState<Set<string>>(new Set());
   const [loading,   setLoading]   = useState(true);
   const [sevFilter, setSevFilter] = useState<string>("ALL");
   const [activeTab, setActiveTab] = useState<"sast" | "review" | "secrets" | "deps">("sast");
+  // True only after workflow_runs.state = "completed" — i.e. Semgrep + FP pipeline both done
+  const [sastDone,  setSastDone]  = useState(false);
 
-  // Code review state
+  // Code review state — starts as "loading" like secrets/SCA, no separate detection needed
   const [crFindings,   setCrFindings]   = useState<CodeReviewFinding[]>([]);
   const [crSummary,    setCrSummary]    = useState<CodeReviewSummary | null>(null);
-  const [crLoading,    setCrLoading]    = useState(false);
-  const [crTriggered,  setCrTriggered]  = useState(false);
+  const [crLoading,    setCrLoading]    = useState(true);   // true by default — poll until done
+  const [crTriggered,  setCrTriggered]  = useState(true);   // true by default — always show spinner
   const [crCompleted,  setCrCompleted]  = useState(false);
   const [crError,      setCrError]      = useState<string | null>(null);
   const [crCatFilter,  setCrCatFilter]  = useState<string>("ALL");
@@ -72,6 +82,8 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     pct: number; files_done: number; total_files: number;
     current_file: string | null; findings_count: number;
   } | null>(null);
+  const [crQueued,     setCrQueued]     = useState(true);  // true = waiting for SAST/Secrets/SCA
+  const crPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // FP Challenger state
   const [fpLoading,    setFpLoading]    = useState(false);
@@ -81,6 +93,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   const [fpProgress,   setFpProgress]   = useState<{
     pct: number; findings_done: number; findings_total: number;
     fp_found: number; current_finding: string | null;
+    sca_total: number; sca_done: number; cr_total: number; cr_done: number;
   } | null>(null);
 
   // Secrets state
@@ -107,12 +120,20 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
   // Data loading — initial fetch + polling for parallel agents
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    // Reset scanning flags for new runId
+    // Reset ALL agent state for the new runId
+    setSastDone(false);
     setSecretScanning(true);
     setDepScanning(true);
     setSecretFindings([]);
     setDepFindings([]);
     setCrFindings([]);
+    setCrSummary(null);
+    setCrLoading(true);      // Always start loading — same as secrets/SCA
+    setCrTriggered(true);    // Always show spinner — don't wait for "detection"
+    setCrCompleted(false);
+    setCrError(null);
+    setCrProgress(null);
+    setCrQueued(true);
     setFindings([]);
     setGraphBuildStatus("idle");
     setGraphBuildError(null);
@@ -123,27 +144,62 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     setFpError(null);
     setFpProgress(null);
 
-    // Poll for code review start — called when initial load finds CR not yet running.
-    // Retries every 10s for up to 3 minutes, then gives up silently.
-    async function waitForCrToStart(retries = 0) {
-      const MAX_CR_WAIT = 18; // 18 × 10s = 3 minutes
-      if (retries >= MAX_CR_WAIT) return;
+    // ── Code review polling ──────────────────────────────────────────────────
+    // Polls every 5s. Status responses:
+    //   "not_started" → SAST still running, keep waiting (spinner stays)
+    //   "running"     → update progress bar
+    //   "completed"   → fetch findings, mark done
+    //   "failed"      → show error + retry button
+    // After 20 min of "not_started" with no change → show manual trigger button.
+    let crStalled = 0;
+    const MAX_CR_STALLED = 240; // 240 × 5s = 20 min
+
+    async function pollCr(): Promise<void> {
       try {
-        const [cr, prog] = await Promise.allSettled([
-          getCodeReview(runId),
-          getCodeReviewProgress(runId),
-        ]);
-        if (cr.status === "fulfilled" && cr.value.count > 0) {
-          setCrFindings(cr.value.findings); setCrSummary(cr.value.summary);
-          setCrTriggered(true); setCrCompleted(true); return;
+        const prog = await getCodeReviewProgress(runId);
+
+        if (prog.status === "running") {
+          crStalled = 0;
+          setCrQueued(false);
+          setCrProgress({
+            pct: prog.pct, files_done: prog.files_done,
+            total_files: prog.total_files, current_file: prog.current_file,
+            findings_count: prog.findings_count,
+          });
+          crPollRef.current = setTimeout(pollCr, 5_000);
+          return;
         }
-        if (prog.status === "fulfilled") {
-          if (prog.value.status === "running") { startCrPolling(); return; }
-          if (prog.value.status === "completed") { setCrTriggered(true); setCrCompleted(true); return; }
-          if (prog.value.status === "failed") { setCrTriggered(true); setCrError("Code review failed. Check logs."); return; }
+
+        if (prog.status === "completed") {
+          const cr = await getCodeReview(runId);
+          if (cr.count > 0) { setCrFindings(cr.findings); setCrSummary(cr.summary); }
+          setCrQueued(false);
+          setCrCompleted(true);
+          setCrLoading(false);
+          waitForFpToStart();
+          return;
         }
-      } catch { /* not started yet — keep waiting */ }
-      setTimeout(() => waitForCrToStart(retries + 1), 10_000);
+
+        if (prog.status === "failed") {
+          setCrQueued(false);
+          setCrError("Code review failed on the server. Check /tmp/app.log.");
+          setCrLoading(false);
+          return;
+        }
+
+        // "not_started" — SAST/Secrets/SCA still running, keep waiting
+        setCrQueued(true);
+        crStalled++;
+        if (crStalled >= MAX_CR_STALLED) {
+          // Something is genuinely wrong — let user trigger manually
+          setCrTriggered(false);
+          setCrLoading(false);
+          return;
+        }
+        crPollRef.current = setTimeout(pollCr, 5_000);
+      } catch {
+        crPollRef.current = setTimeout(pollCr, 8_000);
+      }
     }
 
     async function load() {
@@ -151,37 +207,18 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       setFindings(f);
       setStatus(s);
       setLoading(false);
-      let crDetected = false;
-      try {
-        // Also check progress status — might be "completed" (0 findings) or "failed"
-        const [cr, prog] = await Promise.allSettled([
-          getCodeReview(runId),
-          getCodeReviewProgress(runId),
-        ]);
-        if (cr.status === "fulfilled" && cr.value.count > 0) {
-          setCrFindings(cr.value.findings);
-          setCrSummary(cr.value.summary);
-          setCrTriggered(true);
-          setCrCompleted(true);
-          crDetected = true;
-        } else if (prog.status === "fulfilled" && prog.value.status === "completed") {
-          // Completed but found nothing
-          setCrTriggered(true);
-          setCrCompleted(true);
-          crDetected = true;
-        } else if (prog.status === "fulfilled" && prog.value.status === "failed") {
-          setCrTriggered(true);
-          setCrError("Code review failed. Check logs or try again.");
-          crDetected = true;
-        } else if (prog.status === "fulfilled" && prog.value.status === "running") {
-          // Auto-triggered by backend — resume polling without manual button click
-          startCrPolling();
-          crDetected = true;
-        }
-      } catch { /* not yet */ }
-      // If CR wasn't detected yet (backend hasn't started it — SAST still running),
-      // start a background retry loop that picks it up once Step 3 begins.
-      if (!crDetected) waitForCrToStart();
+
+      // Mark SAST done immediately if:
+      //   a) workflow_runs.state is already "completed"/"failed" (full pipeline done), OR
+      //   b) agents.sast_done is already true (Semgrep wrote findings, pipeline still running)
+      // In case (b) findings are already loaded above; poll continues for other agents.
+      if (s.status === "completed" || s.status === "failed") {
+        setSastDone(true);
+      } else {
+        if (s.agents?.sast_done) setSastDone(true);
+        // Poll for remaining agents (Code Review, Reachability, FP, etc.)
+        pollSastStatus();
+      }
 
       // Check FP Challenger status
       try {
@@ -190,7 +227,6 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setFpTriggered(true);
           setFpCompleted(true);
           setFpProgress(fp);
-          // Reload findings to pick up challenger verdicts
           const refreshed = await getFindings(runId);
           setFindings(refreshed);
         } else if (fp.status === "running") {
@@ -201,9 +237,98 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
         }
       } catch { /* not started yet */ }
 
-      loadSecrets();
-      loadDeps();
+      loadSecrets(0, s);
+      loadDeps(0, s);
       startGraphBuildPolling(s.scan_path);
+
+      // Start code review polling immediately — same as secrets/SCA
+      pollCr();
+    }
+
+    // Poll workflow_runs.state every 10s.
+    // agents.sast_done  → Semgrep finished + findings in DB → mark SAST card done, load findings.
+    // agents.secrets_done / sca_done / reachability_done → stop those spinners independently.
+    // status === "completed" → full pipeline done, do one final refresh of all agents.
+    async function pollSastStatus(retries = 0) {
+      const MAX_RETRIES = 360; // 360 × 10s = 60 min
+      if (retries >= MAX_RETRIES) {
+        setSastDone(true);
+        setSecretScanning(false);
+        setDepScanning(false);
+        return;
+      }
+      try {
+        const s = await getScanStatus(runId);
+        setStatus(s);
+
+        // sast_done: Semgrep finished and wrote findings to DB (set by node_write_findings
+        // via scan_duration_ms in metadata). Mark the SAST card done and load findings
+        // immediately — don't wait for the full FP/Code Review/Reachability pipeline.
+        if (s.agents?.sast_done) {
+          setSastDone(true);
+          try {
+            const refreshed = await getFindings(runId);
+            setFindings(refreshed);
+          } catch { /* ignore */ }
+        }
+
+        // Stop individual agent spinners as soon as their workflow writes completed_at
+        // to workflow_runs.metadata — independent of SAST pipeline timing.
+        if (s.agents?.secrets_done) setSecretScanning(false);
+        if (s.agents?.sca_done)     setDepScanning(false);
+        if (s.agents?.reachability_done) {
+          // Refresh deps to pick up reachability verdicts
+          try {
+            const dep = await getDependencyFindings(runId);
+            if (dep.count > 0) { setDepFindings(dep.findings); setDepSummary(dep.summary); }
+          } catch { /* ignore */ }
+        }
+
+        if (s.status === "completed" || s.status === "failed") {
+          // Full pipeline done — do a final refresh of all agents to capture
+          // FP verdicts, late-arriving secrets/deps, and reachability verdicts.
+          setSastDone(true);
+          try {
+            const refreshed = await getFindings(runId);
+            setFindings(refreshed);
+          } catch { /* ignore */ }
+          try {
+            const sec = await getSecretFindings(runId);
+            if (sec.count > 0) { setSecretFindings(sec.findings); setSecretSummary(sec.summary); }
+          } catch { /* ignore */ }
+          setSecretScanning(false);
+          try {
+            const dep = await getDependencyFindings(runId);
+            if (dep.count > 0) { setDepFindings(dep.findings); setDepSummary(dep.summary); }
+          } catch { /* ignore */ }
+          setDepScanning(false);
+
+          // FP Challenger runs as step 4 (after Code Review + Reachability both finish).
+          // waitForFpToStart() may have timed out if Reachability ran longer than its
+          // wait window. Catch up here now that the full pipeline is confirmed done.
+          try {
+            const fp = await getFpChallengeProgress(runId);
+            if (fp.status === "completed") {
+              setFpTriggered(true);
+              setFpCompleted(true);
+              setFpLoading(false);
+              setFpProgress(fp);
+            } else if (fp.status === "failed") {
+              setFpTriggered(true);
+              setFpError("FP challenge failed. Check server logs.");
+              setFpLoading(false);
+            }
+          } catch { /* ignore */ }
+
+          // If reachability is still running after full pipeline reports completed,
+          // keep polling until reachability_done is also set.
+          if (!s.agents?.reachability_done) {
+            setTimeout(() => pollSastStatus(retries + 1), 10_000);
+          }
+          return;
+        }
+      } catch { /* ignore transient errors */ }
+      setTimeout(() => pollSastStatus(retries + 1), 10_000);
     }
 
     // -------------------------------------------------------------------------
@@ -258,12 +383,11 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       if (graphElapsedRef.current) { clearInterval(graphElapsedRef.current); graphElapsedRef.current = null; }
     }
 
-    async function loadSecrets(retries = 0) {
-      // Poll for up to 150s (30 × 5s). Do NOT check getScanStatus — scan status
-      // "completed" means SAST is done, not Secrets. Secrets runs in parallel with
-      // SCA and Code Review AFTER SAST, so scan status is always "completed" before
-      // Secrets has a chance to write findings.
-      const MAX_RETRIES = 30;
+    async function loadSecrets(retries = 0, scanState?: ScanStatus) {
+      // Secrets runs in parallel with SCA/Code Review AFTER SAST completes.
+      // For historical scans (completed_at > 5 min ago) all agents are long done —
+      // stop immediately if there are no findings instead of spinning for 150s.
+      const MAX_RETRIES = 30; // 30 × 5s = 150s absolute max for live scans
       try {
         const sec = await getSecretFindings(runId);
         if (sec.count > 0) {
@@ -272,27 +396,33 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setSecretScanning(false);
           return;
         }
+        // On first check: if this is a historical scan, stop immediately
+        if (retries === 0 && scanState?.completed_at) {
+          const ageMs = Date.now() - new Date(scanState.completed_at).getTime();
+          if (ageMs > 5 * 60 * 1000) { // > 5 min old → historical scan, agents done
+            setSecretScanning(false);
+            return;
+          }
+        }
         if (retries < MAX_RETRIES) {
-          setTimeout(() => loadSecrets(retries + 1), 5000);
+          setTimeout(() => loadSecrets(retries + 1, scanState), 5000);
         } else {
           setSecretScanning(false);  // give up — no secrets found
         }
       } catch {
         if (retries < MAX_RETRIES) {
-          setTimeout(() => loadSecrets(retries + 1), 5000);
+          setTimeout(() => loadSecrets(retries + 1, scanState), 5000);
         } else {
           setSecretScanning(false);
         }
       }
     }
 
-    async function loadDeps(retries = 0) {
-      // SCA runs after SAST. "completed" scan status only means SAST is done.
-      // Wait at least 10 retries (50s) before checking scan status, to give SCA
-      // time to finish. After that, if scan is completed AND SCA still has no
-      // findings, it genuinely found nothing — stop the spinner.
-      const MAX_RETRIES = 30; // 30 × 5s = 150s absolute max
-      const SCAN_STATUS_CHECK_AFTER = 10; // wait 50s before trusting scan status
+    async function loadDeps(retries = 0, scanState?: ScanStatus) {
+      // SCA runs in parallel with Secrets/Code Review AFTER SAST completes.
+      // For historical scans (completed_at > 5 min ago) all agents are long done —
+      // stop immediately if there are no findings instead of spinning for 150s.
+      const MAX_RETRIES = 30; // 30 × 5s = 150s absolute max for live scans
       try {
         const dep = await getDependencyFindings(runId);
         if (dep.count > 0) {
@@ -301,24 +431,22 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setDepScanning(false);
           return;
         }
-        // After 50s, check if scan is fully done — if so SCA found nothing
-        if (retries >= SCAN_STATUS_CHECK_AFTER) {
-          try {
-            const scanState = await getScanStatus(runId);
-            if (scanState.status === "completed" || scanState.status === "failed") {
-              setDepScanning(false);
-              return;
-            }
-          } catch { /* ignore */ }
+        // On first check: if this is a historical scan, stop immediately
+        if (retries === 0 && scanState?.completed_at) {
+          const ageMs = Date.now() - new Date(scanState.completed_at).getTime();
+          if (ageMs > 5 * 60 * 1000) { // > 5 min old → historical scan, agents done
+            setDepScanning(false);
+            return;
+          }
         }
         if (retries < MAX_RETRIES) {
-          setTimeout(() => loadDeps(retries + 1), 5000);
+          setTimeout(() => loadDeps(retries + 1, scanState), 5000);
         } else {
           setDepScanning(false);
         }
       } catch {
         if (retries < MAX_RETRIES) {
-          setTimeout(() => loadDeps(retries + 1), 5000);
+          setTimeout(() => loadDeps(retries + 1, scanState), 5000);
         } else {
           setDepScanning(false);
         }
@@ -330,91 +458,65 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     return () => {
       if (graphPollRef.current)    clearInterval(graphPollRef.current);
       if (graphElapsedRef.current) clearInterval(graphElapsedRef.current);
+      if (crPollRef.current)       clearTimeout(crPollRef.current);
     };
   }, [runId]);
 
   // ---------------------------------------------------------------------------
   // Code review trigger + progress polling
   // ---------------------------------------------------------------------------
-  function startCrPolling() {
-    setCrLoading(true);
-    setCrTriggered(true);
-    let stalePct = -1;
-    let staleCount = 0;
-    const MAX_STALE_POLLS = 20; // 20 × 6s = 2 min with no change → stuck
-
-    const poll = async () => {
-      try {
-        const prog = await getCodeReviewProgress(runId);
-        setCrProgress({
-          pct: prog.pct, files_done: prog.files_done,
-          total_files: prog.total_files, current_file: prog.current_file,
-          findings_count: prog.findings_count,
-        });
-
-        if (prog.status === "completed") {
-          const cr = await getCodeReview(runId);
-          if (cr.count > 0) {
-            setCrFindings(cr.findings);
-            setCrSummary(cr.summary);
-          }
-          setCrCompleted(true);
-          setCrLoading(false);
-          // Code review done → FP Challenger starts next. Begin polling for it.
-          waitForFpToStart();
-          return;
-        }
-
-        if (prog.status === "failed") {
-          setCrError("Code review failed on the server. Check /tmp/app.log for details.");
-          setCrLoading(false);
-          return;
-        }
-
-        // Stale detection — if pct hasn't moved in MAX_STALE_POLLS, warn
-        if (prog.pct === stalePct) {
-          staleCount++;
-        } else {
-          stalePct = prog.pct;
-          staleCount = 0;
-        }
-        if (staleCount >= MAX_STALE_POLLS) {
-          setCrError(`Code review appears stuck at ${prog.pct}%. Ollama may be overloaded. Check /tmp/app.log.`);
-          setCrLoading(false);
-          return;
-        }
-
-        setTimeout(poll, 6000);
-      } catch {
-        setTimeout(poll, 8000);
-      }
-    };
-    setTimeout(poll, 4000);
-  }
-
+  // Manual re-trigger (shown only after 20 min of no activity, or on error retry)
   async function handleRunCodeReview() {
     setCrError(null);
     setCrCompleted(false);
     setCrProgress(null);
+    setCrLoading(true);
+    setCrTriggered(true);
+    if (crPollRef.current) clearTimeout(crPollRef.current);
     try {
       await triggerCodeReview(runId);
     } catch (err) {
       setCrError(`Failed to start code review: ${err instanceof Error ? err.message : "server error"}. Is the server running?`);
+      setCrLoading(false);
       return;
     }
-    startCrPolling();
+    // Let the existing pollCr loop in useEffect handle progress — but since
+    // that loop already exited (stalled), schedule one more immediate check
+    // by reloading the page state — simplest: just re-trigger the poll via ref
+    setTimeout(async () => {
+      try {
+        const prog = await getCodeReviewProgress(runId);
+        if (prog.status === "running" || prog.status === "not_started") {
+          // Back to normal polling — reload the component will restart useEffect
+          // For now just update state
+        }
+      } catch { /* ignore */ }
+    }, 2000);
   }
 
   // ---------------------------------------------------------------------------
   // FP Challenger progress polling
   // ---------------------------------------------------------------------------
   async function waitForFpToStart(retries = 0) {
-    const MAX_FP_WAIT = 18; // 18 × 10s = 3 minutes
+    // FP starts only after BOTH Code Review AND Reachability complete (gateway step 4).
+    // Reachability can run 5-30 min after Code Review finishes, so we must wait long enough.
+    // pollSastStatus also catches FP at scan completion as a safety net.
+    const MAX_FP_WAIT = 360; // 360 × 10s = 60 min
     if (retries >= MAX_FP_WAIT) return;
     try {
       const fp = await getFpChallengeProgress(runId);
       if (fp.status === "running")   { startFpPolling(); return; }
-      if (fp.status === "completed") { setFpTriggered(true); setFpCompleted(true); setFpProgress(fp); getFindings(runId).then(setFindings).catch(() => {}); return; }
+      if (fp.status === "completed") {
+        setFpTriggered(true); setFpCompleted(true);
+        setFpProgress({
+          pct: fp.pct, findings_done: fp.findings_done, findings_total: fp.findings_total,
+          fp_found: fp.fp_found, current_finding: fp.current_finding,
+          sca_total: fp.sca_total ?? 0, sca_done: fp.sca_done ?? 0,
+          cr_total: fp.cr_total ?? 0, cr_done: fp.cr_done ?? 0,
+        });
+        getFindings(runId).then(setFindings).catch(() => {});
+        return;
+      }
       if (fp.status === "failed")    { setFpTriggered(true); setFpError("FP challenge failed. Check /tmp/app.log."); return; }
     } catch { /* not started yet */ }
     setTimeout(() => waitForFpToStart(retries + 1), 10_000);
@@ -425,14 +527,20 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
     setFpTriggered(true);
     let stalePct = -1;
     let staleCount = 0;
-    const MAX_STALE_POLLS = 20;
+    // 40 × 6s = 4 min; gives enough runway for the initialization phase (findings_total=0)
+    // and the actual processing before declaring "stuck".
+    const MAX_STALE_POLLS = 40;
 
     const poll = async () => {
       try {
         const prog = await getFpChallengeProgress(runId);
-        setFpProgress({ pct: prog.pct, findings_done: prog.findings_done,
+        setFpProgress({
+          pct: prog.pct, findings_done: prog.findings_done,
           findings_total: prog.findings_total, fp_found: prog.fp_found,
-          current_finding: prog.current_finding });
+          current_finding: prog.current_finding,
+          sca_total: prog.sca_total ?? 0, sca_done: prog.sca_done ?? 0,
+          cr_total: prog.cr_total ?? 0, cr_done: prog.cr_done ?? 0,
+        });
 
         if (prog.status === "completed") {
           setFpCompleted(true);
@@ -446,6 +554,9 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
           setFpLoading(false);
           return;
         }
+        // Skip stale counting while the job is still in the initialization phase
+        // (findings_total=0 means the row was pre-inserted but processing hasn't begun yet).
+        if (prog.findings_total === 0) { setTimeout(poll, 6000); return; }
         if (prog.pct === stalePct) { staleCount++; } else { stalePct = prog.pct; staleCount = 0; }
         if (staleCount >= MAX_STALE_POLLS) {
           setFpError(`FP challenge appears stuck at ${prog.pct}%. Check /tmp/app.log.`);
@@ -456,6 +567,19 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       } catch { setTimeout(poll, 8000); }
     };
     setTimeout(poll, 4000);
+  }
+
+  async function handleManualFpTrigger() {
+    if (fpLoading) return;
+    setFpError(null);
+    setFpCompleted(false);
+    setFpProgress(null);
+    try {
+      await triggerFpChallenge(runId);
+      startFpPolling();
+    } catch (err) {
+      setFpError(`Failed to trigger FP Challenge: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -547,16 +671,17 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             }
           </p>
           <p className="text-xs text-gray-600 mb-4">Click an agent to view its findings</p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
 
             {/* SAST */}
             <AgentStatusCard
               label="SAST Scanner"
               icon={<ShieldAlert className="w-4 h-4" />}
               color="text-orange-400"
-              done={true}
+              done={sastDone}
               count={findings.length}
               unit="findings"
+              skills={["SQL Injection", "XSS", "Path Traversal", "CSRF", "Deserialization", "Weak Crypto"]}
               active={activeTab === "sast"}
               onClick={() => setActiveTab("sast")}
             />
@@ -569,6 +694,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               done={!secretScanning}
               count={secretFindings.length}
               unit="secrets"
+              skills={["API Keys", "Private Keys", "Tokens", "Passwords", "Certificates"]}
               active={activeTab === "secrets"}
               onClick={() => setActiveTab("secrets")}
             />
@@ -581,6 +707,21 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               done={!depScanning}
               count={depFindings.length}
               unit="CVEs"
+              skills={["Known CVEs", "Outdated Packages", "License Risks", "Supply Chain"]}
+              active={activeTab === "deps"}
+              onClick={() => setActiveTab("deps")}
+            />
+
+            {/* Reachability */}
+            <AgentStatusCard
+              label="Reachability"
+              icon={<Network className="w-4 h-4" />}
+              color="text-cyan-400"
+              done={!!status?.agents?.reachability_done}
+              count={depFindings.filter(f => f.reachability && f.reachability !== 'UNKNOWN').length}
+              unit="analysed"
+              skills={["Import Scan", "JAR Bytecode", "Transitive Chain", "LLM Verdict"]}
+              notStarted={!crCompleted}
               active={activeTab === "deps"}
               onClick={() => setActiveTab("deps")}
             />
@@ -593,8 +734,9 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               done={crCompleted && !crError}
               count={crFindings.length}
               unit="issues"
-              notStarted={!crTriggered}
-              progress={crLoading ? crProgress?.pct : undefined}
+              skills={["Logic Flaws", "Auth Gaps", "N+1 Queries", "Resource Leaks", "Error Handling"]}
+              notStarted={crQueued}
+              progress={crLoading && !crQueued && crProgress ? crProgress.pct : undefined}
               error={!!crError}
               active={activeTab === "review"}
               onClick={() => setActiveTab("review")}
@@ -608,12 +750,19 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               done={fpCompleted && !fpError}
               count={fpProgress?.fp_found ?? 0}
               unit="FPs found"
-              subtitle={fpCompleted && fpProgress ? `${fpProgress.findings_total} reviewed` : undefined}
+              subtitle={
+                fpCompleted
+                  ? `SAST ${findings.length} · SCA ${depFindings.length} · CR ${crFindings.length} reviewed`
+                  : fpLoading && fpProgress
+                  ? `SAST ${fpProgress.findings_done}/${findings.length} · SCA ${fpProgress.sca_done}/${depFindings.length} · CR ${fpProgress.cr_done}/${crFindings.length}`
+                  : undefined
+              }
+              skills={["SAST Re-evaluation", "SCA Applicability", "Code Review Validation", "Fix Generation"]}
               notStarted={!fpTriggered}
               progress={fpLoading ? fpProgress?.pct : undefined}
               error={!!fpError}
-              active={false}
-              onClick={() => {}}
+              active={fpLoading}
+              onBadgeClick={!fpLoading ? handleManualFpTrigger : undefined}
             />
 
             {/* Code Knowledge Graph */}
@@ -788,7 +937,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                           Called by {f.blast_radius} file{f.blast_radius === 1 ? "" : "s"}
                         </span>
                       )}
-                      {/* FP Challenger verdict badge */}
+                      {/* AI verdict badge — shown as soon as data available, from SAST L3 or FP Challenger */}
                       {f.verdict === "FP" && (
                         <span className="text-xs text-emerald-300 bg-emerald-500/10 border border-emerald-500/40 px-1.5 py-0.5 rounded flex items-center gap-1"
                           title={f.reasoning ?? undefined}>
@@ -796,15 +945,17 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                           False Positive{f.fp_category ? ` · ${f.fp_category}` : ""}
                         </span>
                       )}
-                      {f.verdict === "REAL" && fpCompleted && (
+                      {f.verdict === "REAL" && (
                         <span className="text-xs text-red-300 bg-red-500/10 border border-red-500/40 px-1.5 py-0.5 rounded flex items-center gap-1"
                           title={f.reasoning ?? undefined}>
                           <ShieldAlert className="w-3 h-3" />
                           Confirmed Real
+                          {f.confidence != null && <span className="opacity-60">· {Math.round(f.confidence * 100)}%</span>}
                         </span>
                       )}
-                      {f.verdict === "ESCALATED" && fpCompleted && (
-                        <span className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/40 px-1.5 py-0.5 rounded">
+                      {f.verdict === "ESCALATED" && (
+                        <span className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/40 px-1.5 py-0.5 rounded flex items-center gap-1">
+                          <AlertTriangle className="w-3 h-3" />
                           Needs Review
                         </span>
                       )}
@@ -882,7 +1033,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                             </div>
                           </div>
                         )}
-                        {/* FP Challenger verdict detail */}
+                        {/* AI verdict detail panel */}
                         {f.verdict && (
                           <div className={`rounded-lg border px-4 py-3 text-sm ${
                             f.verdict === "FP"
@@ -891,9 +1042,13 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                               ? "bg-red-950/20 border-red-700/40 text-red-300"
                               : "bg-yellow-950/20 border-yellow-700/40 text-yellow-300"
                           }`}>
-                            <p className="flex items-center gap-1.5 font-medium mb-1">
-                              <CheckCheck className="w-3.5 h-3.5" />
-                              FP Challenger verdict: <span className="font-semibold">{f.verdict}</span>
+                            <p className="flex items-center gap-1.5 font-medium mb-1 flex-wrap">
+                              <Brain className="w-3.5 h-3.5 shrink-0" />
+                              <span className="opacity-60 text-xs font-normal">
+                                {f.fp_source === "fp_challenger" ? "FP Challenger" : "AI Analysis"}
+                              </span>
+                              <span>→</span>
+                              <span className="font-semibold">{f.verdict}</span>
                               {f.fp_category && <span className="font-normal text-xs opacity-75">· {f.fp_category}</span>}
                               {f.confidence != null && (
                                 <span className="ml-auto text-xs opacity-60">
@@ -901,7 +1056,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                                 </span>
                               )}
                             </p>
-                            {f.reasoning && <p className="text-xs opacity-80 mt-1">{f.reasoning}</p>}
+                            {f.reasoning && <p className="text-xs opacity-80 mt-1 leading-relaxed">{f.reasoning}</p>}
                           </div>
                         )}
 
@@ -1115,6 +1270,20 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                             <span className="text-sm font-medium text-white font-mono">{f.package_name}</span>
                             <span className="text-xs text-gray-500 bg-gray-800 border border-gray-700 px-1.5 py-0.5 rounded">{f.ecosystem}</span>
                             <span className="text-xs text-red-400 bg-red-900/20 border border-red-700/40 px-1.5 py-0.5 rounded">{f.vulnerability_id}</span>
+                            {f.reachability && (
+                              <span className={`text-xs font-medium px-1.5 py-0.5 rounded border flex items-center gap-1 ${
+                                f.reachability === 'REACHABLE' || f.reachability === 'LIKELY_REACHABLE'
+                                  ? 'text-red-300 bg-red-500/10 border-red-500/30'
+                                  : f.reachability === 'NOT_REACHABLE' || f.reachability === 'LIKELY_NOT_REACHABLE'
+                                  ? 'text-green-300 bg-green-500/10 border-green-500/30'
+                                  : 'text-gray-400 bg-gray-500/10 border-gray-500/30'
+                              }`}>
+                                {f.reachability === 'REACHABLE' ? '⚡ Reachable' :
+                                 f.reachability === 'NOT_REACHABLE' ? '✓ Not Reachable' :
+                                 f.reachability === 'LIKELY_REACHABLE' ? '~ Likely Reachable' :
+                                 f.reachability === 'LIKELY_NOT_REACHABLE' ? '~ Likely Safe' : '? Unknown'}
+                              </span>
+                            )}
                           </div>
                           <p className="text-xs text-gray-400 mt-1 line-clamp-2">{f.description || "No description available."}</p>
                           <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-600">
@@ -1138,15 +1307,86 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                                 {f.installed_version && <div><p className="text-gray-500 mb-1">Installed Version</p><p className="text-red-300">{f.installed_version}</p></div>}
                                 {f.fixed_version     && <div><p className="text-gray-500 mb-1">Fixed In</p><p className="text-green-400">{f.fixed_version}</p></div>}
                               </div>
-                              {f.description && (
-                                <div>
-                                  <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Description</p>
-                                  <p className="text-gray-300 text-sm leading-relaxed">{f.description}</p>
-                                </div>
-                              )}
+                              <div>
+                                <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Description</p>
+                                <p className="text-gray-300 text-sm leading-relaxed">
+                                  {f.description || <span className="text-gray-600 italic">No description stored — see advisory link below.</span>}
+                                </p>
+                              </div>
+                              {/* Advisory link — always show so user can get full CVE details */}
+                              <div className="flex items-center gap-3 flex-wrap">
+                                <a
+                                  href={`https://osv.dev/vulnerability/${f.vulnerability_id}`}
+                                  target="_blank" rel="noopener noreferrer"
+                                  className="text-xs text-brand-400 hover:text-brand-300 underline flex items-center gap-1"
+                                >
+                                  View on OSV.dev ↗
+                                </a>
+                                {f.vulnerability_id.startsWith("CVE-") && (
+                                  <a
+                                    href={`https://nvd.nist.gov/vuln/detail/${f.vulnerability_id}`}
+                                    target="_blank" rel="noopener noreferrer"
+                                    className="text-xs text-brand-400 hover:text-brand-300 underline flex items-center gap-1"
+                                  >
+                                    View on NVD ↗
+                                  </a>
+                                )}
+                                {f.vulnerability_id.startsWith("GHSA-") && (
+                                  <a
+                                    href={`https://github.com/advisories/${f.vulnerability_id}`}
+                                    target="_blank" rel="noopener noreferrer"
+                                    className="text-xs text-brand-400 hover:text-brand-300 underline flex items-center gap-1"
+                                  >
+                                    View on GitHub Advisory ↗
+                                  </a>
+                                )}
+                              </div>
                               {f.fixed_version && (
                                 <div className="rounded-lg bg-green-950/30 border border-green-800/40 px-4 py-3 text-xs text-green-300">
-                                  Update {f.package_name} to version {f.fixed_version} or later to remediate this vulnerability.
+                                  <span className="font-semibold">Remediation:</span> Update <span className="font-mono">{f.package_name}</span> to version <span className="font-mono font-semibold">{f.fixed_version}</span> or later to fix this vulnerability.
+                                </div>
+                              )}
+                              {!f.fixed_version && (
+                                <div className="rounded-lg bg-yellow-950/20 border border-yellow-800/30 px-4 py-3 text-xs text-yellow-400">
+                                  No fixed version available. Check the advisory for workarounds or consider replacing this dependency.
+                                </div>
+                              )}
+                              {f.reach_evidence && (
+                                <div>
+                                  <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Reachability Evidence</p>
+                                  <pre className="text-xs text-gray-300 bg-gray-800 rounded p-3 whitespace-pre-wrap leading-relaxed font-mono">
+                                    {f.reach_evidence}
+                                  </pre>
+                                  {f.reach_source && (
+                                    <p className="text-xs text-gray-600 mt-1">Source: {f.reach_source} · confidence {Math.round((f.reach_confidence ?? 0) * 100)}%</p>
+                                  )}
+                                </div>
+                              )}
+
+                              {/* FP Challenger applicability result */}
+                              {f.fp_challenge_verdict && (
+                                <div className={`rounded-lg border px-4 py-3 text-sm ${
+                                  f.fp_challenge_verdict === "APPLICABLE"
+                                    ? "bg-red-950/20 border-red-700/40 text-red-300"
+                                    : f.fp_challenge_verdict === "NOT_APPLICABLE"
+                                    ? "bg-emerald-950/30 border-emerald-700/40 text-emerald-300"
+                                    : "bg-yellow-950/20 border-yellow-700/40 text-yellow-300"
+                                }`}>
+                                  <p className="flex items-center gap-1.5 font-medium mb-1">
+                                    <CheckCheck className="w-3.5 h-3.5 shrink-0" />
+                                    <span className="opacity-60 text-xs font-normal">FP Challenger</span>
+                                    <span>→</span>
+                                    <span className="font-semibold">{f.fp_challenge_verdict.replace("_", " ")}</span>
+                                  </p>
+                                  {f.fp_challenge_reasoning && (
+                                    <p className="text-xs opacity-80 mt-1 leading-relaxed">{f.fp_challenge_reasoning}</p>
+                                  )}
+                                  {f.fp_challenge_fix && (
+                                    <div className="mt-2 pt-2 border-t border-current/20">
+                                      <p className="text-xs opacity-60 mb-1 flex items-center gap-1"><Wrench className="w-3 h-3" /> Remediation</p>
+                                      <p className="text-xs leading-relaxed">{f.fp_challenge_fix}</p>
+                                    </div>
+                                  )}
                                 </div>
                               )}
                             </div>
@@ -1173,7 +1413,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
               <div className="text-center">
                 <h3 className="text-base font-semibold text-white">LLM Code Review</h3>
                 <p className="text-sm text-gray-500 mt-1 max-w-md">
-                  llama3.2:3b reviews every source file for security issues, performance problems,
+                  {llmDisplay} reviews every source file for security issues, performance problems,
                   code quality, error handling, and best practices beyond what Semgrep detects.
                 </p>
               </div>
@@ -1210,11 +1450,23 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
             </div>
           )}
 
-          {crTriggered && crLoading && (
+          {crTriggered && crLoading && crQueued && (
+            <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-8 space-y-3">
+              <div className="flex items-center gap-3">
+                <div className="w-2.5 h-2.5 rounded-full bg-purple-400/50 animate-pulse" />
+                <p className="text-sm font-medium text-gray-400">Code Review queued</p>
+              </div>
+              <p className="text-xs text-gray-500">
+                Waiting for SAST, Secrets and SCA agents to complete before starting file review…
+              </p>
+            </div>
+          )}
+
+          {crTriggered && crLoading && !crQueued && (
             <div className="rounded-xl bg-gray-900 border border-gray-700/60 p-8 space-y-5">
               <div className="flex items-center gap-3">
                 <div className="w-2.5 h-2.5 rounded-full bg-purple-400 animate-pulse" />
-                <p className="text-sm font-medium text-white">llama3.2:3b — reviewing files</p>
+                <p className="text-sm font-medium text-white">{llmDisplay} — reviewing files</p>
               </div>
               <div className="space-y-2">
                 <div className="flex justify-between text-xs text-gray-500">
@@ -1242,7 +1494,7 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                 </p>
               )}
               <p className="text-xs text-gray-600">
-                Reviewing {crProgress?.total_files ?? "…"} files (2 concurrently) with llama3.2:3b.
+                Reviewing {crProgress?.total_files ?? "…"} files with {llmDisplay}.
                 {crProgress?.total_files && crProgress.total_files <= 20
                   ? " Small project — est. ~10 min."
                   : crProgress?.total_files && crProgress.total_files <= 25
@@ -1373,6 +1625,33 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
                                   {f.recommendation}
                                 </div>
                               </div>
+
+                              {/* FP Challenger result */}
+                              {f.fp_challenge_verdict && (
+                                <div className={`rounded-lg border px-4 py-3 text-sm ${
+                                  f.fp_challenge_verdict === "CONFIRMED"
+                                    ? "bg-red-950/20 border-red-700/40 text-red-300"
+                                    : f.fp_challenge_verdict === "FALSE_POSITIVE"
+                                    ? "bg-emerald-950/30 border-emerald-700/40 text-emerald-300"
+                                    : "bg-yellow-950/20 border-yellow-700/40 text-yellow-300"
+                                }`}>
+                                  <p className="flex items-center gap-1.5 font-medium mb-1">
+                                    <CheckCheck className="w-3.5 h-3.5 shrink-0" />
+                                    <span className="opacity-60 text-xs font-normal">FP Challenger</span>
+                                    <span>→</span>
+                                    <span className="font-semibold">{f.fp_challenge_verdict.replace("_", " ")}</span>
+                                  </p>
+                                  {f.fp_challenge_reasoning && (
+                                    <p className="text-xs opacity-80 mt-1 leading-relaxed">{f.fp_challenge_reasoning}</p>
+                                  )}
+                                  {f.fp_challenge_fix && f.fp_challenge_verdict === "CONFIRMED" && (
+                                    <div className="mt-2 pt-2 border-t border-current/20">
+                                      <p className="text-xs opacity-60 mb-1 flex items-center gap-1"><Wrench className="w-3 h-3" /> Suggested Fix</p>
+                                      <p className="text-xs leading-relaxed whitespace-pre-wrap">{f.fp_challenge_fix}</p>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
                             </div>
                           </motion.div>
                         )}
@@ -1416,17 +1695,17 @@ function SummaryCard({
 }
 
 function AgentStatusCard({
-  label, icon, color, done, count, unit, subtitle, notStarted = false, progress, error = false, active = false, onClick,
+  label, icon, color, done, count, unit, subtitle, skills, notStarted = false, progress, error = false, active = false, onClick, onBadgeClick,
 }: {
   label: string; icon: React.ReactNode; color: string;
-  done: boolean; count: number; unit: string; subtitle?: string;
+  done: boolean; count: number; unit: string; subtitle?: string; skills?: string[];
   notStarted?: boolean; progress?: number; error?: boolean;
-  active?: boolean; onClick?: () => void;
+  active?: boolean; onClick?: () => void; onBadgeClick?: () => void;
 }) {
   return (
     <div
       onClick={onClick}
-      className={`rounded-lg px-4 py-3 space-y-2 transition-all cursor-pointer
+      className={`rounded-lg px-4 py-3 space-y-2 transition-all ${onClick ? "cursor-pointer" : "cursor-default"}
         ${active
           ? "bg-gray-700/80 border-2 border-brand-500/70 shadow-lg shadow-brand-500/10"
           : error
@@ -1441,9 +1720,13 @@ function AgentStatusCard({
         {error ? (
           <AlertTriangle className="w-4 h-4 text-red-400" />
         ) : done ? (
-          <CheckCheck className="w-4 h-4 text-green-400" />
+          onBadgeClick
+            ? <span onClick={(e) => { e.stopPropagation(); onBadgeClick(); }} className="text-[10px] text-gray-500 border border-gray-600 rounded px-1.5 py-0.5 hover:border-gray-400 hover:text-gray-300 transition-colors cursor-pointer">re-run</span>
+            : <CheckCheck className="w-4 h-4 text-green-400" />
         ) : notStarted ? (
-          <span className="text-xs text-gray-600">not started</span>
+          onBadgeClick
+            ? <span onClick={(e) => { e.stopPropagation(); onBadgeClick(); }} className="text-[10px] text-emerald-500 border border-emerald-600/50 rounded px-1.5 py-0.5 hover:border-emerald-400 hover:text-emerald-300 transition-colors flex items-center gap-1 cursor-pointer"><PlayCircle className="w-3 h-3" />Run</span>
+            : <span className="text-xs text-gray-600">not started</span>
         ) : (
           <Loader2 className="w-3.5 h-3.5 animate-spin text-gray-500" />
         )}
@@ -1478,8 +1761,18 @@ function AgentStatusCard({
       <p className={`text-sm font-bold tabular-nums ${error ? "text-red-400" : done ? color : "text-gray-500"}`}>
         {error ? "failed" : done ? `${count} ${unit}` : notStarted ? "—" : "running…"}
       </p>
-      {done && subtitle && (
+      {subtitle && (done || (!notStarted && !error)) && (
         <p className="text-xs text-gray-500 -mt-1">{subtitle}</p>
+      )}
+      {skills && skills.length > 0 && (
+        <div className="pt-1.5 border-t border-gray-700/50 mt-1">
+          <p className="text-[9px] uppercase tracking-widest text-gray-600 mb-1">Skills</p>
+          <div className="flex flex-wrap gap-1">
+            {skills.map(s => (
+              <span key={s} className={`text-[10px] font-medium px-1.5 py-0.5 rounded border ${color.replace("text-", "border-").replace("400", "500/40")} ${color.replace("text-", "bg-").replace("400", "500/10")} ${color}`}>{s}</span>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );

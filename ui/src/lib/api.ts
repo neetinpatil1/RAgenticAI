@@ -76,6 +76,7 @@ export async function getDependencyFindings(runId: string): Promise<{ findings: 
 export async function getFpChallengeProgress(runId: string): Promise<{
   status: string; pct: number; findings_done: number; findings_total: number;
   fp_found: number; current_finding: string | null;
+  sca_total: number; sca_done: number; cr_total: number; cr_done: number;
 }> {
   const res = await fetch(`${BASE}/fp-challenge/${runId}/progress`);
   if (!res.ok) throw new Error(`FP challenge progress fetch failed: ${res.status}`);

@@ -27,6 +27,7 @@ export interface Finding {
   fp_category: string | null;
   reasoning: string | null;
   label_status: string | null;
+  fp_source: string | null;
 }
 
 export interface ScanCoverage {
@@ -55,6 +56,14 @@ export interface ScanStatus {
     baseline: number;
     total: number;
   };
+  agents?: {
+    sast_done: boolean;
+    secrets_done: boolean;
+    sca_done: boolean;
+    reachability_done: boolean;
+    spotbugs_done?: boolean;
+    codeql_done?: boolean;
+  };
 }
 
 export type ReviewCategory = "SECURITY" | "PERFORMANCE" | "CODE_QUALITY" | "ERROR_HANDLING" | "BEST_PRACTICES";
@@ -74,6 +83,9 @@ export interface CodeReviewFinding {
   confidence: number;
   overall_file_score: number | null;
   created_at: string;
+  fp_challenge_verdict?: string | null;   // CONFIRMED | FALSE_POSITIVE | UNCERTAIN
+  fp_challenge_reasoning?: string | null;
+  fp_challenge_fix?: string | null;
 }
 
 export interface CodeReviewSummary {
@@ -143,6 +155,14 @@ export interface DependencyFinding {
   ecosystem: string;
   file_path: string | null;
   created_at: string;
+  reachability?:           string | null;   // REACHABLE | NOT_REACHABLE | UNKNOWN | LIKELY_REACHABLE | LIKELY_NOT_REACHABLE
+  reach_evidence?:         string | null;
+  reach_confidence?:       number | null;
+  reach_source?:           string | null;
+  affected_classes?:       string | null;   // JSON string of string[]
+  fp_challenge_verdict?:   string | null;   // APPLICABLE | NOT_APPLICABLE | UNCERTAIN
+  fp_challenge_reasoning?: string | null;
+  fp_challenge_fix?:       string | null;
 }
 
 export interface DependencySummary {

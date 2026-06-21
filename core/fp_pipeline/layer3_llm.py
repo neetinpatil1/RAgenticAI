@@ -16,7 +16,7 @@ Prompt loaded from: prompts/sast_agent/v1.0/fp_analysis.yml
 
 import json
 import logging
-import httpx
+import re
 from typing import Optional
 
 from core.config import settings
@@ -28,6 +28,29 @@ from core.state.vector_memory import VectorMemory
 from core.prompt_manager import PromptManager
 
 logger = logging.getLogger(__name__)
+
+
+def _try_repair_json(raw: str) -> Optional[dict]:
+    """
+    Best-effort extraction from a truncated LLM JSON response.
+
+    When num_predict cuts off mid-string the JSON is invalid, but the fields
+    we need (verdict, confidence) usually appear early in the response.
+    Returns a partial dict if verdict is recoverable, else None.
+    """
+    verdict_m = re.search(r'"verdict"\s*:\s*"([^"]+)"', raw)
+    if not verdict_m:
+        return None
+    confidence_m = re.search(r'"confidence"\s*:\s*([\d.]+)', raw)
+    fp_cat_m = re.search(r'"fp_category"\s*:\s*"?([^",\n}]+)"?', raw)
+    reasoning_m = re.search(r'"reasoning"\s*:\s*"([^"]*)', raw)
+
+    return {
+        "verdict":     verdict_m.group(1),
+        "confidence":  float(confidence_m.group(1)) if confidence_m else 0.5,
+        "fp_category": fp_cat_m.group(1).strip() if fp_cat_m and fp_cat_m.group(1).strip() not in ("null", "") else None,
+        "reasoning":   (reasoning_m.group(1).strip() + " [truncated]") if reasoning_m else None,
+    }
 
 
 class Layer3LLM:
@@ -69,11 +92,6 @@ class Layer3LLM:
         Returns:
             FPDecision with one of: REAL, FP, ESCALATED, DEADLOCK.
         """
-        model = (
-            settings.ollama.tier1_model if use_tier1
-            else settings.ollama.tier2_model
-        )
-
         # --- Step 1: Retrieve similar past decisions from pgvector ---
         query_text = f"{finding.message}\n\n{finding.code_snippet or ''}"
         similar = await self._memory.retrieve_similar(
@@ -87,8 +105,8 @@ class Layer3LLM:
         system_prompt = self._prompts.get("sast_agent", "v1.0", "fp_analysis", "system")
         user_prompt = self._build_user_prompt(finding, similar)
 
-        # --- Step 3: Call Ollama ---
-        raw_response = await self._call_ollama(model, system_prompt, user_prompt)
+        # --- Step 3: Call LLM ---
+        raw_response = await self._call_llm(use_tier1, system_prompt, user_prompt)
 
         # --- Step 4: Parse structured output ---
         decision = self._parse_response(raw_response, finding_db_id, run_id)
@@ -159,35 +177,21 @@ Respond with valid JSON matching the schema:
   "reasoning": "brief explanation"
 }}"""
 
-    async def _call_ollama(
+    async def _call_llm(
         self,
-        model: str,
+        use_tier1: bool,
         system_prompt: str,
         user_prompt: str,
     ) -> str:
-        """
-        Call Ollama chat completion API.
-        Ollama runs natively on Mac — no Docker, direct Metal GPU access.
-        """
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            "stream": False,
-            "format": "json",       # Ollama JSON mode — enforces JSON output
-        }
-
-        async with httpx.AsyncClient(timeout=settings.ollama.request_timeout) as client:
-            response = await client.post(
-                f"{settings.ollama.base_url}/api/chat",
-                json=payload,
-            )
-            response.raise_for_status()
-
-        data = response.json()
-        return data["message"]["content"]
+        """Route FP analysis call through the unified LLM client."""
+        from core.llm_client import call_llm
+        return await call_llm(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            use_tier1=use_tier1,
+            json_mode=True,
+            max_tokens=512,
+        )
 
     def _parse_response(
         self,
@@ -202,7 +206,16 @@ Respond with valid JSON matching the schema:
         This prevents hallucinated or truncated output from being treated as REAL.
         """
         try:
-            data = json.loads(raw)
+            # Strip markdown code fences that some models wrap around JSON output
+            # e.g. ```json\n{...}\n``` → {...}
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```", 2)[1]          # strip opening fence
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]                      # strip "json" tag
+                if "```" in cleaned:
+                    cleaned = cleaned[:cleaned.rindex("```")] # strip closing fence
+            data = json.loads(cleaned.strip())
             verdict_str = data.get("verdict", "ESCALATED").upper()
             verdict = FPVerdict(verdict_str)
 
@@ -218,6 +231,29 @@ Respond with valid JSON matching the schema:
             )
 
         except (json.JSONDecodeError, ValueError, KeyError) as exc:
+            # JSON repair: if the response is truncated mid-string, try to extract
+            # the fields we need via regex before giving up with ESCALATED.
+            repaired = _try_repair_json(raw)
+            if repaired is not None:
+                logger.info(
+                    "Layer 3 JSON repaired from truncated response | raw=%.100s", raw
+                )
+                verdict_str = repaired.get("verdict", "ESCALATED").upper()
+                try:
+                    verdict = FPVerdict(verdict_str)
+                except ValueError:
+                    verdict = FPVerdict.ESCALATED
+                return FPDecision(
+                    finding_id=finding_db_id,
+                    run_id=run_id,
+                    verdict=verdict,
+                    source=FPSource.LAYER3_LLM,
+                    confidence=float(repaired.get("confidence", 0.5)),
+                    fp_category=repaired.get("fp_category") if verdict == FPVerdict.FP else None,
+                    reasoning=repaired.get("reasoning"),
+                    label_status=LabelStatus.AGENT_ONLY,
+                )
+
             logger.warning(
                 "Layer 3 parse error — returning ESCALATED | error=%s raw=%.200s",
                 exc, raw

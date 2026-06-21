@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import TypedDict, Optional
 
 import asyncpg
-import httpx
 from langgraph.graph import StateGraph, END
 
 from core.config import settings
@@ -125,31 +124,19 @@ async def _load_sast_findings(pool: asyncpg.Pool, run_id: str) -> dict[str, list
 # Helper: call Ollama LLM
 # ---------------------------------------------------------------------------
 
-async def _call_llm(system_prompt: str, user_prompt: str, timeout: int = 120) -> str:
-    """Call Ollama chat API."""
-    payload = {
-        "model": settings.ollama.tier1_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-        "stream":  False,
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 1024,  # enough for full JSON with multiple findings
-            "num_ctx":     3072,  # input (~1200 tokens) + output (1024) = ~2224; 3072 gives headroom
-            "num_gpu":     99,    # force all layers onto Metal GPU
-            "num_thread":  8,     # CPU threads for prompt processing
-        },
-    }
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            f"{settings.ollama.base_url}/api/chat",
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["message"]["content"]
+async def _call_llm(system_prompt: str, user_prompt: str, timeout: int | None = None) -> str:
+    """Call the configured LLM provider for code review."""
+    from core.llm_client import call_llm
+    if timeout is None:
+        timeout = settings.ollama.request_timeout
+    return await call_llm(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        use_tier1=False,
+        timeout=timeout,
+        max_tokens=2048,
+        temperature=0.1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +355,11 @@ async def node_start(state: CodeReviewState, deps: dict) -> CodeReviewState:
         """)
 
     sast_findings = await _load_sast_findings(pool, run_id)
-    logger.warning("CODE REVIEW STARTED | run=%s sast_context_files=%d model=%s", run_id, len(sast_findings), settings.ollama.tier1_model)
+    provider = settings.llm.provider
+    model = (settings.llm.gemini_tier2 if provider == "gemini"
+             else settings.llm.claude_tier2 if provider == "claude"
+             else settings.ollama.tier2_model)
+    logger.warning("CODE REVIEW STARTED | run=%s sast_context_files=%d provider=%s model=%s", run_id, len(sast_findings), provider, model)
     return {**state, "sast_findings": sast_findings}
 
 
@@ -745,8 +736,9 @@ async def node_review_files(state: CodeReviewState, deps: dict) -> CodeReviewSta
     processed = 0
     total_findings = 0
 
-    # Semaphore = 2: send 2 files to Ollama concurrently (matches OLLAMA_NUM_PARALLEL=2)
-    semaphore = asyncio.Semaphore(2)
+    # Semaphore = 1: one file at a time — avoids timeout when reachability/FP pipeline
+    # compete for the same LLM concurrently.
+    semaphore = asyncio.Semaphore(1)
     lock = asyncio.Lock()   # protect shared counters
 
     async def review_one(abs_path: str) -> None:

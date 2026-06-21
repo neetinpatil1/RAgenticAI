@@ -54,6 +54,32 @@ class OllamaConfig:
 
 
 @dataclass
+class LLMConfig:
+    """
+    Multi-provider LLM config. Set LLM_PROVIDER=ollama|claude|gemini to switch.
+
+    Tier 1 = high-capability model (SAST analysis, FP arbitration, code review).
+    Tier 2 = fast/cheap model (classification, routing, reachability fallback).
+    """
+    provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama"))
+
+    # Anthropic / Claude
+    anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
+    claude_tier1: str = field(default_factory=lambda: os.getenv("CLAUDE_TIER1_MODEL", "claude-sonnet-4-6"))
+    claude_tier2: str = field(default_factory=lambda: os.getenv("CLAUDE_TIER2_MODEL", "claude-haiku-4-5-20251001"))
+
+    # Google Gemini
+    # Leave GOOGLE_API_KEY blank to use Application Default Credentials (ADC).
+    # ADC: run `gcloud auth application-default login` once, then set
+    # GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION below.
+    google_api_key: str = field(default_factory=lambda: os.getenv("GOOGLE_API_KEY", ""))
+    google_cloud_project: str = field(default_factory=lambda: os.getenv("GOOGLE_CLOUD_PROJECT", ""))
+    google_cloud_location: str = field(default_factory=lambda: os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"))
+    gemini_tier1: str = field(default_factory=lambda: os.getenv("GEMINI_TIER1_MODEL", "gemini-2.5-pro"))
+    gemini_tier2: str = field(default_factory=lambda: os.getenv("GEMINI_TIER2_MODEL", "gemini-2.0-flash"))
+
+
+@dataclass
 class SemgrepConfig:
     """Semgrep SAST scanner settings. Runs in Docker sandbox for isolation."""
     # Detection rules path — Semgrep-format YAML rules for vulnerability detection.
@@ -95,6 +121,7 @@ class AppConfig:
     """Top-level application config. Import this singleton."""
     db: DatabaseConfig = field(default_factory=DatabaseConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     semgrep: SemgrepConfig = field(default_factory=SemgrepConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
 

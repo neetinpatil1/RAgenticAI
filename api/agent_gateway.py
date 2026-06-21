@@ -56,9 +56,12 @@ from workflows.code_review_workflow import run_code_review_workflow
 from workflows.secret_scan_workflow import run_secret_scan_workflow
 from workflows.sca_workflow import run_sca_workflow
 from workflows.fp_challenger_workflow import run_fp_challenger_workflow
+from workflows.reachability_workflow import run_reachability_workflow
+from workflows.spotbugs_workflow import run_spotbugs_workflow
+from workflows.codeql_workflow import run_codeql_workflow
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -66,6 +69,8 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
 logging.getLogger("asyncpg").setLevel(logging.ERROR)
+logging.getLogger("langgraph").setLevel(logging.WARNING)
+logging.getLogger("httpcore.http11").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +166,7 @@ class ScanRequest(BaseModel):
     """Request body for POST /api/v1/scan"""
     path: str = Field(..., description="Absolute local path to the code to scan")
     metadata: dict = Field(default_factory=dict, description="Optional scan context (project, team, etc.)")
+    deep: bool = Field(False, description="Enable deep scan: runs CodeQL + SpotBugs + Eclipse Steady in addition to normal pipeline. Requires CodeQL CLI installed. Adds 5–20 min.")
 
 
 class ScanResponse(BaseModel):
@@ -218,42 +224,68 @@ def _build_workflow_deps() -> dict:
 # Phase 1: parallel agent launcher
 # ---------------------------------------------------------------------------
 
-async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
+async def _run_all_agents(run_id: str, scan_path: str, deps: dict, deep: bool = False) -> None:
     """
     Orchestration order (guaranteed):
       Step 1 — Code Knowledge Graph build (awaited, blocks step 2)
                Graph must be ready before code review so it can enrich LLM prompts.
       Step 2 — SAST + Secret Scanner + SCA run in parallel (graph already built)
       Step 3 — Code Review runs after SAST/SCA complete with full graph context
+      Step 4 — FP Challenger runs after Code Review completes
+      Step 5 — CodeQL deep scan (fire-and-forget, only when deep=True)
 
     return_exceptions=True ensures one agent crashing does not cancel the others.
     """
     import time as _t
     root = Path(scan_path)
     key  = str(root)
+    _wall_start = _t.time()
+
+    logger.info("=" * 70)
+    logger.info("SCAN ORCHESTRATION START | run=%s path=%s", run_id, scan_path)
+    logger.info("=" * 70)
 
     # ── Step 1: Build code knowledge graph first ──────────────────────────────
-    # Skip if already done (e.g. repeat scan of same project)
+    _t1 = _t.time()
     if _graph_build_status.get(key, {}).get("status") not in ("done",):
-        _graph_build_status[key] = {"status": "building", "error": None, "started_at": _t.time()}
-        logger.warning("graph/build: starting BEFORE SAST for %s", root)
+        _graph_build_status[key] = {"status": "building", "error": None, "started_at": _t1}
+        logger.info("[STEP 1/5] Graph build: STARTING | run=%s path=%s", run_id, root.name)
         await _run_graph_build(root)   # ← awaited: SAST waits for this
-        logger.warning("graph/build: finished, SAST starting now for %s", root)
+        _graph_state = _graph_build_status.get(key, {}).get("status", "unknown")
+        logger.info("[STEP 1/5] Graph build: DONE | run=%s status=%s elapsed=%.1fs",
+                    run_id, _graph_state, _t.time() - _t1)
     else:
-        logger.warning("graph/build: already done, skipping rebuild for %s", root)
+        logger.info("[STEP 1/5] Graph build: SKIPPED (already built) | run=%s", run_id)
 
-    # ── Step 2: SAST only (awaited — writes findings to DB before code review) ──
-    logger.info("SAST starting | run=%s", run_id)
-    try:
-        await run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
-    except Exception as exc:
-        logger.error("SAST failed | run=%s error=%s", run_id, exc)
-    logger.info("SAST complete | run=%s", run_id)
+    # ── Step 2: SAST + Secrets + SCA + SpotBugs in parallel ─────────────────
+    # All four run concurrently. SAST includes its inline FP pipeline (Layer 1 + Layer 3 LLM).
+    # SpotBugs adds Java bytecode SAST (FindSecBugs) — skipped gracefully if no .class files.
+    # Code Review is NOT here — it needs SAST findings in the DB first.
+    _t2 = _t.time()
+    logger.info("[STEP 2/5] SAST + Secrets + SCA + SpotBugs: STARTING in parallel | run=%s", run_id)
+    pool_ref: asyncpg.Pool = deps["pool"]
+    step2_results = await asyncio.gather(
+        run_sast_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_secret_scan_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_sca_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
+        run_spotbugs_workflow(run_id=run_id, scan_path=scan_path, pool=pool_ref),
+        return_exceptions=True,
+    )
+    _elapsed2 = _t.time() - _t2
+    for i, r in enumerate(step2_results):
+        agent = ["sast", "secret_scanner", "sca", "spotbugs"][i]
+        if isinstance(r, Exception):
+            logger.error("[STEP 2/5] Agent FAILED | agent=%s run=%s error=%s", agent, run_id, r)
+        else:
+            logger.info("[STEP 2/5] Agent done | agent=%s run=%s", agent, run_id)
+    logger.info("[STEP 2/5] SAST + Secrets + SCA + SpotBugs: ALL COMPLETE | run=%s elapsed=%.1fs",
+                run_id, _elapsed2)
 
-    # ── Step 3: Secrets + SCA + Code Review in parallel ───────────────────────
-    # Pre-insert code_review_status='running' BEFORE the gather so the UI
+    # ── Step 3: Code Review (needs SAST findings in DB from step 2) ──────────
+    # Pre-insert code_review_status='running' BEFORE starting so the UI
     # immediately sees "running" when it polls — eliminates the race where
     # node_enumerate_files hasn't written its first row yet and the UI gives up.
+    _t3 = _t.time()
     try:
         async with _pool.acquire() as conn:
             await conn.execute("""
@@ -282,46 +314,122 @@ async def _run_all_agents(run_id: str, scan_path: str, deps: dict) -> None:
     except Exception as exc:
         logger.warning("Could not pre-insert code_review_status: %s", exc)
 
-    logger.info("Secrets + SCA + Code Review starting in parallel | run=%s", run_id)
-    results = await asyncio.gather(
-        run_secret_scan_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
-        run_sca_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
-        run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps),
-        return_exceptions=True,
-    )
-    for i, r in enumerate(results):
-        if isinstance(r, Exception):
-            agent = ["secret_scanner", "sca", "code_review"][i]
-            logger.error("Agent failed | agent=%s run=%s error=%s", agent, run_id, r)
-    logger.info("Secrets + SCA + Code Review complete | run=%s", run_id)
+    # Code Review then Reachability — sequential, not parallel.
+    # Ollama queues requests serially; running both concurrently causes ReadTimeout
+    # on whichever workflow has to wait behind the other's LLM calls.
+    logger.info("[STEP 3/5] Code Review: STARTING | run=%s", run_id)
+    try:
+        await _run_code_review_step(run_id, scan_path, deps)
+    except Exception as exc:
+        logger.warning("[STEP 3/5] Code Review failed (non-fatal): %s | run=%s", exc, run_id)
+    logger.info("[STEP 3/5] Reachability: STARTING | run=%s", run_id)
+    try:
+        await _run_reachability_step(run_id, scan_path, deps["pool"])
+    except Exception as exc:
+        logger.warning("[STEP 3/5] Reachability failed (non-fatal): %s | run=%s", exc, run_id)
+    logger.info("[STEP 3/5] Code Review + Reachability: COMPLETE | run=%s elapsed=%.1fs",
+                run_id, _t.time() - _t3)
 
-    # ── Step 4: FP Challenger ─────────────────────────────────────────────────
-    # Pre-insert fp_challenge_status='running' so the UI detects it immediately
-    # instead of waiting for node_load_findings to write the first row.
+    # ── Step 4/5: FP Challenger ───────────────────────────────────────────────
+    # Runs ONLY after Code Review completes.
+    # Pre-insert fp_challenge_status='running' so the UI detects it immediately.
+    _t4 = _t.time()
     try:
         async with _pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO fp_challenge_status
-                    (run_id, status, findings_total, findings_done, pct, fp_found, current_finding, updated_at)
-                VALUES ($1, 'running', 0, 0, 0, 0, NULL, NOW())
+                    (run_id, status, findings_total, findings_done, pct, fp_found,
+                     current_finding, sca_total, sca_done, cr_total, cr_done, updated_at)
+                VALUES ($1, 'running', 0, 0, 0, 0, NULL, 0, 0, 0, 0, NOW())
                 ON CONFLICT (run_id) DO UPDATE SET
                     status='running', findings_total=0, findings_done=0, pct=0,
-                    fp_found=0, current_finding=NULL, updated_at=NOW()
+                    fp_found=0, current_finding=NULL,
+                    sca_total=0, sca_done=0, cr_total=0, cr_done=0,
+                    updated_at=NOW()
                 """,
                 run_id,
             )
     except Exception as exc:
         logger.warning("Could not pre-insert fp_challenge_status: %s", exc)
 
-    logger.info("FP Challenger starting | run=%s", run_id)
+    logger.info("[STEP 4/5] FP Challenger: STARTING | run=%s", run_id)
     await run_fp_challenger_workflow(run_id=run_id, deps=deps)
-    logger.info("FP Challenger complete | run=%s", run_id)
+    logger.info("[STEP 4/5] FP Challenger: COMPLETE | run=%s elapsed=%.1fs", run_id, _t.time() - _t4)
+
+    # ── Step 5: CodeQL deep scan (fire-and-forget, only when deep=True) ──────
+    if deep:
+        logger.info("[STEP 5/5] CodeQL deep scan: STARTING (background) | run=%s", run_id)
+        pool: asyncpg.Pool = deps["pool"]
+        asyncio.create_task(
+            _run_codeql_step(run_id, scan_path, pool),
+        )
+    else:
+        logger.info("[STEP 5/5] CodeQL deep scan: SKIPPED (deep=False) | run=%s", run_id)
+
+    # Mark the run as completed only after all steps finish.
+    # Previously this was done inside sast_workflow.py which caused the UI
+    # to start its MAX_RETRIES countdown before reachability/FP even began.
+    wf_state = get_workflow_state()
+    await wf_state.set_completed(run_id)
+
+    logger.info("=" * 70)
+    logger.info("SCAN ORCHESTRATION COMPLETE | run=%s total_elapsed=%.1fs",
+                run_id, _t.time() - _wall_start)
+    logger.info("=" * 70)
+
+
+async def _run_code_review_step(run_id: str, scan_path: str, deps: dict) -> None:
+    try:
+        await run_code_review_workflow(run_id=run_id, scan_path=scan_path, deps=deps)
+    except Exception as exc:
+        logger.error("Code Review: FAILED | run=%s error=%s", run_id, exc)
+
+
+async def _run_reachability_step(run_id: str, scan_path: str, pool: asyncpg.Pool) -> None:
+    try:
+        # Only run if there are CVE findings
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM dependency_findings WHERE run_id = $1", run_id
+            )
+        if count and count > 0:
+            logger.info("Reachability step: %d CVEs found — starting analysis | run=%s", count, run_id)
+            await run_reachability_workflow(run_id=run_id, scan_path=scan_path, pool=pool)
+        else:
+            logger.info("Reachability step: no CVEs — skipping | run=%s", run_id)
+    except Exception as exc:
+        logger.error("Reachability step: FAILED | run=%s error=%s", run_id, exc)
+
+
+async def _run_codeql_step(run_id: str, scan_path: str, pool: asyncpg.Pool) -> None:
+    """Fire-and-forget wrapper for the CodeQL deep-scan workflow."""
+    try:
+        await run_codeql_workflow(run_id=run_id, scan_path=scan_path, pool=pool)
+        logger.info("CodeQL step: COMPLETE | run=%s", run_id)
+    except Exception as exc:
+        logger.error("CodeQL step: FAILED | run=%s error=%s", run_id, exc)
 
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/api/v1/config/llm")
+async def get_llm_config():
+    """Return current LLM provider and model names for UI display."""
+    provider = settings.llm.provider.lower()
+    if provider == "claude":
+        tier2 = settings.llm.claude_tier2
+        display = tier2.replace("claude-", "Claude ").replace("-20251001", "").replace("-", " ").title()
+    elif provider == "gemini":
+        tier2 = settings.llm.gemini_tier2
+        display = tier2.replace("gemini-", "Gemini ").replace("-", " ").title()
+    else:
+        tier2 = settings.ollama.tier2_model
+        display = tier2
+    return {"provider": provider, "tier2_model": tier2, "display_name": display}
+
 
 @app.get("/health")
 async def health():
@@ -390,6 +498,7 @@ async def submit_scan(
         run_id=run_id,
         scan_path=str(scan_path.resolve()),
         deps=deps,
+        deep=request.deep,
     )
 
     logger.info("Scan submitted | run=%s path=%s", run_id, request.path)
@@ -455,6 +564,22 @@ async def get_scan_status(run_id: str, pool: asyncpg.Pool = Depends(get_pool)):
             "scan_duration_ms":    meta.get("scan_duration_ms", 0),
         },
         "findings": {k: v for k, v in findings_dict.items() if k != "files_with_findings"},
+        # Per-agent completion flags — set by each workflow's node_complete, independent of SAST
+        "agents": {
+            # sast_done: the full SAST workflow is done — Semgrep AND the inline FP pipeline
+            # (L1 rules + L3 LLM verdicts on every finding) have both completed.
+            # node_finalize writes fp_summary to metadata as its very last action,
+            # so this is the correct completion signal for the SAST card.
+            "sast_done":         bool(meta.get("fp_summary")),
+            "secrets_done":      bool((meta.get("secret_scan") or {}).get("completed_at")),
+            "sca_done":          bool((meta.get("sca") or {}).get("completed_at")),
+            "reachability_done": bool((meta.get("reachability") or {}).get("completed_at")),
+            "spotbugs_done":     bool((meta.get("spotbugs") or {}).get("completed_at")),
+            "codeql_done":       bool(
+                (meta.get("codeql") or {}).get("completed_at")
+                or (meta.get("codeql") or {}).get("skipped")
+            ),
+        },
     }
 
 
@@ -496,9 +621,15 @@ async def list_findings(
                 fr.is_baseline, fr.created_at,
                 COALESCE(fr.blast_radius, 0) AS blast_radius,
                 fp.verdict, fp.confidence, fp.fp_category, fp.reasoning,
-                fp.label_status
+                fp.label_status, fp.source AS fp_source
             FROM findings_reports fr
-            LEFT JOIN fp_decisions fp ON fp.finding_id = fr.id
+            LEFT JOIN LATERAL (
+                SELECT verdict, confidence, fp_category, reasoning, label_status, source
+                FROM fp_decisions
+                WHERE finding_id = fr.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) fp ON true
             {where}
             ORDER BY
                 CASE fr.severity
@@ -962,7 +1093,10 @@ async def get_dependency_findings(
         rows = await conn.fetch(
             f"""
             SELECT id, run_id, package_name, installed_version, fixed_version,
-                   vulnerability_id, severity, description, ecosystem, file_path, created_at
+                   vulnerability_id, severity, description, ecosystem, file_path,
+                   reachability, reach_evidence, reach_confidence, reach_source,
+                   affected_classes, created_at,
+                   fp_challenge_verdict, fp_challenge_reasoning, fp_challenge_fix
             FROM dependency_findings
             {where}
             ORDER BY
@@ -1147,7 +1281,8 @@ async def get_code_review_findings(
             f"""
             SELECT id, run_id, file_path, language, category, severity,
                    line_start, line_end, title, description, recommendation,
-                   confidence, overall_file_score, created_at
+                   confidence, overall_file_score, created_at,
+                   fp_challenge_verdict, fp_challenge_reasoning, fp_challenge_fix
             FROM code_review_findings
             {where}
             ORDER BY
@@ -1235,11 +1370,14 @@ async def trigger_fp_challenge(
             await conn.execute(
                 """
                 INSERT INTO fp_challenge_status
-                    (run_id, status, findings_total, findings_done, pct, fp_found, current_finding, updated_at)
-                VALUES ($1, 'running', 0, 0, 0, 0, NULL, NOW())
+                    (run_id, status, findings_total, findings_done, pct, fp_found,
+                     current_finding, sca_total, sca_done, cr_total, cr_done, updated_at)
+                VALUES ($1, 'running', 0, 0, 0, 0, NULL, 0, 0, 0, 0, NOW())
                 ON CONFLICT (run_id) DO UPDATE SET
                     status='running', findings_total=0, findings_done=0, pct=0,
-                    fp_found=0, current_finding=NULL, updated_at=NOW()
+                    fp_found=0, current_finding=NULL,
+                    sca_total=0, sca_done=0, cr_total=0, cr_done=0,
+                    updated_at=NOW()
                 """,
                 run_id,
             )
@@ -1272,18 +1410,27 @@ async def get_fp_challenge_progress(
             row = None
 
     if not row:
-        return {"run_id": run_id, "status": "not_started", "pct": 0, "findings_done": 0,
-                "findings_total": 0, "fp_found": 0, "current_finding": None}
+        return {
+            "run_id": run_id, "status": "not_started",
+            "pct": 0, "findings_done": 0, "findings_total": 0, "fp_found": 0,
+            "current_finding": None,
+            "sca_total": 0, "sca_done": 0, "cr_total": 0, "cr_done": 0,
+        }
 
+    d = dict(row)
     return {
         "run_id":          run_id,
-        "status":          row["status"],
-        "findings_done":   row["findings_done"],
-        "findings_total":  row["findings_total"],
-        "pct":             row["pct"],
-        "fp_found":        row["fp_found"],
-        "current_finding": row["current_finding"],
-        "updated_at":      row["updated_at"].isoformat() if row["updated_at"] else None,
+        "status":          d["status"],
+        "findings_done":   d["findings_done"],
+        "findings_total":  d["findings_total"],
+        "pct":             d["pct"],
+        "fp_found":        d["fp_found"],
+        "current_finding": d["current_finding"],
+        "sca_total":       d.get("sca_total", 0),
+        "sca_done":        d.get("sca_done", 0),
+        "cr_total":        d.get("cr_total", 0),
+        "cr_done":         d.get("cr_done", 0),
+        "updated_at":      d["updated_at"].isoformat() if d["updated_at"] else None,
     }
 
 
@@ -1365,14 +1512,102 @@ async def get_fp_challenge_results(
     fp_count   = sum(1 for d in decisions if d["verdict"] == "FP")
     real_count = sum(1 for d in decisions if d["verdict"] == "REAL")
 
+    # SCA challenge results
+    sca_rows = []
+    try:
+        async with pool.acquire() as conn:
+            sca_rows = await conn.fetch(
+                """
+                SELECT id, package_name, installed_version, fixed_version,
+                       vulnerability_id, severity, ecosystem, file_path,
+                       fp_challenge_verdict, fp_challenge_reasoning, fp_challenge_fix
+                FROM dependency_findings
+                WHERE run_id = $1 AND fp_challenge_verdict IS NOT NULL
+                ORDER BY
+                    CASE severity
+                        WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2
+                        WHEN 'MEDIUM'   THEN 3 WHEN 'LOW'  THEN 4 ELSE 5
+                    END
+                """,
+                run_id,
+            )
+    except Exception:
+        pass
+
+    sca_results = [
+        {
+            "id":             str(r["id"]),
+            "package_name":   r["package_name"],
+            "version":        r["installed_version"],
+            "fixed_version":  r["fixed_version"],
+            "vulnerability_id": r["vulnerability_id"],
+            "severity":       r["severity"],
+            "ecosystem":      r["ecosystem"],
+            "file_path":      r["file_path"],
+            "verdict":        r["fp_challenge_verdict"],
+            "reasoning":      r["fp_challenge_reasoning"],
+            "fix_suggestion": r["fp_challenge_fix"],
+        }
+        for r in sca_rows
+    ]
+
+    # Code review challenge results
+    cr_rows = []
+    try:
+        async with pool.acquire() as conn:
+            cr_rows = await conn.fetch(
+                """
+                SELECT id, file_path, category, severity, line_start, line_end,
+                       title, description, recommendation,
+                       fp_challenge_verdict, fp_challenge_reasoning, fp_challenge_fix
+                FROM code_review_findings
+                WHERE run_id = $1 AND fp_challenge_verdict IS NOT NULL
+                ORDER BY
+                    CASE severity
+                        WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2
+                        WHEN 'MEDIUM'   THEN 3 WHEN 'LOW'  THEN 4 ELSE 5
+                    END
+                """,
+                run_id,
+            )
+    except Exception:
+        pass
+
+    cr_results = [
+        {
+            "id":              str(r["id"]),
+            "file_path":       r["file_path"],
+            "category":        r["category"],
+            "severity":        r["severity"],
+            "line_start":      r["line_start"],
+            "line_end":        r["line_end"],
+            "title":           r["title"],
+            "description":     r["description"],
+            "recommendation":  r["recommendation"],
+            "verdict":         r["fp_challenge_verdict"],
+            "reasoning":       r["fp_challenge_reasoning"],
+            "fix_suggestion":  r["fp_challenge_fix"],
+        }
+        for r in cr_rows
+    ]
+
+    sr = dict(status_row) if status_row else {}
+
     return {
-        "run_id":    run_id,
-        "count":     len(decisions),
-        "fp_count":  fp_count,
-        "real_count": real_count,
-        "status":    status_row["status"] if status_row else "not_started",
-        "fp_found":  status_row["fp_found"] if status_row else 0,
-        "decisions": decisions,
+        "run_id":       run_id,
+        "status":       sr.get("status", "not_started"),
+        # SAST summary
+        "count":        len(decisions),
+        "fp_count":     fp_count,
+        "real_count":   real_count,
+        "fp_found":     sr.get("fp_found", 0),
+        "decisions":    decisions,
+        # SCA summary
+        "sca_total":    sr.get("sca_total", len(sca_results)),
+        "sca_results":  sca_results,
+        # Code review summary
+        "cr_total":     sr.get("cr_total", len(cr_results)),
+        "cr_results":   cr_results,
     }
 
 
