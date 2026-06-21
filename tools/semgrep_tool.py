@@ -322,8 +322,12 @@ class SemgrepTool:
         tech_list = metadata.get("technology", [])
         framework = self._detect_framework(tech_list, result.get("path", ""))
 
-        # File path — make relative to scan root for cleaner output
+        # File path — Semgrep in Docker emits /src/... paths; remap to host path.
         abs_file_path = result.get("path", "")
+        if abs_file_path.startswith("/src/"):
+            abs_file_path = scan_path.rstrip("/") + "/" + abs_file_path[len("/src/"):]
+        elif abs_file_path == "/src":
+            abs_file_path = scan_path
         file_path = abs_file_path
         if file_path.startswith(scan_path):
             file_path = file_path[len(scan_path):].lstrip("/")

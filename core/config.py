@@ -52,6 +52,19 @@ class OllamaConfig:
 
 
 @dataclass
+class GeminiConfig:
+    """Google Gemini API settings. Used when LLM_PROVIDER=gemini."""
+    api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    # Tier 1 — high-accuracy model for SAST analysis, FP arbitration, code review
+    tier1_model: str = field(default_factory=lambda: os.getenv("GEMINI_TIER1_MODEL", "gemini-2.5-flash"))
+    # Tier 2 — fast model for classification, routing, simple extraction
+    tier2_model: str = field(default_factory=lambda: os.getenv("GEMINI_TIER2_MODEL", "gemini-2.5-flash-lite"))
+    # Escalation threshold: re-run on Tier 1 if LLM confidence below this
+    escalation_confidence_threshold: float = 0.6
+    request_timeout: int = 120  # seconds — Gemini API is fast, 2 min is generous
+
+
+@dataclass
 class SemgrepConfig:
     """Semgrep SAST scanner settings. Runs in Docker sandbox for isolation."""
     # Detection rules path — Semgrep-format YAML rules for vulnerability detection.
@@ -93,8 +106,20 @@ class AppConfig:
     """Top-level application config. Import this singleton."""
     db: DatabaseConfig = field(default_factory=DatabaseConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    gemini: GeminiConfig = field(default_factory=GeminiConfig)
     semgrep: SemgrepConfig = field(default_factory=SemgrepConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
+
+    # LLM provider: "ollama" (local) | "gemini" (Google Gemini API)
+    # Controlled by a single flag in .env — switch providers without code changes.
+    llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama").lower())
+
+    @property
+    def llm(self) -> "OllamaConfig | GeminiConfig":
+        """Active LLM config for the current provider."""
+        if self.llm_provider == "gemini":
+            return self.gemini
+        return self.ollama
 
     # FastAPI server
     api_host: str = field(default_factory=lambda: os.getenv("API_HOST", "0.0.0.0"))

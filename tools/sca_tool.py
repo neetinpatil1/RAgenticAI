@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -277,6 +278,16 @@ class SCATool:
             except Exception as exc:
                 logger.debug("pom.xml parse error %s: %s", rel, exc)
 
+        # If no packages resolved (e.g. Spring Boot BOM inheritance — all deps
+        # have no <version> tags), fall back to `mvnw dependency:list` which
+        # asks Maven to resolve all transitive versions.
+        if not packages:
+            logger.info(
+                "SCA Maven | no explicit versions in pom.xml(s) — "
+                "trying mvnw dependency:list for BOM-managed deps"
+            )
+            packages = await self._resolve_via_mvnw(pom_files, root)
+
         stats["maven"]          += len(packages)
         stats["total_packages"] += len(packages)
         logger.info("SCA Maven | pom_files=%d resolved_packages=%d", len(pom_files), len(packages))
@@ -289,6 +300,83 @@ class SCATool:
             logger.warning("OSV Maven query failed: %s", exc)
 
         return findings
+
+    async def _resolve_via_mvnw(
+        self,
+        pom_files: list[Path],
+        root: Path,
+    ) -> list[tuple[str, str, str, str]]:
+        """
+        Run `mvnw dependency:list` (or `mvn dependency:list`) in each project
+        directory that contains a wrapper or a pom.xml, then parse the resolved
+        dependency lines to extract (group, artifact, version, rel_pom_path).
+
+        Output line format:
+            [INFO]    ch.qos.logback:logback-classic:jar:1.5.32:compile -- module ...
+        We match lines like:
+            ^\\[INFO\\]\\s+([^:]+):([^:]+):jar:([^:]+):[a-z]+
+        """
+        _DEP_RE = re.compile(
+            r"^\[INFO\]\s+([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):(?:jar|war|pom|aar):([^:]+):[a-z]+"
+        )
+        packages: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        # Determine unique project roots (directories containing pom.xml)
+        project_dirs: list[Path] = []
+        for pom in pom_files:
+            pdir = pom.parent
+            if pdir not in project_dirs:
+                project_dirs.append(pdir)
+
+        for pdir in project_dirs:
+            rel_pom = str((pdir / "pom.xml").relative_to(root))
+            mvnw = pdir / "mvnw"
+            if mvnw.exists():
+                cmd = [str(mvnw), "-f", str(pdir / "pom.xml"),
+                       "dependency:list", "-DincludeScope=compile",
+                       "-DoutputAbsoluteArtifactFilename=false"]
+            elif shutil.which("mvn"):
+                cmd = ["mvn", "-f", str(pdir / "pom.xml"),
+                       "dependency:list", "-DincludeScope=compile",
+                       "-DoutputAbsoluteArtifactFilename=false"]
+            else:
+                logger.debug("SCA Maven | no mvnw or mvn found in %s — skipping", pdir)
+                continue
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,  # merge stderr into stdout
+                    cwd=str(pdir),
+                )
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=120
+                )
+                output = stdout.decode("utf-8", errors="replace")
+
+                count = 0
+                for line in output.splitlines():
+                    m = _DEP_RE.match(line.strip())
+                    if m:
+                        group, artifact, version = m.group(1), m.group(2), m.group(3)
+                        key = (group, artifact, version)
+                        if key not in seen:
+                            seen.add(key)
+                            packages.append((group, artifact, version, rel_pom))
+                            count += 1
+
+                logger.info(
+                    "SCA Maven | mvnw dependency:list resolved %d packages in %s",
+                    count, pdir,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("SCA Maven | mvnw dependency:list timed out for %s", pdir)
+            except Exception as exc:
+                logger.warning("SCA Maven | mvnw dependency:list error for %s: %s", pdir, exc)
+
+        return packages
 
     async def _query_osv_batch(
         self,

@@ -109,7 +109,7 @@ class FPDecision(BaseModel):
         from core.config import settings
         return (
             self.verdict == FPVerdict.ESCALATED
-            or self.confidence < settings.ollama.escalation_confidence_threshold
+            or self.confidence < settings.llm.escalation_confidence_threshold
         )
 
     @property

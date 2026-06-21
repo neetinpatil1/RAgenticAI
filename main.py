@@ -187,17 +187,34 @@ async def _check_health():
     except Exception as exc:
         print(f"  ✗ PostgreSQL  — {exc}")
 
-    # Ollama
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{settings.ollama.base_url}/api/tags")
-            models = [m["name"] for m in resp.json().get("models", [])]
-            tier1_ok = settings.ollama.tier1_model in models
-            tier2_ok = settings.ollama.tier2_model in models
-            print(f"  {'✓' if tier1_ok else '✗'} Ollama Tier1  — {settings.ollama.tier1_model} {'(available)' if tier1_ok else '(NOT FOUND — run: ollama pull ' + settings.ollama.tier1_model + ')'}")
-            print(f"  {'✓' if tier2_ok else '✗'} Ollama Tier2  — {settings.ollama.tier2_model} {'(available)' if tier2_ok else '(NOT FOUND — run: ollama pull ' + settings.ollama.tier2_model + ')'}")
-    except Exception as exc:
-        print(f"  ✗ Ollama      — {exc}\n    Is Ollama running? Run: ollama serve")
+    # LLM provider
+    print(f"\n  LLM_PROVIDER  = {settings.llm_provider.upper()}")
+    if settings.llm_provider == "gemini":
+        # Gemini API — lightweight check via models list endpoint
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": settings.gemini.api_key},
+                )
+            ok = r.status_code == 200
+            print(f"  {'✓' if ok else '✗'} Gemini API    — Tier1: {settings.gemini.tier1_model} | Tier2: {settings.gemini.tier2_model}")
+            if not ok:
+                print(f"    Status {r.status_code} — check GEMINI_API_KEY in .env")
+        except Exception as exc:
+            print(f"  ✗ Gemini API  — {exc}")
+    else:
+        # Ollama
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{settings.ollama.base_url}/api/tags")
+                models = [m["name"] for m in resp.json().get("models", [])]
+                tier1_ok = settings.ollama.tier1_model in models
+                tier2_ok = settings.ollama.tier2_model in models
+                print(f"  {'✓' if tier1_ok else '✗'} Ollama Tier1  — {settings.ollama.tier1_model} {'(available)' if tier1_ok else '(NOT FOUND — run: ollama pull ' + settings.ollama.tier1_model + ')'}")
+                print(f"  {'✓' if tier2_ok else '✗'} Ollama Tier2  — {settings.ollama.tier2_model} {'(available)' if tier2_ok else '(NOT FOUND — run: ollama pull ' + settings.ollama.tier2_model + ')'}")
+        except Exception as exc:
+            print(f"  ✗ Ollama      — {exc}\n    Is Ollama running? Run: ollama serve")
 
     # Docker (for Semgrep sandbox)
     import subprocess

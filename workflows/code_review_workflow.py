@@ -29,10 +29,10 @@ from pathlib import Path
 from typing import TypedDict, Optional
 
 import asyncpg
-import httpx
 from langgraph.graph import StateGraph, END
 
 from core.config import settings
+from core.llm_client import llm_chat
 from core.output_contracts.code_review_report import (
     CodeReviewFileResult, CodeReviewFinding, ReviewCategory, ReviewSeverity,
 )
@@ -125,32 +125,23 @@ async def _load_sast_findings(pool: asyncpg.Pool, run_id: str) -> dict[str, list
 # ---------------------------------------------------------------------------
 
 async def _call_llm(system_prompt: str, user_prompt: str, timeout: int | None = None) -> str:
-    """Call Ollama chat API."""
-    if timeout is None:
-        timeout = settings.ollama.request_timeout
-    payload = {
-        "model": settings.ollama.tier2_model,  # llama3.2:3b — fast; switch to tier1_model for production
-        "messages": [
+    """Call LLM for code review (routes to Ollama or Claude based on LLM_PROVIDER)."""
+    return await llm_chat(
+        tier="tier2",
+        messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ],
-        "stream":  False,
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 2048,  # increased: 1024 was too small for files with 5+ findings
-            "num_ctx":     4096,  # input (~1200 tokens) + output (2048) = ~3248; 4096 gives headroom
-            "num_gpu":     99,    # force all layers onto Metal GPU
-            "num_thread":  8,     # CPU threads for prompt processing
+        max_tokens=2048,
+        temperature=0.1,
+        timeout=timeout,
+        # Ollama-specific options (ignored when provider=claude)
+        ollama_options={
+            "num_ctx":    4096,
+            "num_gpu":    99,
+            "num_thread": 8,
         },
-    }
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            f"{settings.ollama.base_url}/api/chat",
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["message"]["content"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +216,7 @@ async def _review_file(
     try:
         raw = await _call_llm(system_prompt, user_prompt)
     except Exception as exc:
-        logger.warning("LLM FAIL | file=%s error=%s: %s", rel_path, type(exc).__name__, exc)
+        logger.warning("LLM FAIL | file=%s type=%s", rel_path, type(exc).__name__)
         return None
     elapsed_ms = int((time.time() - start) * 1000)
     logger.warning("LLM DONE | file=%s elapsed=%dms raw_len=%d", rel_path, elapsed_ms, len(raw))
@@ -369,7 +360,7 @@ async def node_start(state: CodeReviewState, deps: dict) -> CodeReviewState:
         """)
 
     sast_findings = await _load_sast_findings(pool, run_id)
-    logger.warning("CODE REVIEW STARTED | run=%s sast_context_files=%d model=%s", run_id, len(sast_findings), settings.ollama.tier2_model)
+    logger.warning("CODE REVIEW STARTED | run=%s sast_context_files=%d provider=%s model=%s", run_id, len(sast_findings), settings.llm_provider, settings.llm.tier2_model)
     return {**state, "sast_findings": sast_findings}
 
 

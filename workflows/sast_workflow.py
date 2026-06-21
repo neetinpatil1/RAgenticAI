@@ -444,8 +444,8 @@ async def node_run_fp_pipeline(state: SastWorkflowState, deps: dict) -> SastWork
             except Exception as exc:
                 _l3_done_count += 1
                 logger.error(
-                    "FP/L3 error | run=%s finding=%s error=%s elapsed=%.1fs [%d/%d]",
-                    run_id, db_id[:8], exc, _t.time() - _call_start,
+                    "FP/L3 error | run=%s finding=%s type=%s elapsed=%.1fs [%d/%d]",
+                    run_id, db_id[:8], type(exc).__name__, _t.time() - _call_start,
                     _l3_done_count, len(l3_queue),
                 )
                 return FPDecision(
@@ -454,7 +454,7 @@ async def node_run_fp_pipeline(state: SastWorkflowState, deps: dict) -> SastWork
                     verdict=FPVerdict.ESCALATED,
                     source="layer3_llm",   # type: ignore
                     confidence=0.0,
-                    reasoning=f"Pipeline error: {exc}",
+                    reasoning="LLM analysis unavailable — escalated for manual review",
                     fp_category=None,
                 )
 

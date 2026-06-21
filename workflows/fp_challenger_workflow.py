@@ -265,7 +265,7 @@ async def node_challenge_findings(state: FPChallengerState, deps: dict) -> FPCha
                 done += 1
                 return l3_decision.model_dump()
             except Exception as exc:
-                logger.error("L3 challenge error | finding=%s error=%s", finding_id, exc)
+                logger.error("L3 challenge error | finding=%s type=%s", finding_id, type(exc).__name__)
                 done += 1
                 return None
 

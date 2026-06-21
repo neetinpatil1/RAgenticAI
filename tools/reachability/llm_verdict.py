@@ -8,8 +8,8 @@ Only invoked when static analysis returns UNKNOWN.
 from __future__ import annotations
 import json
 import logging
-import httpx
 from core.config import settings
+from core.llm_client import llm_chat
 
 logger = logging.getLogger(__name__)
 
@@ -48,27 +48,22 @@ Respond with valid JSON:
 }}"""
 
     try:
-        async with httpx.AsyncClient(timeout=settings.ollama.request_timeout) as client:
-            r = await client.post(
-                f"{settings.ollama.base_url}/api/chat",
-                json={
-                    "model": settings.ollama.tier2_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                    "format": "json",
-                },
-            )
-            r.raise_for_status()
-            content = r.json()["message"]["content"]
-            data    = json.loads(content.strip())
-            verdict = data.get("verdict", "UNKNOWN")
-            if verdict not in ("LIKELY_REACHABLE", "LIKELY_NOT_REACHABLE", "UNKNOWN"):
-                verdict = "UNKNOWN"
-            return {
-                "verdict":    verdict,
-                "confidence": float(data.get("confidence", 0.4)),
-                "reasoning":  data.get("reasoning", ""),
-            }
+        content = await llm_chat(
+            tier="tier2",
+            messages=[{"role": "user", "content": prompt}],
+            json_mode=True,
+            max_tokens=1024,
+            timeout=settings.llm.request_timeout,
+        )
+        data    = json.loads(content.strip())
+        verdict = data.get("verdict", "UNKNOWN")
+        if verdict not in ("LIKELY_REACHABLE", "LIKELY_NOT_REACHABLE", "UNKNOWN"):
+            verdict = "UNKNOWN"
+        return {
+            "verdict":    verdict,
+            "confidence": float(data.get("confidence", 0.4)),
+            "reasoning":  data.get("reasoning", ""),
+        }
     except Exception as exc:
         err_msg = str(exc) or type(exc).__name__
         logger.warning("llm_verdict | failed: %s", err_msg)

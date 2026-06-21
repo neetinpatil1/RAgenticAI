@@ -394,6 +394,22 @@ async def _run_reachability_step(run_id: str, scan_path: str, pool: asyncpg.Pool
             await run_reachability_workflow(run_id=run_id, scan_path=scan_path, pool=pool)
         else:
             logger.info("Reachability step: no CVEs — skipping | run=%s", run_id)
+            # Mark reachability as done so the UI doesn't stay stuck on "running"
+            import json as _json
+            patch = _json.dumps({
+                "reachability": {
+                    "skipped": True,
+                    "reason": "no_cves",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                }
+            })
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE workflow_runs
+                       SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+                       WHERE run_id = $2""",
+                    patch, run_id,
+                )
     except Exception as exc:
         logger.error("Reachability step: FAILED | run=%s error=%s", run_id, exc)
 

@@ -199,6 +199,12 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       setStatus(s);
       setLoading(false);
 
+      // Stop agent spinners immediately if the server already knows they're done.
+      // This covers both: (a) completed scans opened from history where pollSastStatus()
+      // never runs, and (b) in-progress scans where agents finish before the first poll.
+      if (s.agents?.secrets_done)     setSecretScanning(false);
+      if (s.agents?.sca_done)         setDepScanning(false);
+
       // Mark SAST done immediately if:
       //   a) workflow_runs.state is already "completed"/"failed" (full pipeline done), OR
       //   b) agents.sast_done is already true (Semgrep wrote findings, pipeline still running)

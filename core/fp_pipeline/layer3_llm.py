@@ -17,10 +17,10 @@ Prompt loaded from: prompts/sast_agent/v1.0/fp_analysis.yml
 import json
 import logging
 import re
-import httpx
 from typing import Optional
 
 from core.config import settings
+from core.llm_client import llm_chat
 from core.output_contracts.sast_report import SASTFinding
 from core.output_contracts.fp_decision import (
     FPDecision, FPVerdict, FPSource, LabelStatus
@@ -93,10 +93,7 @@ class Layer3LLM:
         Returns:
             FPDecision with one of: REAL, FP, ESCALATED, DEADLOCK.
         """
-        model = (
-            settings.ollama.tier1_model if use_tier1
-            else settings.ollama.tier2_model
-        )
+        tier = "tier1" if use_tier1 else "tier2"
 
         # --- Step 1: Retrieve similar past decisions from pgvector ---
         query_text = f"{finding.message}\n\n{finding.code_snippet or ''}"
@@ -111,8 +108,16 @@ class Layer3LLM:
         system_prompt = self._prompts.get("sast_agent", "v1.0", "fp_analysis", "system")
         user_prompt = self._build_user_prompt(finding, similar)
 
-        # --- Step 3: Call Ollama ---
-        raw_response = await self._call_ollama(model, system_prompt, user_prompt)
+        # --- Step 3: Call LLM (Ollama or Claude based on LLM_PROVIDER) ---
+        raw_response = await llm_chat(
+            tier=tier,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            json_mode=True,  # tier2: Ollama format=json; tier1: no-op (qwen hangs with format=json)
+            max_tokens=2048,  # gemini-2.5-flash uses thinking tokens; needs headroom for actual JSON output
+        )
 
         # --- Step 4: Parse structured output ---
         decision = self._parse_response(raw_response, finding_db_id, run_id)
@@ -130,7 +135,7 @@ class Layer3LLM:
         if not use_tier1 and decision.should_escalate:
             logger.info(
                 "Confidence escalation | confidence=%.2f threshold=%.2f",
-                decision.confidence, settings.ollama.escalation_confidence_threshold
+                decision.confidence, settings.llm.escalation_confidence_threshold
             )
             return await self.evaluate(finding, run_id, finding_db_id, use_tier1=True)
 
@@ -182,44 +187,6 @@ Respond with valid JSON matching the schema:
   "fp_category": "test-code|config-only|framework-safe|dead-code|out-of-scope|annotation-suppressed|null",
   "reasoning": "brief explanation"
 }}"""
-
-    async def _call_ollama(
-        self,
-        model: str,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> str:
-        """
-        Call Ollama chat completion API.
-        Ollama runs natively on Mac — no Docker, direct Metal GPU access.
-        """
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            "stream": False,
-            # Ensure the model has enough token budget to close the JSON.
-            # Ollama default num_predict=128 truncates mid-reasoning → invalid JSON.
-            "options": {
-                "num_predict": 512,
-            },
-        }
-        # "format": "json" forces strict JSON output — safe for llama3.2:3b but causes
-        # qwen2.5-coder to hang indefinitely, so only enable it for Tier 2 (small model).
-        if model == settings.ollama.tier2_model:
-            payload["format"] = "json"
-
-        async with httpx.AsyncClient(timeout=settings.ollama.request_timeout) as client:
-            response = await client.post(
-                f"{settings.ollama.base_url}/api/chat",
-                json=payload,
-            )
-            response.raise_for_status()
-
-        data = response.json()
-        return data["message"]["content"]
 
     def _parse_response(
         self,

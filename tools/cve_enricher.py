@@ -21,6 +21,7 @@ import logging
 from typing import Optional
 import httpx
 from core.config import settings
+from core.llm_client import llm_chat
 
 logger = logging.getLogger(__name__)
 
@@ -163,31 +164,26 @@ async def _extract_classes_with_llm(vuln_id: str, description: str) -> list[str]
             "If no specific class is mentioned, return []. "
             'Example: ["com.example.VulnClass"]'
         )
-        async with httpx.AsyncClient(timeout=settings.ollama.request_timeout) as client:
-            r = await client.post(
-                f"{settings.ollama.base_url}/api/chat",
-                json={
-                    "model": settings.ollama.tier2_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                    "format": "json",
-                },
+        content = await llm_chat(
+            tier="tier2",
+            messages=[{"role": "user", "content": prompt}],
+            json_mode=True,
+            max_tokens=1024,
+            timeout=settings.llm.request_timeout,
+        )
+        # Parse JSON from response — model may return bare array OR wrapped object
+        cleaned = content.strip()
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            classes = parsed
+        elif isinstance(parsed, dict):
+            # format:json wraps array — look for any list value
+            classes = next(
+                (v for v in parsed.values() if isinstance(v, list)), []
             )
-            r.raise_for_status()
-            content = r.json()["message"]["content"]
-            # Parse JSON from response — model may return bare array OR wrapped object
-            cleaned = content.strip()
-            parsed = json.loads(cleaned)
-            if isinstance(parsed, list):
-                classes = parsed
-            elif isinstance(parsed, dict):
-                # format:json wraps array — look for any list value
-                classes = next(
-                    (v for v in parsed.values() if isinstance(v, list)), []
-                )
-            else:
-                classes = []
-            return [c for c in classes if isinstance(c, str) and "." in c]
+        else:
+            classes = []
+        return [c for c in classes if isinstance(c, str) and "." in c]
     except Exception as exc:
         logger.warning("CVE enricher LLM | vuln=%s error=%s", vuln_id, str(exc) or type(exc).__name__)
     return []
