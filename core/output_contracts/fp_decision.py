@@ -34,6 +34,7 @@ class FPVerdict(str, Enum):
 
 class FPSource(str, Enum):
     LAYER1     = "layer1"        # YAML rule matched
+    LAYER2     = "layer2"        # Heuristic filter (path / file-type patterns)
     LAYER3_LLM = "layer3_llm"    # Qwen2.5-Coder:14b verdict
     HUMAN      = "human"         # reviewer decision
 

@@ -2,3 +2,5 @@
   - /Users/nitinpatil/sampleProjects/JavaVulnerableLab
   - /Users/nitinpatil/sampleProjects/SecurityShepherd
   - /Users/nitinpatil/sampleProjects/spring-petclinic
+  - /Users/nitinpatil/IdeaProjects/TestTelegram
+  - /Users/nitinpatil/sampleProjects/AltoroJ

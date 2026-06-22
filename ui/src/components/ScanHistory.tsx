@@ -5,7 +5,7 @@ import { getRuns } from "../lib/api";
 import type { RunSummary } from "../types";
 
 interface Props {
-  onViewResults: (runId: string) => void;
+  onViewResults: (runId: string, scanPath: string) => void;
 }
 
 const SEV_COLORS = {
@@ -181,7 +181,7 @@ export function ScanHistory({ onViewResults }: Props) {
               {/* View results button */}
               {run.state === "completed" && (
                 <button
-                  onClick={() => onViewResults(run.run_id)}
+                  onClick={() => onViewResults(run.run_id, run.scan_path)}
                   className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg
                              bg-gray-800 border border-gray-700 text-sm text-gray-300
                              hover:text-white hover:border-gray-500 transition-colors

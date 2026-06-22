@@ -47,6 +47,7 @@ from core.prompt_manager import PromptManager, init_prompt_manager, get_prompt_m
 from core.state.workflow_state import WorkflowState, init_workflow_state, get_workflow_state
 from core.state.vector_memory import VectorMemory, init_vector_memory, get_vector_memory
 from core.fp_pipeline.layer1_rules import Layer1Rules
+from core.fp_pipeline.layer2_heuristics import Layer2Heuristics
 from core.fp_pipeline.layer3_llm import Layer3LLM
 from core.watchdog import Watchdog
 from tools.semgrep_tool import SemgrepTool
@@ -205,17 +206,19 @@ def _build_workflow_deps() -> dict:
     vector_memory = get_vector_memory()
 
     layer1 = Layer1Rules(settings.semgrep.rules_path)
+    layer2 = Layer2Heuristics()
     layer3 = Layer3LLM(vector_memory, prompt_manager)
 
     return {
-        "pool":           pool,
-        "audit":          get_audit_logger(),
-        "job_queue":      get_job_queue(),
-        "workflow_state": get_workflow_state(),
-        "vector_memory":  vector_memory,
-        "semgrep_tool":   SemgrepTool(),
-        "layer1_rules":   layer1,
-        "layer3_llm":     layer3,
+        "pool":               pool,
+        "audit":              get_audit_logger(),
+        "job_queue":          get_job_queue(),
+        "workflow_state":     get_workflow_state(),
+        "vector_memory":      vector_memory,
+        "semgrep_tool":       SemgrepTool(),
+        "layer1_rules":       layer1,
+        "layer2_heuristics":  layer2,
+        "layer3_llm":         layer3,
     }
 
 

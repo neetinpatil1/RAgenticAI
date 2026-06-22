@@ -47,6 +47,7 @@ from core.output_contracts.fp_decision import (
     FPDecision, FPVerdict, FPBatchResult, LabelStatus, LABEL_WEIGHT
 )
 from core.fp_pipeline.layer1_rules import Layer1Rules
+from core.fp_pipeline.layer2_heuristics import Layer2Heuristics
 from core.fp_pipeline.layer3_llm import Layer3LLM
 from tools.semgrep_tool import SemgrepTool
 
@@ -363,6 +364,7 @@ async def node_run_fp_pipeline(state: SastWorkflowState, deps: dict) -> SastWork
     """
     import time as _t
     layer1: Layer1Rules = deps["layer1_rules"]
+    layer2: Layer2Heuristics = deps["layer2_heuristics"]
     layer3: Layer3LLM = deps["layer3_llm"]
     pool: asyncpg.Pool = deps["pool"]
     audit: AuditLogger = deps["audit"]
@@ -401,6 +403,32 @@ async def node_run_fp_pipeline(state: SastWorkflowState, deps: dict) -> SastWork
         "FP pipeline Layer1 DONE | run=%s l1_resolved=%d l3_queue=%d elapsed=%.2fs",
         run_id, len(findings) - len(l3_queue), len(l3_queue), _t.time() - _l1_start,
     )
+
+    # --- Layer 2: heuristic filter — test files, generated code, non-source files ---
+    _l2_start = _t.time()
+    l2_passed: list[tuple[SASTFinding, str]] = []
+    for finding, db_id in l3_queue:
+        l2_decision = layer2.evaluate(finding, run_id)
+        if l2_decision:
+            l2_decision = l2_decision.model_copy(update={"finding_id": db_id})
+            decisions.append(l2_decision)
+            counters["fp"] += 1
+            await audit.log(
+                event_type=AuditEvent.FP_LAYER1_RESOLVED,   # reuse existing event type
+                actor="sast_agent",
+                run_id=run_id,
+                entity_type="finding",
+                entity_id=db_id,
+                payload={"fp_category": l2_decision.fp_category, "layer": "layer2"},
+            )
+        else:
+            l2_passed.append((finding, db_id))
+
+    logger.info(
+        "FP pipeline Layer2 DONE | run=%s l2_resolved=%d l3_queue=%d elapsed=%.2fs",
+        run_id, len(l3_queue) - len(l2_passed), len(l2_passed), _t.time() - _l2_start,
+    )
+    l3_queue = l2_passed
 
     # --- Layer 3: LLM calls — max 2 concurrent (matches OLLAMA_NUM_PARALLEL=2).
     # Higher concurrency causes queue buildup inside Ollama: queuing time + inference

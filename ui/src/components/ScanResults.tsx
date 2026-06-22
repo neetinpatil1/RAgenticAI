@@ -1639,8 +1639,8 @@ export function ScanResults({ runId, scanPath, onNewScan }: Props) {
       )}
 
       {/* ── Code Knowledge Graph — shown when scanPath is known ── */}
-      {!loading && scanPath && (
-        <CodeGraph scanPath={scanPath} />
+      {!loading && (scanPath || status?.scan_path) && (
+        <CodeGraph scanPath={(scanPath || status?.scan_path) as string} />
       )}
 
     </div>
